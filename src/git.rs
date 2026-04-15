@@ -706,10 +706,14 @@ fn split_logical_lines(text: &str) -> Vec<(String, bool)> {
         .map(|chunk| {
             let has_trailing_newline = chunk.ends_with('\n');
             let without_newline = chunk.strip_suffix('\n').unwrap_or(chunk);
-            let line = without_newline
-                .strip_suffix('\r')
-                .unwrap_or(without_newline)
-                .to_string();
+            let line = if has_trailing_newline {
+                without_newline
+                    .strip_suffix('\r')
+                    .unwrap_or(without_newline)
+                    .to_string()
+            } else {
+                without_newline.to_string()
+            };
             (line, has_trailing_newline)
         })
         .collect()
@@ -990,6 +994,12 @@ diff --git a/foo.rs b/foo.rs
             err.to_string().contains("malformed old hunk range"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn split_logical_lines_preserves_literal_carriage_return_without_newline() {
+        let lines = split_logical_lines("carriage-return-only\r");
+        assert_eq!(lines, vec![("carriage-return-only\r".to_string(), false)]);
     }
 
     #[test]
