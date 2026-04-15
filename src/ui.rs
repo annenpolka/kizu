@@ -296,7 +296,15 @@ fn render_diff_line_wrapped(
             } else {
                 Span::raw("     ")
             };
-            let prefix_span = Span::styled(prefix_char.to_string(), prefix_style);
+            // Only the first visual row of a logical diff line carries
+            // the `+`/`-`/` ` prefix. Continuation rows leave the
+            // prefix column blank so the reader's eye treats them as
+            // "same line, wrapped" rather than a new add/delete.
+            let prefix_span = if is_first {
+                Span::styled(prefix_char.to_string(), prefix_style)
+            } else {
+                Span::raw(" ")
+            };
             let body_span = Span::styled(chunk.to_string(), body_style);
             let mut spans = vec![bar, prefix_span, body_span];
             if is_last {
