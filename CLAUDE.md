@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **kizu** は AI コーディングエージェント (主に Claude Code) と並走させるリアルタイム diff 監視 TUI。Rust 製の単一バイナリ。
 
-現状は **v0.1 skeleton**。`src/{app,git,watcher,ui}.rs` の各モジュールは型定義と TODO スタブのみで、`unimplemented!()` を含む。
+現状は **v0.1 MVP 実装中** (feat/v0.1-mvp ブランチ)。`src/{app,git,watcher,ui}.rs` は全て実装済みで、Rust 単体テスト 84 本 + tuistory e2e 11 本が green。
 
 ## 実装前に必ず読むもの
 
@@ -29,6 +29,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **`plans/`** — 「どう実装するか」の ExecPlan (PLANS.md 準拠のリビングドキュメント)。進捗・発見・判断を作業中に継続更新する。小さな判断は ExecPlan の Decision Log に残し、後から効く重い判断は ADR に昇格させる。
 
 ## ビルド・検証
+
+ローカル作業の一括ランナーとして **`just`** を採用している。`justfile` 参照。
+
+```bash
+just                # default = `just ci` — 全 CI gate を順に実行
+just ci             # fmt-check → clippy → cargo test → release → e2e
+just rust           # 高速ループ: fmt + lint + cargo test (e2e をスキップ)
+just test           # cargo test --all-targets のみ
+just e2e            # release build + tuistory e2e (bun test)
+just run            # cargo run --release で kizu を起動
+just clean          # cargo clean + tests/e2e/node_modules 削除
+```
+
+`just --list` でレシピ一覧を確認できる。生 cargo コマンドを直接叩いてもよい (以下は等価):
 
 ```bash
 cargo build                       # debug
@@ -56,23 +70,29 @@ cargo build --release             # release (LTO thin, strip)
 
 ## ビルド検証フロー (CI と一致)
 
-CI (`.github/workflows/ci.yml`) は以下の順で実行される。ローカルでも同順で確認すること。
+CI (`.github/workflows/ci.yml`) と同じ順序を `just ci` 一発でローカル再現できる:
+
+```bash
+just ci   # fmt-check → clippy → cargo test → release → e2e
+```
+
+展開すると以下と等価:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
 cargo build --release --locked
 
 # tuistory + bun による e2e (v0.1 から required check)
 cd tests/e2e && bun install --frozen-lockfile && KIZU_BIN=../../target/release/kizu bun test
 ```
 
-`tests/e2e/` は TypeScript + bun:test で書かれた black-box e2e テスト群。kizu バイナリを実 pty で起動し、キー操作・waitForText・色フィルタ・inline snapshot で検証する。詳細は ADR-0004。
+`tests/e2e/` は TypeScript + bun:test で書かれた black-box e2e テスト群。kizu バイナリを実 pty で起動し、キー操作・`waitForText`・inline snapshot で検証する。5 シナリオ (smoke / navigation / reactive / reset / colors) = 11 test。ratatui の basic ANSI 色は tuistory の `foreground` フィルタでマッチしないので、色検証は Rust 単体テスト (`ui::tests::render_scroll_lines_carry_added_and_deleted_colors`) に寄せ、e2e では `+`/`-` テキストレイアウトを pin する。詳細は ADR-0004。
 
 ## コミット / PR 規約
 
-- コミット / PR を作る前に **`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test --all-targets` が通ること** (CI と同順)
+- コミット / PR を作る前に **`just ci` が通ること** (= CI と同順の fmt-check → clippy → cargo test → release → e2e)
 - コミットメッセージは `prefix: subject` 形式 (例: `init: kizu v0.1 skeleton + design context`)
 - フッターに `Co-Authored-By: Claude ...` を維持する (このリポジトリは Claude Code との共同作業を前提とした設計のため)
 
