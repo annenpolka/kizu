@@ -541,58 +541,47 @@ impl App {
         }
     }
 
-    /// `J` — fine-grained forward motion through change runs.
+    /// `J` — adaptive forward motion that switches between scroll and
+    /// hunk jump based on the current hunk's size.
     ///
-    /// - Inside a long change run, scroll forward by [`Self::chunk_size`]
-    ///   rows (clamped to the last row of the run).
-    /// - Once the cursor reaches the end of the current run (or starts
-    ///   outside any run), jump to the start of the next change run in
-    ///   the layout — even when that run lives in a different hunk or
-    ///   a different file. `J` flows continuously through the whole
-    ///   scroll, ignoring hunk and file boundaries.
+    /// - **Short hunk** (fits in the viewport): instant jump to the next
+    ///   hunk's first row, same as `j`. No chunk-scroll mid-hunk, so
+    ///   walking dense edit clusters doesn't fragment into micro-presses.
+    /// - **Long hunk** (taller than the viewport): scroll forward by
+    ///   [`Self::chunk_size`] rows, clamped to the hunk's last row. Once
+    ///   the cursor lands on the last row, the next `J` flows into the
+    ///   next hunk's first row, so walking through a 200-line hunk ends
+    ///   at the next hunk without any extra key press.
+    /// - Crosses file boundaries the same way [`Self::next_hunk`] does,
+    ///   so `J` keeps flowing through the whole scroll.
     pub fn next_change(&mut self) {
         let cursor = self.scroll;
-        let chunk = self.chunk_size();
-        if let Some(&(_, end)) = self.run_containing(cursor) {
-            let last_row = end.saturating_sub(1);
-            if cursor < last_row {
-                let target = (cursor + chunk).min(last_row);
+        let viewport = self.last_body_height.get().max(1);
+        if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
+            let hunk_size = hunk_end - hunk_top;
+            let last_row = hunk_end.saturating_sub(1);
+            if hunk_size > viewport && cursor < last_row {
+                let target = (cursor + self.chunk_size()).min(last_row);
                 self.scroll_to(target);
                 return;
             }
         }
-        if let Some(&(start, _)) = self.layout.change_runs.iter().find(|(s, _)| *s > cursor) {
-            self.scroll_to(start);
-        }
+        self.next_hunk();
     }
 
-    /// `K` — fine-grained backward motion. Mirror of [`Self::next_change`].
+    /// `K` — adaptive backward motion. Mirror of [`Self::next_change`].
     pub fn prev_change(&mut self) {
         let cursor = self.scroll;
-        let chunk = self.chunk_size();
-        if let Some(&(start, _)) = self.run_containing(cursor)
-            && cursor > start
-        {
-            let target = cursor.saturating_sub(chunk).max(start);
-            self.scroll_to(target);
-            return;
+        let viewport = self.last_body_height.get().max(1);
+        if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
+            let hunk_size = hunk_end - hunk_top;
+            if hunk_size > viewport && cursor > hunk_top {
+                let target = cursor.saturating_sub(self.chunk_size()).max(hunk_top);
+                self.scroll_to(target);
+                return;
+            }
         }
-        if let Some(&(start, _)) = self
-            .layout
-            .change_runs
-            .iter()
-            .rev()
-            .find(|(s, _)| *s < cursor)
-        {
-            self.scroll_to(start);
-        }
-    }
-
-    fn run_containing(&self, row: usize) -> Option<&(usize, usize)> {
-        self.layout
-            .change_runs
-            .iter()
-            .find(|(start, end)| row >= *start && row < *end)
+        self.prev_hunk();
     }
 
     pub fn jump_to_file_first_hunk(&mut self, file_idx: usize) {
@@ -1278,35 +1267,29 @@ mod tests {
 
     #[test]
     fn capital_j_in_short_run_jumps_to_next_run_anywhere() {
-        // Two single-row runs separated by a context line. From the
-        // first run's only row, SHIFT-J falls through to the next run
-        // start because there are no more rows inside the current one.
+        // Two short hunks. Each fits comfortably in the default viewport,
+        // so SHIFT-J should behave like `j` and jump to the next hunk's
+        // header row.
         let mut app = fake_app(vec![make_file(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Context, " keep"),
-                    diff_line(LineKind::Added, "alpha"),
-                    diff_line(LineKind::Context, " keep"),
-                    diff_line(LineKind::Added, "beta"),
-                    diff_line(LineKind::Context, " keep"),
-                ],
-            )],
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "alpha")]),
+                hunk(10, vec![diff_line(LineKind::Added, "beta")]),
+            ],
             100,
         )]);
-        assert_eq!(app.layout.change_runs.len(), 2);
-        let (first_start, _) = app.layout.change_runs[0];
-        let (second_start, _) = app.layout.change_runs[1];
+        assert_eq!(app.layout.hunk_starts.len(), 2);
+        let first_hunk = app.layout.hunk_starts[0];
+        let second_hunk = app.layout.hunk_starts[1];
 
-        app.scroll_to(first_start);
+        app.scroll_to(first_hunk);
         app.handle_key(key(KeyCode::Char('J')));
-        assert_eq!(app.scroll, second_start);
+        assert_eq!(app.scroll, second_hunk);
         assert!(!app.follow_mode);
 
-        // No more runs after this one → stay put.
+        // No more hunks after this one → stay put.
         app.handle_key(key(KeyCode::Char('J')));
-        assert_eq!(app.scroll, second_start);
+        assert_eq!(app.scroll, second_hunk);
     }
 
     #[test]
@@ -1342,9 +1325,9 @@ mod tests {
 
     #[test]
     fn capital_j_crosses_hunk_and_file_boundaries() {
-        // Run 1 in a.rs, run 2 in b.rs. From run 1's only row, SHIFT-J
-        // should jump straight into run 2 even though that means
-        // crossing both a hunk boundary and a file boundary.
+        // One tiny hunk per file. Short-hunk SHIFT-J falls back to
+        // `next_hunk`, which jumps across the file boundary into b.rs
+        // for free.
         let mut app = fake_app(vec![
             make_file(
                 "a.rs",
@@ -1357,60 +1340,88 @@ mod tests {
                 200,
             ),
         ]);
-        assert_eq!(app.layout.change_runs.len(), 2);
-        let (first_start, _) = app.layout.change_runs[0];
-        let (second_start, _) = app.layout.change_runs[1];
+        assert_eq!(app.layout.hunk_starts.len(), 2);
+        let first_hunk = app.layout.hunk_starts[0];
+        let second_hunk = app.layout.hunk_starts[1];
 
-        app.scroll_to(first_start);
+        app.scroll_to(first_hunk);
         app.handle_key(key(KeyCode::Char('J')));
         assert_eq!(
-            app.scroll, second_start,
-            "SHIFT-J must cross hunk + file boundaries when no rows remain in the current run"
+            app.scroll, second_hunk,
+            "SHIFT-J on a short hunk must cross hunk + file boundaries"
         );
     }
 
     #[test]
-    fn capital_k_in_long_run_walks_back_by_chunk() {
+    fn capital_k_in_long_hunk_walks_back_by_chunk() {
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
         let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
-        let (start, end) = app.layout.change_runs[0];
-        let last = end - 1;
+        // Hunk spans header + 20 diff rows → [1, 22). viewport = 15 < 21,
+        // so SHIFT-K chunk-scrolls back clamped to the header row.
+        let hunk_top = app.layout.hunk_starts[0];
+        let last = 21;
 
         app.scroll_to(last);
         app.handle_key(key(KeyCode::Char('K')));
         assert_eq!(app.scroll, last - chunk);
 
-        // Continue back; should stay >= the run's first row, not before.
+        // Continue back; scroll must stay within the hunk's row range,
+        // flooring at the hunk header.
         app.handle_key(key(KeyCode::Char('K')));
         app.handle_key(key(KeyCode::Char('K')));
         app.handle_key(key(KeyCode::Char('K')));
-        assert!(app.scroll >= start);
+        assert!(app.scroll >= hunk_top);
     }
 
     #[test]
-    fn capital_k_at_run_start_jumps_to_previous_run() {
+    fn capital_k_in_short_hunk_jumps_to_previous_hunk() {
+        // Two short hunks. SHIFT-K from the second lands on the first
+        // hunk's header row, same behaviour as `k`.
         let mut app = fake_app(vec![make_file(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "alpha"),
-                    diff_line(LineKind::Context, " keep"),
-                    diff_line(LineKind::Added, "beta"),
-                ],
-            )],
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "alpha")]),
+                hunk(10, vec![diff_line(LineKind::Added, "beta")]),
+            ],
             100,
         )]);
-        let (first_start, _) = app.layout.change_runs[0];
-        let (second_start, _) = app.layout.change_runs[1];
+        let first_hunk = app.layout.hunk_starts[0];
+        let second_hunk = app.layout.hunk_starts[1];
 
-        app.scroll_to(second_start);
+        app.scroll_to(second_hunk);
         app.handle_key(key(KeyCode::Char('K')));
-        assert_eq!(app.scroll, first_start);
+        assert_eq!(app.scroll, first_hunk);
+    }
+
+    #[test]
+    fn capital_j_flows_from_end_of_long_hunk_into_next_hunk() {
+        // Long hunk + short hunk. SHIFT-J walks the long hunk in chunks,
+        // then on the *next* press flows into the next hunk's header row
+        // automatically — no extra key press to cross the boundary.
+        let lines: Vec<DiffLine> = (0..20)
+            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+            .collect();
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, lines),
+                hunk(100, vec![diff_line(LineKind::Added, "tail")]),
+            ],
+            100,
+        )]);
+        app.last_body_height.set(15);
+        let second_hunk = app.layout.hunk_starts[1];
+
+        // Park on the last row of the long hunk (row 21: 1 header + 20
+        // diff lines starting at row 1).
+        app.scroll_to(21);
+        // One more SHIFT-J should leap into the next hunk's header.
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.scroll, second_hunk);
     }
 
     #[test]
