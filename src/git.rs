@@ -98,7 +98,7 @@ pub fn compute_diff(root: &Path, baseline_sha: &str) -> Result<Vec<FileDiff>> {
     // payload now matches. Invalid bytes become U+FFFD in the display,
     // which is a tolerable cost for preserving refresh liveness.
     let raw = String::from_utf8_lossy(&output.stdout);
-    let mut files = parse_unified_diff(&raw);
+    let mut files = parse_unified_diff(&raw).context("parsing git diff output")?;
 
     for rel in list_untracked(root)? {
         match synthesize_untracked(root, &rel) {
@@ -198,11 +198,9 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// branch leans on that invariant to split `rest` at its exact midpoint
 /// instead of searching for ` b/`, which is ambiguous for a filename
 /// whose bytes contain the literal sequence ` b/` (e.g. `foo b/bar`).
-/// Returns `None` if neither shape parses cleanly — the caller then
-/// falls back to `PathBuf::default()` and the subsequent file gets
-/// empty-path'd, which is the pre-fix behavior for unrecognized
-/// headers and is still visible as a bug but no longer the only
-/// outcome for legal git output.
+/// Returns `None` if neither shape parses cleanly. The caller treats
+/// that as a parse error and aborts the refresh instead of silently
+/// collapsing the file under an empty path.
 fn parse_diff_git_header(rest: &str) -> Option<PathBuf> {
     let bytes = rest.as_bytes();
 
@@ -535,7 +533,7 @@ pub fn find_root(start: &Path) -> Result<PathBuf> {
 
 /// Parse a unified diff payload (the stdout of `git diff --no-renames ...`)
 /// into a vector of [`FileDiff`].
-pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
+pub(crate) fn parse_unified_diff(raw: &str) -> Result<Vec<FileDiff>> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut current_hunks: Vec<Hunk> = Vec::new();
     let mut current_hunk: Option<Hunk> = None;
@@ -577,7 +575,8 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             // ` b/`; use a format-aware helper that leans on the
             // `--no-renames` invariant that both sides name the same
             // file. See ADR-0001.
-            let path = parse_diff_git_header(rest).unwrap_or_default();
+            let path = parse_diff_git_header(rest)
+                .ok_or_else(|| anyhow!("unparseable `diff --git` header: {rest}"))?;
             files.push(FileDiff {
                 path,
                 status: FileStatus::Modified,
@@ -630,10 +629,16 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
                 None => (rest.trim_end_matches("@@"), None),
             };
             let mut parts = header.split_whitespace();
-            let old = parts.next().unwrap_or("-0,0");
-            let new = parts.next().unwrap_or("+0,0");
-            let (old_start, old_count) = parse_hunk_range(old.trim_start_matches('-'));
-            let (new_start, new_count) = parse_hunk_range(new.trim_start_matches('+'));
+            let old = parts
+                .next()
+                .ok_or_else(|| anyhow!("malformed hunk header missing old range: {line}"))?;
+            let new = parts
+                .next()
+                .ok_or_else(|| anyhow!("malformed hunk header missing new range: {line}"))?;
+            let (old_start, old_count) = parse_hunk_range(old.trim_start_matches('-'))
+                .ok_or_else(|| anyhow!("malformed old hunk range: {line}"))?;
+            let (new_start, new_count) = parse_hunk_range(new.trim_start_matches('+'))
+                .ok_or_else(|| anyhow!("malformed new hunk range: {line}"))?;
             current_hunk = Some(Hunk {
                 old_start,
                 old_count,
@@ -689,7 +694,7 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
 
     // Flush trailing hunk + file.
     finish_file(&mut files, &mut current_hunks, &mut current_hunk);
-    files
+    Ok(files)
 }
 
 fn split_logical_lines(text: &str) -> Vec<(String, bool)> {
@@ -711,10 +716,10 @@ fn split_logical_lines(text: &str) -> Vec<(String, bool)> {
 }
 
 /// Parse `start,count` (or just `start`, defaulting count to 1) from a hunk header range.
-fn parse_hunk_range(spec: &str) -> (usize, usize) {
+fn parse_hunk_range(spec: &str) -> Option<(usize, usize)> {
     match spec.split_once(',') {
-        Some((start, count)) => (start.parse().unwrap_or(0), count.parse().unwrap_or(0)),
-        None => (spec.parse().unwrap_or(0), 1),
+        Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+        None => Some((spec.parse().ok()?, 1)),
     }
 }
 
@@ -761,7 +766,7 @@ index e69de29..4b825dc 100644
 +fn main() {}
 ";
 
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
 
         assert_eq!(files.len(), 1, "expected exactly one FileDiff");
         let file = &files[0];
@@ -802,7 +807,7 @@ index e69de29..4b825dc 100644
 +    }
 ";
 
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 1);
         let hunks = match &files[0].content {
             DiffContent::Text(h) => h,
@@ -835,7 +840,7 @@ index 1111111..2222222 100644
 +new bar
 ";
 
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 2, "expected two FileDiffs");
         assert_eq!(files[0].path, PathBuf::from("foo.rs"));
         assert_eq!(files[0].added, 1);
@@ -863,7 +868,7 @@ index 1111111..2222222 100644
 +fn eleven_v2() {}
 ";
 
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 1);
         let hunks = match &files[0].content {
             DiffContent::Text(h) => h,
@@ -893,7 +898,7 @@ index 1111111..2222222 100644
 +only added
 ";
 
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].added, 2, "two + lines expected");
         assert_eq!(files[0].deleted, 3, "three - lines expected");
@@ -910,7 +915,7 @@ index 0000000..2222222
 @@ -0,0 +1,1 @@
 +brand new
 ";
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].status, FileStatus::Added);
     }
@@ -923,7 +928,7 @@ diff --git a/icon.png b/icon.png
 index 1111111..2222222 100644
 Binary files a/icon.png and b/icon.png differ
 ";
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("icon.png"));
         assert!(matches!(files[0].content, DiffContent::Binary));
@@ -944,7 +949,7 @@ index e69de29..4b825dc 100644
 \\ No newline at end of file
 ";
 
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         let hunks = match &files[0].content {
             DiffContent::Text(hunks) => hunks,
             DiffContent::Binary => panic!("expected text content"),
@@ -954,6 +959,36 @@ index e69de29..4b825dc 100644
         assert!(
             !last.has_trailing_newline,
             "newline marker line must clear the previous diff line's newline flag"
+        );
+    }
+
+    #[test]
+    fn parse_unified_diff_rejects_unparseable_diff_git_header() {
+        let raw = "\
+diff --git definitely-not-a-valid-header
+@@ -0,0 +1,1 @@
++x
+";
+
+        let err = parse_unified_diff(raw).expect_err("malformed diff header must surface");
+        assert!(
+            err.to_string().contains("unparseable `diff --git` header"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_unified_diff_rejects_malformed_hunk_header() {
+        let raw = "\
+diff --git a/foo.rs b/foo.rs
+@@ -bogus +1 @@
++x
+";
+
+        let err = parse_unified_diff(raw).expect_err("malformed hunk header must surface");
+        assert!(
+            err.to_string().contains("malformed old hunk range"),
+            "unexpected error: {err:#}"
         );
     }
 
@@ -968,7 +1003,7 @@ index 1111111..0000000
 @@ -1,1 +0,0 @@
 -was here
 ";
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].status, FileStatus::Deleted);
     }
@@ -976,8 +1011,8 @@ index 1111111..0000000
     #[test]
     fn parse_unified_diff_decodes_c_quoted_tracked_pathname() {
         // Regression for the adversarial finding: the old path
-        // extraction used `split_once(" b/")` with a
-        // `PathBuf::default()` fallback, so a quoted header like
+        // extraction used `split_once(" b/")` with an
+        // empty-path fallback, so a quoted header like
         // `"a/\t.txt" "b/\t.txt"` collapsed to an empty path. Every
         // quoted file then merged under the same empty path, breaking
         // file grouping and follow mode in the diff view.
@@ -994,7 +1029,7 @@ index 1111111..2222222 100644
  line
 +added
 ";
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 1, "expected one file, got {files:?}");
         assert_eq!(files[0].path, PathBuf::from("\t.txt"));
         assert_eq!(files[0].added, 1);
@@ -1016,7 +1051,7 @@ index 1111111..2222222 100644
  one
 +two
 ";
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("café.txt"));
         assert_eq!(files[0].added, 1);
@@ -1039,7 +1074,7 @@ index 1111111..2222222 100644
  x
 +y
 ";
-        let files = parse_unified_diff(raw);
+        let files = parse_unified_diff(raw).expect("parse diff");
         assert_eq!(files.len(), 1, "expected one file, got {files:?}");
         assert_eq!(files[0].path, PathBuf::from("foo b/bar"));
         assert_eq!(files[0].added, 1);
