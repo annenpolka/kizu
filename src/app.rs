@@ -1615,7 +1615,7 @@ async fn run_loop(
 ) -> Result<()> {
     use crossterm::event::{Event, EventStream};
     use futures_util::StreamExt;
-    use tokio::time::{MissedTickBehavior, interval};
+    use tokio::time::{MissedTickBehavior, interval, sleep};
 
     let mut events = EventStream::new();
 
@@ -1625,6 +1625,15 @@ async fn run_loop(
     // user kicks off a new animation.
     let mut frame = interval(Duration::from_millis(16));
     frame.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // notify backends can have a short arm-up window right after startup.
+    // Without a one-shot self-heal refresh, an edit that lands during that
+    // gap can be missed forever until the *next* filesystem event. The
+    // existing watcher tests used `sleep(150ms)` to paper over this; the app
+    // should instead recover on its own.
+    let startup_refresh = sleep(Duration::from_millis(400));
+    tokio::pin!(startup_refresh);
+    let mut startup_refresh_pending = true;
 
     while !app.should_quit {
         // Draw at the top of the loop so the bootstrap state is visible
@@ -1661,6 +1670,10 @@ async fn run_loop(
                 if need_head_dirty {
                     app.mark_head_dirty();
                 }
+            }
+            _ = &mut startup_refresh, if startup_refresh_pending => {
+                startup_refresh_pending = false;
+                app.recompute_diff();
             }
             _ = frame.tick(), if app.anim.is_some() => {
                 // The tick itself carries no payload — falling through

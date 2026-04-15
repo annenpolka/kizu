@@ -1,9 +1,15 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import type { Session } from "tuistory";
 import { createTempRepo, launchKizu, type Repo } from "./helpers";
 
 let session: Session | null = null;
 let repo: Repo | null = null;
+
+// These scenarios intentionally wait up to 10s for watcher-driven UI updates.
+// Bun's default 5s per-test timeout can kill the test harness before
+// `waitForText(..., { timeout: 10_000 })` gets a chance to finish under CI
+// load or when the macOS PollWatcher fallback is active.
+setDefaultTimeout(15_000);
 
 afterEach(() => {
   session?.close();

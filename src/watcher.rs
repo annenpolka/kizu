@@ -5,8 +5,11 @@ use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{
-    DebounceEventResult, Debouncer, RecommendedCache, new_debouncer, notify::RecommendedWatcher,
+    DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt,
+    notify::{Config as NotifyConfig, PollWatcher},
 };
+#[cfg(not(target_os = "macos"))]
+use notify_debouncer_full::{new_debouncer, notify::RecommendedWatcher};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Worktree debounce window (SPEC.md).
@@ -14,6 +17,19 @@ const WORKTREE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// `<git_dir>` debounce window (SPEC.md). HEAD/refs move much less often than
 /// random worktree edits, so we keep the window short.
 const HEAD_DEBOUNCE: Duration = Duration::from_millis(100);
+
+#[cfg(target_os = "macos")]
+type KizuWatcher = PollWatcher;
+#[cfg(not(target_os = "macos"))]
+type KizuWatcher = RecommendedWatcher;
+type KizuDebouncer = Debouncer<KizuWatcher, RecommendedCache>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchRoot {
+    path: PathBuf,
+    recursive_mode: RecursiveMode,
+    compare_contents: bool,
+}
 
 /// A coarse classification of file system activity that the app loop cares
 /// about. The actual diff recompute is driven from these signals; we don't
@@ -61,14 +77,8 @@ pub struct WatchHandle {
     /// for linked worktrees). Same rationale as `git_dir`.
     common_git_dir: PathBuf,
     // The debouncers must outlive `events`; dropping them stops the watchers.
-    _worktree: Debouncer<RecommendedWatcher, RecommendedCache>,
-    _git_dir: Debouncer<RecommendedWatcher, RecommendedCache>,
-    // Only set when the repository is a linked worktree — the common
-    // git dir lives elsewhere and holds the shared `refs/heads/` tree
-    // that actually moves when `git commit` runs. When the common dir
-    // matches `git_dir` (normal repos) we skip the second watcher to
-    // avoid double-firing GitHead.
-    _common_git_dir: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
+    _worktree: KizuDebouncer,
+    _git_state: Vec<KizuDebouncer>,
 }
 
 impl WatchHandle {
@@ -135,22 +145,14 @@ pub fn start(
     )));
 
     let worktree = spawn_worktree_debouncer(&worktree_root, &git_dir_owned, tx.clone())?;
-    let git_dir_watcher =
-        spawn_git_dir_debouncer(&git_dir_owned, Arc::clone(&matcher), tx.clone())?;
-
-    // Only spin up a second watcher when the common dir really differs
-    // from the per-worktree dir; otherwise we'd double-fire GitHead on
-    // every HEAD/ref write in a normal repo.
-    let common_git_dir_watcher =
-        if canonicalize_or_self(&common_git_dir_owned) == canonicalize_or_self(&git_dir_owned) {
-            None
-        } else {
-            Some(spawn_git_dir_debouncer(
-                &common_git_dir_owned,
-                Arc::clone(&matcher),
-                tx,
-            )?)
-        };
+    let mut git_state = Vec::new();
+    for watch_root in git_state_watch_roots(&git_dir_owned, &common_git_dir_owned) {
+        git_state.push(spawn_git_state_debouncer(
+            &watch_root,
+            Arc::clone(&matcher),
+            tx.clone(),
+        )?);
+    }
 
     Ok(WatchHandle {
         events: rx,
@@ -158,8 +160,7 @@ pub fn start(
         git_dir: git_dir_owned,
         common_git_dir: common_git_dir_owned,
         _worktree: worktree,
-        _git_dir: git_dir_watcher,
-        _common_git_dir: common_git_dir_watcher,
+        _git_state: git_state,
     })
 }
 
@@ -230,11 +231,11 @@ fn spawn_worktree_debouncer(
     root: &Path,
     git_dir: &Path,
     tx: UnboundedSender<WatchEvent>,
-) -> Result<Debouncer<RecommendedWatcher, RecommendedCache>> {
+) -> Result<KizuDebouncer> {
     let git_dir = git_dir.to_path_buf();
-    let mut debouncer = new_debouncer(
+    let mut debouncer = new_kizu_debouncer(
         WORKTREE_DEBOUNCE,
-        None,
+        false,
         move |result: DebounceEventResult| {
             let events = match result {
                 Ok(events) => events,
@@ -267,57 +268,133 @@ fn spawn_worktree_debouncer(
     Ok(debouncer)
 }
 
-fn spawn_git_dir_debouncer(
-    git_dir: &Path,
+fn git_state_watch_roots(git_dir: &Path, common_git_dir: &Path) -> Vec<WatchRoot> {
+    let packed_refs = common_git_dir.join("packed-refs");
+    let packed_root = if packed_refs.exists() {
+        WatchRoot {
+            path: packed_refs,
+            recursive_mode: RecursiveMode::NonRecursive,
+            compare_contents: true,
+        }
+    } else {
+        // `packed-refs` is optional; watch the common git-dir root just
+        // deeply enough to notice when the file is born. Keep this
+        // non-recursive so we never scan object packs or logs.
+        WatchRoot {
+            path: common_git_dir.to_path_buf(),
+            recursive_mode: RecursiveMode::NonRecursive,
+            compare_contents: false,
+        }
+    };
+
+    vec![
+        WatchRoot {
+            path: git_dir.join("HEAD"),
+            recursive_mode: RecursiveMode::NonRecursive,
+            compare_contents: true,
+        },
+        // Branch refs live under the shared `refs/` tree. Watching only
+        // this subtree keeps the poll fallback off `.git/objects/**`
+        // while still catching new branch files and nested branch names.
+        WatchRoot {
+            path: common_git_dir.join("refs"),
+            recursive_mode: RecursiveMode::Recursive,
+            compare_contents: true,
+        },
+        packed_root,
+    ]
+}
+
+fn spawn_git_state_debouncer(
+    watch_root: &WatchRoot,
     matcher: SharedMatcher,
     tx: UnboundedSender<WatchEvent>,
-) -> Result<Debouncer<RecommendedWatcher, RecommendedCache>> {
-    let mut debouncer = new_debouncer(HEAD_DEBOUNCE, None, move |result: DebounceEventResult| {
-        let events = match result {
-            Ok(events) => events,
-            Err(errors) => {
-                let msg = format_notify_errors("git_dir", &errors);
-                let _ = tx.send(WatchEvent::Error(msg));
+) -> Result<KizuDebouncer> {
+    let mut debouncer = new_kizu_debouncer(
+        HEAD_DEBOUNCE,
+        watch_root.compare_contents,
+        move |result: DebounceEventResult| {
+            let events = match result {
+                Ok(events) => events,
+                Err(errors) => {
+                    let msg = format_notify_errors("git_dir", &errors);
+                    let _ = tx.send(WatchEvent::Error(msg));
+                    return;
+                }
+            };
+            // Read-lock the shared matcher once per burst. `R` may have
+            // hot-swapped the inner value since the previous firing (the
+            // user checked out a different branch and re-baselined), so
+            // we always read through the Arc rather than capturing a
+            // snapshot in the closure.
+            //
+            // Only treat baseline-affecting paths (the per-worktree HEAD,
+            // the common-dir branch ref the session is currently tracking,
+            // packed-refs) as real head movement. Plain bookkeeping churn
+            // — `index`, `index.lock`, `logs/`, pack files, reflog writes
+            // — and unrelated refs (remotes, tags, other branches) must
+            // not raise the stale-baseline indicator, otherwise a
+            // `git fetch` or a sibling linked worktree's commit would
+            // wrongly flag our HEAD as drifted.
+            let Ok(guard) = matcher.read() else {
+                // Poisoned RwLock: refuse to swallow the burst silently —
+                // bubble a health-level error so the app layer forces a
+                // recompute and marks the watcher unhealthy.
+                let _ = tx.send(WatchEvent::Error(
+                    "watcher [git_dir]: baseline matcher lock poisoned".to_string(),
+                ));
                 return;
+            };
+            let baseline_touched = events
+                .iter()
+                .any(|ev| ev.event.paths.iter().any(|p| guard.matches(p)));
+            drop(guard);
+            if baseline_touched {
+                let _ = tx.send(WatchEvent::GitHead);
             }
-        };
-        // Read-lock the shared matcher once per burst. `R` may have
-        // hot-swapped the inner value since the previous firing (the
-        // user checked out a different branch and re-baselined), so
-        // we always read through the Arc rather than capturing a
-        // snapshot in the closure.
-        //
-        // Only treat baseline-affecting paths (the per-worktree HEAD,
-        // the common-dir branch ref the session is currently tracking,
-        // packed-refs) as real head movement. Plain bookkeeping churn
-        // — `index`, `index.lock`, `logs/`, pack files, reflog writes
-        // — and unrelated refs (remotes, tags, other branches) must
-        // not raise the stale-baseline indicator, otherwise a
-        // `git fetch` or a sibling linked worktree's commit would
-        // wrongly flag our HEAD as drifted.
-        let Ok(guard) = matcher.read() else {
-            // Poisoned RwLock: refuse to swallow the burst silently —
-            // bubble a health-level error so the app layer forces a
-            // recompute and marks the watcher unhealthy.
-            let _ = tx.send(WatchEvent::Error(
-                "watcher [git_dir]: baseline matcher lock poisoned".to_string(),
-            ));
-            return;
-        };
-        let baseline_touched = events
-            .iter()
-            .any(|ev| ev.event.paths.iter().any(|p| guard.matches(p)));
-        drop(guard);
-        if baseline_touched {
-            let _ = tx.send(WatchEvent::GitHead);
-        }
-    })
+        },
+    )
     .context("failed to create git_dir debouncer")?;
 
     debouncer
-        .watch(git_dir, RecursiveMode::Recursive)
-        .with_context(|| format!("failed to watch git_dir at {}", git_dir.display()))?;
+        .watch(&watch_root.path, watch_root.recursive_mode)
+        .with_context(|| format!("failed to watch git_dir at {}", watch_root.path.display()))?;
     Ok(debouncer)
+}
+
+fn new_kizu_debouncer<F>(
+    timeout: Duration,
+    compare_contents: bool,
+    event_handler: F,
+) -> notify::Result<KizuDebouncer>
+where
+    F: notify_debouncer_full::DebounceEventHandler,
+{
+    #[cfg(target_os = "macos")]
+    {
+        // The native FSEvents-backed `RecommendedWatcher` is unreliable in
+        // this project's real macOS environments and in cargo test: create
+        // events can vanish entirely. PollWatcher is slower but observable.
+        //
+        // Keep the poll cadence below the public debounce window so the
+        // worst-case latency stays close to the advertised 300ms / 100ms.
+        let poll_interval = timeout.checked_div(4).unwrap_or(timeout);
+        new_debouncer_opt::<F, KizuWatcher, RecommendedCache>(
+            timeout,
+            None,
+            event_handler,
+            RecommendedCache::new(),
+            NotifyConfig::default()
+                .with_poll_interval(poll_interval)
+                .with_compare_contents(compare_contents),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = compare_contents;
+        new_debouncer(timeout, None, event_handler)
+    }
 }
 
 /// Format one or more notify errors into the human-readable footer
@@ -348,7 +425,33 @@ fn is_inside(path: &Path, git_dir: &Path) -> bool {
 }
 
 pub(crate) fn canonicalize_or_self(p: &Path) -> PathBuf {
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+    if let Ok(canonical) = p.canonicalize() {
+        return canonical;
+    }
+
+    // Some paths we must compare against legitimately do not exist yet
+    // when the watcher starts: a freshly checked-out branch can create
+    // `refs/heads/<branch>` after startup, and packed-refs can be born
+    // later via `git pack-refs`. Canonicalizing only existing ancestors
+    // keeps symlinked temp roots (`/var` vs `/private/var`) stable while
+    // preserving the not-yet-created tail we still need to match.
+    let mut missing_tail = Vec::new();
+    let mut cursor = p;
+    while let Some(parent) = cursor.parent() {
+        let Some(name) = cursor.file_name() else {
+            break;
+        };
+        missing_tail.push(name.to_os_string());
+        if let Ok(mut canonical_parent) = parent.canonicalize() {
+            for segment in missing_tail.iter().rev() {
+                canonical_parent.push(segment);
+            }
+            return canonical_parent;
+        }
+        cursor = parent;
+    }
+
+    p.to_path_buf()
 }
 
 #[cfg(test)]
@@ -356,6 +459,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+    use std::sync::mpsc;
     use tempfile::TempDir;
     use tokio::time::{Duration as TokioDuration, timeout};
 
@@ -734,6 +838,98 @@ mod tests {
         assert!(!matcher.matches(&common.join("HEAD")));
         // A sibling linked worktree's HEAD file is also unrelated.
         assert!(!matcher.matches(&common.join("worktrees").join("wt2").join("HEAD")));
+    }
+
+    #[test]
+    fn canonicalize_or_self_preserves_missing_tail_under_canonical_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("refs").join("heads");
+        fs::create_dir_all(&parent).expect("create existing parent");
+
+        let missing = parent.join("future-branch");
+        let canonical_parent = parent.canonicalize().expect("canonical parent");
+        assert_eq!(
+            canonicalize_or_self(&missing),
+            canonical_parent.join("future-branch")
+        );
+    }
+
+    #[test]
+    fn git_state_watch_roots_focus_on_head_refs_and_packed_refs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git_dir = temp.path().join(".git");
+        fs::create_dir_all(git_dir.join("refs").join("heads")).expect("create refs/heads");
+
+        let roots_without_packed = git_state_watch_roots(&git_dir, &git_dir);
+        assert_eq!(
+            roots_without_packed,
+            vec![
+                WatchRoot {
+                    path: git_dir.join("HEAD"),
+                    recursive_mode: RecursiveMode::NonRecursive,
+                    compare_contents: true,
+                },
+                WatchRoot {
+                    path: git_dir.join("refs"),
+                    recursive_mode: RecursiveMode::Recursive,
+                    compare_contents: true,
+                },
+                WatchRoot {
+                    path: git_dir.clone(),
+                    recursive_mode: RecursiveMode::NonRecursive,
+                    compare_contents: false,
+                },
+            ]
+        );
+
+        fs::write(git_dir.join("packed-refs"), "ref: demo\n").expect("write packed-refs");
+        let roots_with_packed = git_state_watch_roots(&git_dir, &git_dir);
+        assert_eq!(
+            roots_with_packed[2],
+            WatchRoot {
+                path: git_dir.join("packed-refs"),
+                recursive_mode: RecursiveMode::NonRecursive,
+                compare_contents: true,
+            }
+        );
+    }
+
+    #[test]
+    fn selected_kizu_backend_smoke_receives_create_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = mpsc::channel();
+        let mut debouncer =
+            new_kizu_debouncer(TokioDuration::from_millis(50), false, tx).expect("new debouncer");
+        debouncer
+            .watch(dir.path(), RecursiveMode::Recursive)
+            .expect("watch tempdir");
+
+        let file = dir.path().join("smoke.txt");
+        fs::write(&file, "ok\n").expect("write smoke file");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let batch = rx
+                .recv_timeout(deadline - std::time::Instant::now())
+                .expect("receive debounced event")
+                .expect("notify backend error");
+            if batch.iter().any(|event| {
+                event.event.paths.iter().any(|path| {
+                    *path == file
+                        || path
+                            .canonicalize()
+                            .ok()
+                            .is_some_and(|canonical| canonical == file)
+                })
+            }) {
+                return;
+            }
+        }
+
+        panic!(
+            "selected kizu watcher backend never observed {}",
+            file.display()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

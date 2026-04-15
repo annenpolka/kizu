@@ -41,3 +41,7 @@ Michael Nygard 形式を採用する。ファイル名は `NNNN-kebab-case-title
 - [0004 — e2e テストに tuistory + bun を採用する](0004-tuistory-e2e.md)
 - [0005 — watcher は coalescing で吸収し kizu 側に .gitignore フィルタを持たない](0005-watcher-coalescing-no-ignore-filter.md)
 - [0006 — 縦 2 ペイン UI を廃止し、フルスクリーン縦巻物 + popup picker に転換する](0006-scroll-with-popup-picker.md)
+- [0007 — visual-row scroll model + session-scoped watcher observability](0007-visual-row-scroll-and-session-scoped-watcher.md)
+- [0008 — Dynamic watcher reconfiguration + health decoupled from diff errors](0008-dynamic-watcher-and-health-split.md)
+- [0009 — Visual cursor sub-row, self-consistent sticky header, content-row follow target](0009-visual-cursor-position.md)
+- [0010 — macOS watcher は poll fallback を使い、git state watch root を HEAD / refs / packed-refs に絞る](0010-macos-poll-fallback-and-targeted-git-watch-roots.md)
