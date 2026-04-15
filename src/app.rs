@@ -232,24 +232,29 @@ const HALF_PAGE: usize = 12;
 /// stream into a single `tokio::select!`, applies drain-based coalescing
 /// (ADR-0005), and renders through [`crate::ui::render`] every iteration.
 ///
-/// Raw mode, alternate-screen entry, panic hook, and main wiring all live
-/// in M5. For now this function compiles and runs the core loop, but it is
-/// **not yet called from `main`**.
-#[allow(dead_code)]
+/// `ratatui::try_init` installs a panic hook, enables raw mode, and enters
+/// the alternate screen for us; `try_restore` reverses both regardless of
+/// how the inner loop exits.
 pub async fn run() -> Result<()> {
-    use crossterm::event::{Event, EventStream};
-    use futures_util::StreamExt;
-    use ratatui::Terminal;
-    use ratatui::backend::CrosstermBackend;
-    use std::io::stdout;
-
     let cwd = std::env::current_dir().context("reading current directory")?;
     let mut app = App::bootstrap(cwd)?;
     let mut watch = watcher::start(&app.root, &app.git_dir)?;
-    let mut events = EventStream::new();
 
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend).context("constructing ratatui terminal")?;
+    let mut terminal = ratatui::try_init().context("initializing terminal")?;
+    let result = run_loop(&mut terminal, &mut app, &mut watch).await;
+    let _ = ratatui::try_restore();
+    result
+}
+
+async fn run_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    watch: &mut watcher::WatchHandle,
+) -> Result<()> {
+    use crossterm::event::{Event, EventStream};
+    use futures_util::StreamExt;
+
+    let mut events = EventStream::new();
 
     while !app.should_quit {
         tokio::select! {
@@ -276,7 +281,7 @@ pub async fn run() -> Result<()> {
             }
         }
         terminal
-            .draw(|frame| crate::ui::render(frame, &app))
+            .draw(|frame| crate::ui::render(frame, app))
             .context("ratatui draw")?;
     }
 
