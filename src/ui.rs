@@ -40,24 +40,41 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // M4v + cursor placement:
+    // M4v + cursor placement + wrap-aware scroll (ADR-0007):
     //   - The cursor row inside `app.layout.rows` is `app.scroll`.
-    //   - The viewport's *top* row is derived from the cursor + the
-    //     current `CursorPlacement` (centered by default, bottom when
-    //     the user has pressed `z`).
-    //   - When the cursor sits inside a hunk whose header has scrolled
-    //     off the top, the header is pinned to viewport row 0 (sticky
-    //     scroll), shrinking the body area by one row.
+    //   - The viewport's *top* is produced by
+    //     `App::viewport_placement`, which returns `(top_row,
+    //     skip_visual)`. In nowrap `skip_visual` is always 0 so the
+    //     renderer walks whole logical rows. In wrap the placement
+    //     operates in visual-row space via `VisualIndex`, and
+    //     `skip_visual` lets the renderer start drawing mid-row so
+    //     the cursor always lands at its placement target regardless
+    //     of how much preceding diff content wraps.
+    //   - Sticky header still works: the cursor's enclosing hunk is
+    //     pinned to viewport row 0 when its header would otherwise
+    //     be off the top.
     let total_rows = app.layout.rows.len();
     let selected = app.current_hunk();
     let cursor_row = app.scroll;
     let now = std::time::Instant::now();
 
+    // In wrap mode we reserve 7 cells per row: 5 for the left bar,
+    // 1 for the `+`/`-`/` ` prefix, 1 for the `¶` newline marker.
+    // Compute this *before* calling `viewport_placement` because the
+    // placement math needs the wrap body width to produce a correct
+    // `VisualIndex`.
+    let wrap_body_width: Option<usize> = if app.wrap_lines {
+        Some((area.width as usize).saturating_sub(7).max(1))
+    } else {
+        None
+    };
+
     // Provisional body height (before sticky decision). We re-compute
-    // viewport_top with the *real* body height further down so the
-    // sticky overlay never makes the cursor jitter.
+    // placement with the *real* body height further down so the sticky
+    // overlay never makes the cursor jitter.
     let raw_body_height = area.height as usize;
-    let provisional_top = app.visual_viewport_top(raw_body_height, now);
+    let (provisional_top, _provisional_skip) =
+        app.viewport_placement(raw_body_height, wrap_body_width, now);
 
     // Sticky header: cursor is inside a hunk whose header sits above
     // the visible viewport top.
@@ -86,25 +103,21 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let viewport_height = content_area.height as usize;
-    // Tell the App layer how tall the body actually was so the next
-    // `J`/`K` press can size its scroll chunk relative to this height.
+    // Tell the App layer how tall/wide the body actually was so the
+    // next `J`/`K` / Ctrl-d press can size its scroll chunk relative
+    // to the current screen dimensions.
     app.last_body_height.set(viewport_height);
-    let viewport_top = app.visual_viewport_top(viewport_height, now);
-
-    // In wrap mode we reserve 7 cells per row: 5 for the left bar,
-    // 1 for the `+`/`-`/` ` prefix, 1 for the `¶` newline marker.
-    let wrap_body_width: Option<usize> = if app.wrap_lines {
-        Some((content_area.width as usize).saturating_sub(7).max(1))
-    } else {
-        None
-    };
+    app.last_body_width.set(wrap_body_width);
+    let (viewport_top, skip_visual) = app.viewport_placement(viewport_height, wrap_body_width, now);
 
     // Walk logical rows from `viewport_top` and accumulate visual
     // lines until we've filled the viewport or run out of rows.
     // Wrapped DiffLines contribute multiple visual rows per logical
-    // row; everything else contributes exactly one.
+    // row; the first row honours `skip_visual` so wrap-mode placement
+    // can begin drawing in the middle of a wrapped line when needed.
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport_height);
     let mut row_idx = viewport_top;
+    let mut skip_remaining = skip_visual;
     while row_idx < total_rows && lines.len() < viewport_height {
         let is_cursor = row_idx == cursor_row;
         let row_lines = render_row(
@@ -114,7 +127,17 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             is_cursor,
             wrap_body_width,
         );
-        for line in row_lines {
+        let mut take = row_lines.into_iter();
+        // Discard any leading visual lines requested by the
+        // placement layer (only the first logical row ever carries
+        // a non-zero `skip_remaining` budget).
+        for _ in 0..skip_remaining {
+            if take.next().is_none() {
+                break;
+            }
+        }
+        skip_remaining = 0;
+        for line in take {
             if lines.len() >= viewport_height {
                 break;
             }
@@ -738,6 +761,7 @@ mod tests {
             root: PathBuf::from("/tmp/fake"),
             git_dir: PathBuf::from("/tmp/fake/.git"),
             common_git_dir: PathBuf::from("/tmp/fake/.git"),
+            current_branch_ref: Some("refs/heads/main".into()),
             baseline_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
             files: Vec::new(),
             layout: ScrollLayout::default(),
@@ -750,6 +774,7 @@ mod tests {
             head_dirty: false,
             should_quit: false,
             last_body_height: std::cell::Cell::new(24),
+            last_body_width: std::cell::Cell::new(None),
             visual_top: std::cell::Cell::new(0.0),
             anim: None,
             wrap_lines: false,

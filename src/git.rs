@@ -433,6 +433,40 @@ pub fn git_dir(root: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(raw.trim()))
 }
 
+/// Resolve the full ref name HEAD currently points at, e.g.
+/// `refs/heads/main`. Returns `Ok(None)` when HEAD is detached (a
+/// raw SHA rather than a symbolic ref) — in that case the session
+/// baseline cannot be moved by any ref write and callers should
+/// record "no active branch".
+///
+/// Uses `git symbolic-ref --quiet HEAD`: the `--quiet` flag turns
+/// the detached case into a non-zero exit with empty stderr, which
+/// we can tell apart from a genuine failure (corrupt refs,
+/// permissions, etc.) that emits a diagnostic.
+pub fn current_branch_ref(root: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(root)
+        .output()
+        .context("failed to spawn `git symbolic-ref HEAD`")?;
+
+    if output.status.success() {
+        let raw = String::from_utf8(output.stdout)
+            .context("`git symbolic-ref HEAD` produced non-UTF8 output")?;
+        return Ok(Some(raw.trim().to_string()));
+    }
+
+    // Non-zero exit. `--quiet` emits an empty stderr only for the
+    // detached-HEAD case; any other diagnostic means something is
+    // actually broken and must be surfaced.
+    let stderr_empty = output.stderr.iter().all(|b| b.is_ascii_whitespace());
+    if stderr_empty {
+        return Ok(None);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!("`git symbolic-ref HEAD` failed: {}", stderr.trim()))
+}
+
 /// Resolve the **common** git dir — the shared location where
 /// `refs/heads/**`, `packed-refs`, and other branch-wide state live.
 ///

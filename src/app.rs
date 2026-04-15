@@ -27,6 +27,12 @@ pub struct App {
     /// main repo's `.git/`. The watcher needs both to catch commits
     /// performed inside a linked worktree (ADR-0005 addendum).
     pub common_git_dir: PathBuf,
+    /// Full ref name that HEAD pointed at when the session started
+    /// (e.g. `refs/heads/main`). `None` if HEAD was detached. Used
+    /// by the watcher to narrow the baseline-affecting path set —
+    /// unrelated ref activity (remotes, tags, sibling branches) no
+    /// longer raises false HEAD-dirty signals (ADR-0007).
+    pub current_branch_ref: Option<String>,
     pub baseline_sha: String,
     /// Files in the diff, sorted by `mtime` descending. Index 0 is the
     /// most-recently-modified file.
@@ -56,6 +62,11 @@ pub struct App {
     /// chunk relative to the current screen — bigger window, bigger jumps.
     /// Defaults to 24 before the first render.
     pub last_body_height: Cell<usize>,
+    /// Last wrap body width the renderer used, or `None` when wrap
+    /// mode is disabled. Key handlers read this to drive visual-row
+    /// scroll math (see [`VisualIndex`]). Updated every frame in
+    /// tandem with `last_body_height`.
+    pub last_body_width: Cell<Option<usize>>,
     /// The row position the renderer actually drew the viewport at on
     /// the last frame. Matches the logical [`Self::viewport_top`] when
     /// idle; lags behind during a [`ScrollAnim`]. Used as the `from`
@@ -143,6 +154,140 @@ pub struct ScrollLayout {
 /// to update [`App::last_body_height`]. 24 is the classic VT100 height.
 const DEFAULT_BODY_HEIGHT: usize = 24;
 
+/// Per-render map from logical row index → visual y offset, computed
+/// against the current wrap body width. Every frame the renderer
+/// rebuilds a fresh index (cheap: O(rows) with the 2000-row cap from
+/// `SCROLL_ROW_LIMIT`) so scroll math can talk about visual y instead
+/// of logical rows.
+///
+/// The key invariant: `prefix[i]` is the visual y-offset where logical
+/// row `i` begins, and `prefix[i+1] - prefix[i]` is the visual height
+/// of row `i`. In **nowrap** mode every row is exactly 1 visual row
+/// tall, so `prefix` is `[0, 1, 2, …, n]` and `visual_y(row)` is the
+/// identity — all existing logical-row tests stay numerically correct.
+/// In **wrap** mode, diff lines whose content exceeds `body_width`
+/// contribute multiple visual rows and the prefix becomes non-trivial.
+///
+/// Animation (`ScrollAnim`) and viewport placement operate over this
+/// coordinate space, not logical rows. That's the crux of the wrap-mode
+/// fix — logical-row scrolling against wrap rendering was pushing the
+/// cursor off-screen because a few wrapped rows ahead of the cursor
+/// could silently consume the entire viewport before the cursor's
+/// logical row was ever emitted.
+#[derive(Debug, Clone)]
+pub struct VisualIndex {
+    /// Cumulative visual y-offsets, length `rows.len() + 1`.
+    /// `prefix[rows.len()]` is the total visual height of the layout.
+    prefix: Vec<usize>,
+    /// Wrap body width this index was built against. `None` means
+    /// nowrap, in which case `prefix` is the identity mapping — kept
+    /// on the value so downstream code (and tests) can tell at a
+    /// glance whether visual and logical coordinates coincide.
+    #[allow(dead_code)]
+    pub body_width: Option<usize>,
+}
+
+impl VisualIndex {
+    /// Build a fresh prefix sum against the current layout and the
+    /// supplied wrap body width. Pass `None` for nowrap mode; the
+    /// resulting index acts as the identity and keeps the legacy
+    /// logical-row scroll model intact.
+    pub fn build(layout: &ScrollLayout, files: &[FileDiff], body_width: Option<usize>) -> Self {
+        let n = layout.rows.len();
+        let mut prefix = Vec::with_capacity(n + 1);
+        prefix.push(0);
+        let mut acc = 0usize;
+        for row in &layout.rows {
+            let h = Self::row_visual_height(row, files, body_width);
+            acc += h;
+            prefix.push(acc);
+        }
+        Self { prefix, body_width }
+    }
+
+    /// Visual y offset where logical row `row_idx` begins.
+    pub fn visual_y(&self, row_idx: usize) -> usize {
+        self.prefix.get(row_idx).copied().unwrap_or(0)
+    }
+
+    /// Visual-row height of logical row `row_idx`. Falls back to 1
+    /// for out-of-range indices so callers don't need to bounds-check.
+    pub fn visual_height(&self, row_idx: usize) -> usize {
+        match (self.prefix.get(row_idx), self.prefix.get(row_idx + 1)) {
+            (Some(&a), Some(&b)) => b - a,
+            _ => 1,
+        }
+    }
+
+    /// Total visual height of the layout.
+    pub fn total_visual(&self) -> usize {
+        self.prefix.last().copied().unwrap_or(0)
+    }
+
+    /// Given a visual y offset, return `(logical_row, skip_within_row)`
+    /// where `logical_row` is the logical row that contains y and
+    /// `skip_within_row` is how many visual lines of that row sit at
+    /// or above y. Used by the renderer to begin drawing mid-row
+    /// when wrap pushes the viewport's top into the middle of a
+    /// wrapped diff line.
+    pub fn logical_at(&self, y: usize) -> (usize, usize) {
+        if self.prefix.len() < 2 {
+            return (0, 0);
+        }
+        // Clamp past-the-end to the last row's final visual line.
+        let total = self.total_visual();
+        if y >= total {
+            let last = self.prefix.len() - 2;
+            return (last, self.visual_height(last).saturating_sub(1));
+        }
+        // Binary search: smallest `i` such that prefix[i+1] > y.
+        let mut lo = 0usize;
+        let mut hi = self.prefix.len() - 1;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.prefix[mid + 1] > y {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let within = y - self.prefix[lo];
+        (lo, within)
+    }
+
+    fn row_visual_height(row: &RowKind, files: &[FileDiff], body_width: Option<usize>) -> usize {
+        let Some(width) = body_width else {
+            return 1;
+        };
+        let RowKind::DiffLine {
+            file_idx,
+            hunk_idx,
+            line_idx,
+        } = row
+        else {
+            return 1;
+        };
+        let Some(file) = files.get(*file_idx) else {
+            return 1;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return 1;
+        };
+        let Some(hunk) = hunks.get(*hunk_idx) else {
+            return 1;
+        };
+        let Some(line) = hunk.lines.get(*line_idx) else {
+            return 1;
+        };
+        let chars = line.content.chars().count();
+        if chars == 0 {
+            1
+        } else {
+            chars.div_ceil(width.max(1))
+        }
+    }
+}
+
 /// One displayable row in the scroll view. The renderer turns each variant
 /// into a styled `Line`; the App layer cares about `(file_idx, hunk_idx)`
 /// for navigation.
@@ -229,9 +374,18 @@ impl App {
         let git_dir = git::git_dir(&root).context("resolving git directory")?;
         let common_git_dir =
             git::git_common_dir(&root).context("resolving common git directory")?;
+        let current_branch_ref =
+            git::current_branch_ref(&root).context("resolving current branch ref")?;
         let baseline_sha = git::head_sha(&root).context("capturing baseline HEAD")?;
         let diff = git::compute_diff(&root, &baseline_sha);
-        Self::bootstrap_with_diff(root, git_dir, common_git_dir, baseline_sha, diff)
+        Self::bootstrap_with_diff(
+            root,
+            git_dir,
+            common_git_dir,
+            current_branch_ref,
+            baseline_sha,
+            diff,
+        )
     }
 
     /// Inner bootstrap: takes already-resolved git layout plus the
@@ -244,6 +398,7 @@ impl App {
         root: PathBuf,
         git_dir: PathBuf,
         common_git_dir: PathBuf,
+        current_branch_ref: Option<String>,
         baseline_sha: String,
         diff: Result<Vec<FileDiff>>,
     ) -> Result<Self> {
@@ -253,6 +408,7 @@ impl App {
             root,
             git_dir,
             common_git_dir,
+            current_branch_ref,
             baseline_sha,
             files: Vec::new(),
             layout: ScrollLayout::default(),
@@ -265,6 +421,7 @@ impl App {
             head_dirty: false,
             should_quit: false,
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
+            last_body_width: Cell::new(None),
             visual_top: Cell::new(0.0),
             anim: None,
             wrap_lines: false,
@@ -293,8 +450,17 @@ impl App {
     /// Toggle line-wrap mode. `w` calls this. When on, the renderer
     /// wraps long diff lines at the viewport width and decorates every
     /// logical line end with a `¶` marker.
+    ///
+    /// Also kills any in-flight scroll animation: under wrap the
+    /// viewport's top position is tracked in visual-row space
+    /// ([`VisualIndex`]), while under nowrap it's logical rows. The
+    /// two scales diverge as soon as a single diff line wraps to more
+    /// than one visual row, so tweening between them would produce a
+    /// disorienting jump. Clearing `anim` makes the next frame snap
+    /// to the correct target instead.
     pub fn toggle_wrap_lines(&mut self) {
         self.wrap_lines = !self.wrap_lines;
+        self.anim = None;
     }
 
     /// Re-run `git diff`, populate per-file mtimes, sort files by mtime
@@ -559,8 +725,24 @@ impl App {
 
     pub fn scroll_by(&mut self, delta: isize) {
         let last = self.last_row_index();
-        let next = (self.scroll as isize + delta).clamp(0, last as isize) as usize;
-        self.scroll_to(next);
+        let body_width = self.last_body_width.get();
+        if body_width.is_none() {
+            // Nowrap fast path: one logical row == one visual row.
+            let next = (self.scroll as isize + delta).clamp(0, last as isize) as usize;
+            self.scroll_to(next);
+            return;
+        }
+        // Wrap mode: `delta` is interpreted as visual rows so that
+        // Ctrl-d/Ctrl-u (half-page) and any other callers move the
+        // cursor a screenful's worth of *visible* lines instead of
+        // logical rows, which under wrap could otherwise teleport
+        // the cursor across a whole wrapped block per keystroke.
+        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
+        let cur_y = vi.visual_y(self.scroll);
+        let new_y = (cur_y as isize + delta).max(0) as usize;
+        let clamped = new_y.min(vi.total_visual().saturating_sub(1));
+        let (target_row, _) = vi.logical_at(clamped);
+        self.scroll_to(target_row.min(last));
     }
 
     /// Animated scroll: move the cursor row to `row` and kick off a
@@ -601,8 +783,12 @@ impl App {
     /// Animated variant of [`Self::viewport_top`]: feeds the logical
     /// target through the active [`ScrollAnim`], sampling at `now`.
     /// Stores the result in [`Self::visual_top`] so the next animation
-    /// kick-off starts from the exact row the last frame drew. `ui`
-    /// calls this instead of [`Self::viewport_top`] directly.
+    /// kick-off starts from the exact row the last frame drew.
+    ///
+    /// This is the **nowrap** helper: it operates purely in logical
+    /// row units and is retained for the existing centering/hunk-anchor
+    /// tests plus nowrap renders. Wrap renders go through
+    /// [`Self::viewport_placement`] instead, which speaks visual y.
     pub fn visual_viewport_top(&self, viewport_height: usize, now: Instant) -> usize {
         let target = self.viewport_top(viewport_height) as f32;
         let visual = match self.anim.as_ref() {
@@ -611,6 +797,90 @@ impl App {
         };
         self.visual_top.set(visual);
         visual.round().max(0.0) as usize
+    }
+
+    /// Compute the viewport's top position for the current render,
+    /// returning `(top_row, skip_visual)` where `top_row` is the first
+    /// logical layout row to draw and `skip_visual` is the number of
+    /// visual lines of `top_row` the renderer should discard off the
+    /// top so that the cursor lands at its desired placement target.
+    ///
+    /// In **nowrap** mode every logical row is one visual row tall,
+    /// so the result is always `(visual_viewport_top(h), 0)` — the
+    /// legacy scroll model is preserved byte-for-byte. In **wrap**
+    /// mode `viewport_placement` converts the hunk-anchored placement
+    /// logic from logical-row space into visual-row space via
+    /// [`VisualIndex`]; the cursor's first visual row always lands at
+    /// the centre-of-viewport (or viewport ceiling under `Top`
+    /// placement), regardless of how much the preceding diff content
+    /// wraps. Animation is preserved across the transition: the tween
+    /// runs in visual y, which in nowrap collapses to logical rows
+    /// and matches the pre-rework behaviour numerically.
+    pub fn viewport_placement(
+        &self,
+        viewport_height: usize,
+        body_width: Option<usize>,
+        now: Instant,
+    ) -> (usize, usize) {
+        let Some(_width) = body_width else {
+            // Nowrap fast path — identical to the old visual_viewport_top.
+            return (self.visual_viewport_top(viewport_height, now), 0);
+        };
+        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
+        let target_y = self.placement_target_visual_y(viewport_height, &vi);
+        let sampled_y = match self.anim.as_ref() {
+            Some(anim) => anim.sample(target_y as f32, now).0,
+            None => target_y as f32,
+        };
+        self.visual_top.set(sampled_y);
+        let y = sampled_y.round().max(0.0) as usize;
+        vi.logical_at(y)
+    }
+
+    /// Visual-y coordinate of the viewport's top edge under wrap mode,
+    /// chosen so that the cursor (or its enclosing hunk) lands at the
+    /// current [`CursorPlacement`]'s preferred target. Mirrors the
+    /// nowrap [`Self::viewport_top`] hunk-anchoring logic, but in
+    /// visual-row units.
+    fn placement_target_visual_y(&self, viewport_height: usize, vi: &VisualIndex) -> usize {
+        let total_visual = vi.total_visual();
+        if total_visual <= viewport_height {
+            return 0;
+        }
+        let max_top_y = total_visual - viewport_height;
+
+        // Hunk-fits-in-viewport case: anchor the entire hunk at the
+        // placement target so the user always sees the full selected
+        // change as a single block, matching nowrap behaviour.
+        if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
+            let hunk_visual = vi.visual_y(hunk_end).saturating_sub(vi.visual_y(hunk_top));
+            if hunk_visual <= viewport_height {
+                let hunk_top_y = vi.visual_y(hunk_top);
+                let desired = match self.cursor_placement {
+                    CursorPlacement::Centered => {
+                        let pad = (viewport_height - hunk_visual) / 2;
+                        hunk_top_y.saturating_sub(pad)
+                    }
+                    CursorPlacement::Top => hunk_top_y,
+                };
+                return desired.min(max_top_y);
+            }
+        }
+
+        // Long-hunk / non-hunk fallback: place the cursor row itself
+        // at the placement target, measured in visual y.
+        let cursor_y = vi.visual_y(self.scroll);
+        let cursor_h = vi.visual_height(self.scroll);
+        let desired = match self.cursor_placement {
+            CursorPlacement::Centered => {
+                // Keep the cursor's first visual row at mid-viewport;
+                // subtract the cursor's own visual height to avoid
+                // clipping tall wrapped lines below the viewport.
+                cursor_y.saturating_sub(viewport_height.saturating_sub(cursor_h) / 2)
+            }
+            CursorPlacement::Top => cursor_y,
+        };
+        desired.min(max_top_y)
     }
 
     fn last_row_index(&self) -> usize {
@@ -663,12 +933,26 @@ impl App {
     pub fn next_change(&mut self) {
         let cursor = self.scroll;
         let viewport = self.last_body_height.get().max(1);
+        let body_width = self.last_body_width.get();
         if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
-            let hunk_size = hunk_end - hunk_top;
             let last_row = hunk_end.saturating_sub(1);
-            if hunk_size > viewport && cursor < last_row {
-                let target = (cursor + self.chunk_size()).min(last_row);
-                self.scroll_to(target);
+            // Measure hunk size in **visual** rows so a single
+            // wrapped long line doesn't falsely register as "short
+            // hunk, just jump". Under nowrap the VisualIndex is the
+            // identity and this collapses to the old logical-row
+            // check.
+            let vi = VisualIndex::build(&self.layout, &self.files, body_width);
+            let hunk_visual = vi.visual_y(hunk_end).saturating_sub(vi.visual_y(hunk_top));
+            if hunk_visual > viewport && cursor < last_row {
+                // Advance by a visual chunk, then convert back to a
+                // logical row. Clamp to the hunk's last logical row
+                // so the cursor never escapes the current hunk on
+                // what is supposed to be an intra-hunk step.
+                let cur_y = vi.visual_y(cursor);
+                let target_y = cur_y + self.chunk_size();
+                let max_y = vi.visual_y(last_row);
+                let (target_row, _) = vi.logical_at(target_y.min(max_y));
+                self.scroll_to(target_row.min(last_row));
                 return;
             }
         }
@@ -679,11 +963,16 @@ impl App {
     pub fn prev_change(&mut self) {
         let cursor = self.scroll;
         let viewport = self.last_body_height.get().max(1);
+        let body_width = self.last_body_width.get();
         if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
-            let hunk_size = hunk_end - hunk_top;
-            if hunk_size > viewport && cursor > hunk_top {
-                let target = cursor.saturating_sub(self.chunk_size()).max(hunk_top);
-                self.scroll_to(target);
+            let vi = VisualIndex::build(&self.layout, &self.files, body_width);
+            let hunk_visual = vi.visual_y(hunk_end).saturating_sub(vi.visual_y(hunk_top));
+            if hunk_visual > viewport && cursor > hunk_top {
+                let cur_y = vi.visual_y(cursor);
+                let target_y = cur_y.saturating_sub(self.chunk_size());
+                let min_y = vi.visual_y(hunk_top);
+                let (target_row, _) = vi.logical_at(target_y.max(min_y));
+                self.scroll_to(target_row.max(hunk_top));
                 return;
             }
         }
@@ -1047,7 +1336,12 @@ impl App {
 pub async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let mut app = App::bootstrap(cwd)?;
-    let mut watch = watcher::start(&app.root, &app.git_dir, &app.common_git_dir)?;
+    let mut watch = watcher::start(
+        &app.root,
+        &app.git_dir,
+        &app.common_git_dir,
+        app.current_branch_ref.as_deref(),
+    )?;
 
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
     let result = run_loop(&mut terminal, &mut app, &mut watch).await;
@@ -1092,13 +1386,28 @@ async fn run_loop(
                 }
             }
             Some(first) = watch.events.recv() => {
-                let mut worktree = matches!(first, WatchEvent::Worktree);
-                let mut head = matches!(first, WatchEvent::GitHead);
-                while let Ok(more) = watch.events.try_recv() {
-                    match more {
+                let mut worktree = false;
+                let mut head = false;
+                let mut error: Option<String> = None;
+                let mut current = Some(first);
+                while let Some(event) = current {
+                    match event {
                         WatchEvent::Worktree => worktree = true,
                         WatchEvent::GitHead => head = true,
+                        WatchEvent::Error(msg) => error = Some(msg),
                     }
+                    current = watch.events.try_recv().ok();
+                }
+                if let Some(msg) = error {
+                    // Backend failure: surface it in the footer and
+                    // force a diff recompute so the UI cannot silently
+                    // keep rendering the last good snapshot as if the
+                    // watcher were still healthy. `recompute_diff`
+                    // will clear `last_error` on success or overwrite
+                    // it with a fresher error on failure — either
+                    // outcome is visible to the user.
+                    app.last_error = Some(msg);
+                    worktree = true;
                 }
                 if worktree {
                     app.recompute_diff();
@@ -1193,6 +1502,7 @@ mod tests {
             root: PathBuf::from("/tmp/fake"),
             git_dir: PathBuf::from("/tmp/fake/.git"),
             common_git_dir: PathBuf::from("/tmp/fake/.git"),
+            current_branch_ref: Some("refs/heads/main".into()),
             baseline_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
             files: Vec::new(),
             layout: ScrollLayout::default(),
@@ -1205,6 +1515,7 @@ mod tests {
             head_dirty: false,
             should_quit: false,
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
+            last_body_width: Cell::new(None),
             visual_top: Cell::new(0.0),
             anim: None,
             wrap_lines: false,
@@ -2057,6 +2368,7 @@ mod tests {
             tmp.path().to_path_buf(),
             tmp.path().join(".git"),
             tmp.path().join(".git"),
+            Some("refs/heads/main".into()),
             "abcdef1234567890abcdef1234567890abcdef12".into(),
             Ok(vec![kept, gone]),
         )
@@ -2179,6 +2491,7 @@ mod tests {
             PathBuf::from("/tmp/fake"),
             PathBuf::from("/tmp/fake/.git"),
             PathBuf::from("/tmp/fake/.git"),
+            Some("refs/heads/main".into()),
             "abcdef1234567890abcdef1234567890abcdef12".into(),
             diff,
         );
@@ -2217,6 +2530,7 @@ mod tests {
             PathBuf::from("/tmp/fake"),
             PathBuf::from("/tmp/fake/.git"),
             PathBuf::from("/tmp/fake/.git"),
+            Some("refs/heads/main".into()),
             "abcdef1234567890abcdef1234567890abcdef12".into(),
             diff,
         )
@@ -2543,5 +2857,173 @@ mod tests {
         let v = app.visual_viewport_top(9, start + Duration::from_millis(50));
         let expected = (target * 0.875).round() as usize;
         assert_eq!(v, expected);
+    }
+
+    // ---- wrap-mode visual scroll model (ADR-0007) --------------------
+
+    /// Build an app with a single file containing one diff line whose
+    /// content is `width * wrap_factor` characters long — so at wrap
+    /// body_width=`width` the one logical DiffLine produces `wrap_factor`
+    /// visual rows. Used by the wrap regression tests below.
+    fn wrap_regression_app(wrap_factor: usize, width: usize) -> App {
+        let content: String = std::iter::repeat_n('x', width * wrap_factor).collect();
+        fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, &content)])],
+            100,
+        )])
+    }
+
+    #[test]
+    fn visual_index_nowrap_is_identity() {
+        // With body_width=None every logical row is exactly one
+        // visual row, so the prefix is [0, 1, …, n] and visual_y is
+        // the identity. This is the invariant that keeps every
+        // nowrap test numerically unchanged after the rework.
+        let app = wrap_regression_app(4, 10);
+        let vi = VisualIndex::build(&app.layout, &app.files, None);
+        assert_eq!(vi.total_visual(), app.layout.rows.len());
+        for i in 0..app.layout.rows.len() {
+            assert_eq!(vi.visual_y(i), i, "nowrap visual_y must be identity");
+            assert_eq!(vi.visual_height(i), 1);
+        }
+    }
+
+    #[test]
+    fn visual_index_wrap_expands_long_diff_lines() {
+        // 40 chars of content at body_width=10 must produce 4 visual
+        // rows for the single wrapped DiffLine. Non-diff rows (file
+        // header, hunk header, spacer) still contribute exactly 1.
+        let app = wrap_regression_app(4, 10);
+        let vi = VisualIndex::build(&app.layout, &app.files, Some(10));
+
+        // Find the one DiffLine row in the layout.
+        let diff_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::DiffLine { .. }))
+            .expect("layout must contain a DiffLine");
+        assert_eq!(
+            vi.visual_height(diff_row),
+            4,
+            "40 chars at width 10 = 4 visual rows"
+        );
+
+        // logical_at must round-trip: the first visual y inside the
+        // diff row maps back to that row with skip=0, and the second
+        // visual y maps to the same row with skip=1.
+        let base = vi.visual_y(diff_row);
+        assert_eq!(vi.logical_at(base), (diff_row, 0));
+        assert_eq!(vi.logical_at(base + 1), (diff_row, 1));
+        assert_eq!(vi.logical_at(base + 3), (diff_row, 3));
+    }
+
+    #[test]
+    fn viewport_placement_keeps_cursor_visible_across_wrapped_preceding_rows() {
+        // Adversarial case for Codex finding #3: the cursor sits
+        // just after a very long wrapped DiffLine. Under the old
+        // logical-row scroll model, `viewport_top` would put the
+        // wrapped line right at the top, let it consume the entire
+        // viewport in visual rows, and push the cursor OFF the
+        // bottom. With visual-row placement the cursor must always
+        // fall inside the viewport.
+        //
+        // Build a layout with two diff rows: a heavily-wrapped one,
+        // then a short one the cursor sits on.
+        let long_content: String = std::iter::repeat_n('x', 80).collect();
+        let short_content = "short".to_string();
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, &long_content),
+                    diff_line(LineKind::Added, &short_content),
+                ],
+            )],
+            100,
+        )]);
+        // Park the cursor on the second (short) diff row.
+        let short_row = app
+            .layout
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                RowKind::DiffLine { line_idx, .. } if *line_idx == 1 => Some(i),
+                _ => None,
+            })
+            .next()
+            .expect("second diff row");
+        app.scroll = short_row;
+        app.follow_mode = false;
+
+        let body_width = Some(10);
+        let body_height = 6;
+        app.last_body_width.set(body_width);
+        app.last_body_height.set(body_height);
+
+        let (top_row, skip_visual) =
+            app.viewport_placement(body_height, body_width, Instant::now());
+        // With 80 chars at width 10 the long line occupies 8 visual
+        // rows. Viewport is only 6 tall. If placement parked at
+        // `top_row = 0, skip = 0`, the cursor would be at visual y
+        // 8 (after FileHeader + HunkHeader + 8 wrap rows) and never
+        // render. The new placement must push the viewport forward
+        // far enough that the cursor's visual y falls inside [0, 6).
+        let vi = VisualIndex::build(&app.layout, &app.files, body_width);
+        let cursor_y = vi.visual_y(app.scroll);
+        let viewport_top_y = vi.visual_y(top_row) + skip_visual;
+        assert!(
+            cursor_y >= viewport_top_y && cursor_y < viewport_top_y + body_height,
+            "cursor at visual y {cursor_y} must sit inside viewport \
+             [y={viewport_top_y}, h={body_height}); got top_row={top_row} skip={skip_visual}"
+        );
+    }
+
+    #[test]
+    fn scroll_by_in_wrap_mode_advances_by_visual_rows_not_logical() {
+        // Under wrap, `scroll_by(delta)` must treat `delta` as
+        // visual rows so Ctrl-d/Ctrl-u move a screenful's worth of
+        // visible lines — not a screenful of logical rows, which in
+        // a long wrapped hunk could teleport the cursor past the
+        // whole block in one press.
+        let mut app = wrap_regression_app(6, 10); // 60 chars → 6 visual rows
+        app.last_body_width.set(Some(10));
+        app.last_body_height.set(6);
+        app.follow_mode = false;
+
+        // Park cursor on the file header (row 0, visual y 0).
+        app.scroll = 0;
+
+        // Advance by 3 visual rows. Layout: [FileHeader, HunkHeader,
+        // DiffLine(6 visual rows), …]. Visual ys: 0, 1, 2, 3, 4, 5,
+        // 6, 7. Visual y = 3 falls inside the DiffLine at logical
+        // row 2, with skip=1. `scroll_by` lands on logical row 2.
+        app.scroll_by(3);
+        assert_eq!(
+            app.scroll, 2,
+            "scroll_by(3) in wrap mode should land on the diff row at visual y 3"
+        );
+    }
+
+    #[test]
+    fn toggle_wrap_lines_clears_in_flight_scroll_animation() {
+        // Wrap toggling changes the coordinate system that anim
+        // tweens live in. The cleanest thing to do is snap: clear
+        // the anim so the next frame draws at the new target and
+        // no disorienting cross-system tween ever shows up.
+        let mut app = wrap_regression_app(2, 10);
+        app.anim = Some(ScrollAnim {
+            from: 5.0,
+            start: Instant::now(),
+            dur: Duration::from_millis(150),
+        });
+        app.toggle_wrap_lines();
+        assert!(
+            app.anim.is_none(),
+            "wrap toggle must clear scroll animation to avoid cross-coordinate tween"
+        );
     }
 }

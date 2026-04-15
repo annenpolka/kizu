@@ -18,12 +18,22 @@ const HEAD_DEBOUNCE: Duration = Duration::from_millis(100);
 /// about. The actual diff recompute is driven from these signals; we don't
 /// pass payloads on this channel because the app always re-runs `git diff`
 /// after coalescing (ADR-0005).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Error` is surfaced when the underlying notify backend reports a
+/// failure — a dropped event queue on macOS FSEvents, a watched
+/// directory that was moved or deleted, a kqueue overflow on BSD,
+/// etc. The app turns it into a visible `last_error` and forces a
+/// recompute so the UI can't silently drift stale if the filesystem
+/// hook has quietly fallen over.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchEvent {
     /// Something inside the worktree (excluding `<git_dir>`) changed.
     Worktree,
     /// Something inside `<git_dir>` changed (HEAD, refs, packed refs, …).
     GitHead,
+    /// The underlying notify backend reported an error. The app
+    /// treats this as a forced recompute plus a visible error string.
+    Error(String),
 }
 
 /// Owns the running notify debouncers and exposes a tokio receiver that the
@@ -45,6 +55,17 @@ pub struct WatchHandle {
 /// (resolved via `git rev-parse --absolute-git-dir`, see ADR-0005), and
 /// the `common_git_dir` (`git rev-parse --git-common-dir`).
 ///
+/// `current_branch_ref` is the full ref name HEAD currently points at
+/// (for example `refs/heads/main`), or `None` when HEAD is detached.
+/// It is the single most important input for false-positive control:
+/// the watcher only raises `GitHead` when the active branch ref, the
+/// per-worktree `HEAD`, or the common `packed-refs` file is touched.
+/// Unrelated ref activity (`git fetch` writing `refs/remotes/*`, a
+/// tag write, another linked worktree committing to a sibling branch)
+/// is ignored. A stale `current_branch_ref` is harmless: the watcher
+/// will simply miss a new branch the session was not started on,
+/// which is the correct behavior for a frozen baseline.
+///
 /// For a normal repository `git_dir == common_git_dir` and only one
 /// git-dir watcher is spawned. For a **linked worktree** the two
 /// differ — `git_dir` is `.git/worktrees/<name>/` and `common_git_dir`
@@ -55,23 +76,30 @@ pub struct WatchHandle {
 ///
 /// The worktree watcher swallows any event whose paths all sit inside
 /// `git_dir`, so git's own bookkeeping can't trigger a recompute storm.
-pub fn start(root: &Path, git_dir: &Path, common_git_dir: &Path) -> Result<WatchHandle> {
+pub fn start(
+    root: &Path,
+    git_dir: &Path,
+    common_git_dir: &Path,
+    current_branch_ref: Option<&str>,
+) -> Result<WatchHandle> {
     let (tx, rx) = unbounded_channel::<WatchEvent>();
 
     let worktree_root = root.to_path_buf();
     let git_dir_owned = git_dir.to_path_buf();
+    let common_git_dir_owned = common_git_dir.to_path_buf();
+    let matcher = BaselineMatcher::new(&git_dir_owned, &common_git_dir_owned, current_branch_ref);
+
     let worktree = spawn_worktree_debouncer(&worktree_root, &git_dir_owned, tx.clone())?;
-    let git_dir_watcher = spawn_git_dir_debouncer(&git_dir_owned, tx.clone())?;
+    let git_dir_watcher = spawn_git_dir_debouncer(&git_dir_owned, matcher.clone(), tx.clone())?;
 
     // Only spin up a second watcher when the common dir really differs
     // from the per-worktree dir; otherwise we'd double-fire GitHead on
     // every HEAD/ref write in a normal repo.
-    let common_git_dir_owned = common_git_dir.to_path_buf();
     let common_git_dir_watcher =
         if canonicalize_or_self(&common_git_dir_owned) == canonicalize_or_self(&git_dir_owned) {
             None
         } else {
-            Some(spawn_git_dir_debouncer(&common_git_dir_owned, tx)?)
+            Some(spawn_git_dir_debouncer(&common_git_dir_owned, matcher, tx)?)
         };
 
     Ok(WatchHandle {
@@ -80,6 +108,62 @@ pub fn start(root: &Path, git_dir: &Path, common_git_dir: &Path) -> Result<Watch
         _git_dir: git_dir_watcher,
         _common_git_dir: common_git_dir_watcher,
     })
+}
+
+/// Set of git-dir paths that, when touched, genuinely indicate the
+/// session baseline SHA has drifted. Captured once at watcher startup
+/// from the initial HEAD state. Paths are canonicalized so
+/// byte-comparisons work across symlinked tempdirs (e.g. macOS
+/// `/var/folders` → `/private/var/folders`).
+#[derive(Debug, Clone)]
+pub(crate) struct BaselineMatcher {
+    /// `<per-worktree git_dir>/HEAD` — moves on `git checkout`, or
+    /// on reseating HEAD to a different branch via `symbolic-ref`.
+    head_file: PathBuf,
+    /// `<common git_dir>/refs/heads/<current branch>` — moves on
+    /// `git commit`, `git reset`, or any direct ref write. `None`
+    /// when HEAD is detached: in that case the session baseline is
+    /// a raw SHA and only `head_file` can move it (via checkout).
+    branch_ref: Option<PathBuf>,
+    /// `<common git_dir>/packed-refs` — touched when loose refs get
+    /// packed, which can atomically replace the loose branch ref
+    /// file with an entry inside packed-refs. Tracking this catches
+    /// the corner case where a `git pack-refs` happens between two
+    /// HEAD movements.
+    packed_refs: PathBuf,
+}
+
+impl BaselineMatcher {
+    pub(crate) fn new(
+        git_dir: &Path,
+        common_git_dir: &Path,
+        current_branch_ref: Option<&str>,
+    ) -> Self {
+        let head_file = canonicalize_or_self(&git_dir.join("HEAD"));
+        let branch_ref = current_branch_ref.map(|r| {
+            // `r` looks like `refs/heads/foo/bar` — split on `/` and
+            // join to preserve nested branch names on platforms where
+            // path joining with a multi-segment string works differently.
+            let mut p = common_git_dir.to_path_buf();
+            for segment in r.split('/') {
+                p.push(segment);
+            }
+            canonicalize_or_self(&p)
+        });
+        let packed_refs = canonicalize_or_self(&common_git_dir.join("packed-refs"));
+        Self {
+            head_file,
+            branch_ref,
+            packed_refs,
+        }
+    }
+
+    pub(crate) fn matches(&self, path: &Path) -> bool {
+        let p = canonicalize_or_self(path);
+        p == self.head_file
+            || self.branch_ref.as_ref().is_some_and(|r| p == *r)
+            || p == self.packed_refs
+    }
 }
 
 fn spawn_worktree_debouncer(
@@ -92,10 +176,17 @@ fn spawn_worktree_debouncer(
         WORKTREE_DEBOUNCE,
         None,
         move |result: DebounceEventResult| {
-            let Ok(events) = result else {
-                // Errors are surfaced separately by notify; the app layer
-                // can't act on them yet, so just drop them in v0.1.
-                return;
+            let events = match result {
+                Ok(events) => events,
+                Err(errors) => {
+                    // Surface backend failures (FSEvents drop, moved
+                    // watch target, kqueue overflow, …) so the app
+                    // layer can flip the footer to red and force a
+                    // recompute instead of silently drifting stale.
+                    let msg = format_notify_errors("worktree", &errors);
+                    let _ = tx.send(WatchEvent::Error(msg));
+                    return;
+                }
             };
             // If every path on every event lives inside `git_dir`, swallow
             // the burst — that's git churning its own bookkeeping. As soon
@@ -118,25 +209,29 @@ fn spawn_worktree_debouncer(
 
 fn spawn_git_dir_debouncer(
     git_dir: &Path,
+    matcher: BaselineMatcher,
     tx: UnboundedSender<WatchEvent>,
 ) -> Result<Debouncer<RecommendedWatcher, RecommendedCache>> {
-    let git_dir_owned = git_dir.to_path_buf();
     let mut debouncer = new_debouncer(HEAD_DEBOUNCE, None, move |result: DebounceEventResult| {
-        let Ok(events) = result else {
-            return;
+        let events = match result {
+            Ok(events) => events,
+            Err(errors) => {
+                let msg = format_notify_errors("git_dir", &errors);
+                let _ = tx.send(WatchEvent::Error(msg));
+                return;
+            }
         };
-        // Only treat baseline-affecting paths (HEAD, packed-refs, refs/**,
-        // linked-worktree HEADs) as real head movement. Bookkeeping churn
-        // like `index`, `index.lock`, `logs/`, pack files, or reflog writes
-        // must not raise the stale-baseline indicator — otherwise a plain
-        // `git add` (or even the tool's own shell-outs refreshing index
-        // metadata) would wrongly flag HEAD as drifted.
-        let baseline_touched = events.iter().any(|ev| {
-            ev.event
-                .paths
-                .iter()
-                .any(|p| is_baseline_path(p, &git_dir_owned))
-        });
+        // Only treat baseline-affecting paths (the per-worktree HEAD,
+        // the common-dir branch ref the session baseline was captured
+        // from, packed-refs) as real head movement. Plain bookkeeping
+        // churn — `index`, `index.lock`, `logs/`, pack files, reflog
+        // writes — and unrelated refs (remotes, tags, other branches)
+        // must not raise the stale-baseline indicator, otherwise a
+        // `git fetch` or a sibling linked worktree's commit would
+        // wrongly flag our HEAD as drifted.
+        let baseline_touched = events
+            .iter()
+            .any(|ev| ev.event.paths.iter().any(|p| matcher.matches(p)));
         if baseline_touched {
             let _ = tx.send(WatchEvent::GitHead);
         }
@@ -147,6 +242,23 @@ fn spawn_git_dir_debouncer(
         .watch(git_dir, RecursiveMode::Recursive)
         .with_context(|| format!("failed to watch git_dir at {}", git_dir.display()))?;
     Ok(debouncer)
+}
+
+/// Format one or more notify errors into the human-readable footer
+/// string the app surfaces in `last_error`. Prefixed with the
+/// watcher layer so users can tell `worktree` failures apart from
+/// `git_dir` failures when triaging.
+fn format_notify_errors(layer: &str, errors: &[notify::Error]) -> String {
+    let joined = errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        format!("watcher [{layer}]: unknown backend failure")
+    } else {
+        format!("watcher [{layer}]: {joined}")
+    }
 }
 
 /// Return true when `path` is `git_dir` itself or any descendant of it.
@@ -161,39 +273,6 @@ fn is_inside(path: &Path, git_dir: &Path) -> bool {
 
 pub(crate) fn canonicalize_or_self(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
-}
-
-/// Classify `path` as a baseline-affecting path inside `git_dir`.
-///
-/// Returns `true` only when `path` is one of:
-/// - `<git_dir>/HEAD`
-/// - `<git_dir>/packed-refs`
-/// - `<git_dir>/refs/**`
-/// - `<git_dir>/worktrees/*/HEAD` (linked-worktree HEAD)
-///
-/// Plain `.git/index`, `.git/index.lock`, `.git/logs/**`, `.git/objects/**`,
-/// `.git/COMMIT_EDITMSG`, `.git/ORIG_HEAD`, `.git/FETCH_HEAD`, and any ad-hoc
-/// marker files are rejected so they never raise the stale-baseline signal.
-fn is_baseline_path(path: &Path, git_dir: &Path) -> bool {
-    let p = canonicalize_or_self(path);
-    let g = canonicalize_or_self(git_dir);
-    let Ok(rel) = p.strip_prefix(&g) else {
-        return false;
-    };
-    let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
-    match parts.as_slice() {
-        // `.git/HEAD`
-        [name] if *name == "HEAD" => true,
-        // `.git/packed-refs`
-        [name] if *name == "packed-refs" => true,
-        // `.git/refs/**` — any file under the refs subtree.
-        [head, ..] if *head == "refs" => true,
-        // `.git/worktrees/<name>/HEAD` — linked-worktree HEAD. Other files
-        // under `worktrees/<name>/` (commondir, gitdir, locked, …) are
-        // still rejected because they don't move the baseline SHA.
-        [head, _, tail] if *head == "worktrees" && *tail == "HEAD" => true,
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -233,8 +312,9 @@ mod tests {
         let root = crate::git::find_root(repo.path()).expect("find_root");
         let git_dir = crate::git::git_dir(&root).expect("git_dir");
         let common = crate::git::git_common_dir(&root).expect("common git_dir");
+        let branch = crate::git::current_branch_ref(&root).expect("current branch");
 
-        let mut handle = start(&root, &git_dir, &common).expect("start watcher");
+        let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
 
         // Give the debouncer a moment to install its OS hook before we touch
         // the worktree, otherwise the create event can land before notify is
@@ -255,8 +335,9 @@ mod tests {
         let root = crate::git::find_root(repo.path()).expect("find_root");
         let git_dir = crate::git::git_dir(&root).expect("git_dir");
         let common = crate::git::git_common_dir(&root).expect("common git_dir");
+        let branch = crate::git::current_branch_ref(&root).expect("current branch");
 
-        let mut handle = start(&root, &git_dir, &common).expect("start watcher");
+        let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
 
         tokio::time::sleep(TokioDuration::from_millis(150)).await;
         // Drop a file inside .git/ to mimic git's own bookkeeping. notify
@@ -281,8 +362,9 @@ mod tests {
                     saw_head = true;
                     break;
                 }
+                Ok(Some(WatchEvent::Error(_))) => continue,
                 Ok(None) => break,
-                Err(_) => continue, // recv timed out, keep draining
+                Err(_) => continue,
             }
         }
         assert!(
@@ -296,18 +378,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn writing_refs_heads_inside_git_dir_emits_head_event() {
+    async fn writing_current_branch_ref_emits_head_event() {
+        // The active-branch-only narrowing still has to fire for the
+        // session's own branch. Create a ref under refs/heads/<branch>
+        // and verify GitHead lands; the next test verifies that an
+        // unrelated ref DOES NOT fire.
         let repo = init_repo();
         let root = crate::git::find_root(repo.path()).expect("find_root");
         let git_dir = crate::git::git_dir(&root).expect("git_dir");
         let common = crate::git::git_common_dir(&root).expect("common git_dir");
 
-        let mut handle = start(&root, &git_dir, &common).expect("start watcher");
+        // `git init --initial-branch=main` leaves HEAD pointing at
+        // `refs/heads/main`, but the branch ref file does not exist
+        // until the first commit. Pretend the session's branch is
+        // `kizu-test-branch` so we can watch its birth and drive the
+        // event from a direct file write (no `git commit` rigging).
+        let mut handle = start(
+            &root,
+            &git_dir,
+            &common,
+            Some("refs/heads/kizu-test-branch"),
+        )
+        .expect("start watcher");
 
         tokio::time::sleep(TokioDuration::from_millis(150)).await;
-        // Simulate a real baseline move: create a ref under refs/heads/.
-        // The content doesn't have to be valid — we're only exercising the
-        // watcher's path classifier, not git itself.
         let refs_heads = git_dir.join("refs").join("heads");
         fs::create_dir_all(&refs_heads).expect("create refs/heads");
         fs::write(
@@ -316,10 +410,6 @@ mod tests {
         )
         .expect("write ref");
 
-        // We expect a GitHead within the drain window. Worktree events are
-        // fine (the refs path also sits inside git_dir so worktree filter
-        // should still swallow them, but we don't fail the test on stray
-        // Worktree signals).
         let mut saw_head = false;
         let drain_until = tokio::time::Instant::now() + DRAIN_WAIT;
         while tokio::time::Instant::now() < drain_until {
@@ -329,11 +419,77 @@ mod tests {
                     break;
                 }
                 Ok(Some(WatchEvent::Worktree)) => continue,
+                Ok(Some(WatchEvent::Error(_))) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
         }
-        assert!(saw_head, "writes under refs/heads must emit GitHead");
+        assert!(
+            saw_head,
+            "writes under the session's own refs/heads/<branch> must emit GitHead"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writing_unrelated_refs_does_not_emit_head_event() {
+        // Adversarial finding: the previous matcher treated every
+        // `refs/**` path as baseline-affecting, so a plain `git fetch`
+        // updating `refs/remotes/*` would wrongly fire GitHead and
+        // push users to re-baseline. With the narrowed matcher only
+        // the session's own branch ref should count.
+        let repo = init_repo();
+        let root = crate::git::find_root(repo.path()).expect("find_root");
+        let git_dir = crate::git::git_dir(&root).expect("git_dir");
+        let common = crate::git::git_common_dir(&root).expect("common git_dir");
+
+        let mut handle = start(&root, &git_dir, &common, Some("refs/heads/main"))
+            .expect("start watcher with main as active branch");
+
+        tokio::time::sleep(TokioDuration::from_millis(150)).await;
+        // Write a sibling branch, a remote ref, and a tag — none of
+        // which the session is tracking. The matcher must reject all
+        // three.
+        let refs_heads = git_dir.join("refs").join("heads");
+        fs::create_dir_all(&refs_heads).expect("create refs/heads");
+        fs::write(
+            refs_heads.join("sibling-branch"),
+            b"0000000000000000000000000000000000000000\n",
+        )
+        .expect("write sibling");
+        let refs_remotes = git_dir.join("refs").join("remotes").join("origin");
+        fs::create_dir_all(&refs_remotes).expect("create refs/remotes/origin");
+        fs::write(
+            refs_remotes.join("feature"),
+            b"0000000000000000000000000000000000000000\n",
+        )
+        .expect("write remote ref");
+        let refs_tags = git_dir.join("refs").join("tags");
+        fs::create_dir_all(&refs_tags).expect("create refs/tags");
+        fs::write(
+            refs_tags.join("v1.0"),
+            b"0000000000000000000000000000000000000000\n",
+        )
+        .expect("write tag");
+
+        let mut saw_head = false;
+        let drain_until = tokio::time::Instant::now() + DRAIN_WAIT;
+        while tokio::time::Instant::now() < drain_until {
+            match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
+                Ok(Some(WatchEvent::GitHead)) => {
+                    saw_head = true;
+                    break;
+                }
+                Ok(Some(WatchEvent::Worktree)) => continue,
+                Ok(Some(WatchEvent::Error(_))) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            !saw_head,
+            "unrelated ref activity (sibling branch, remotes, tags) \
+             must not raise GitHead under the narrowed matcher"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -383,15 +539,24 @@ mod tests {
             linked_git_dir.display()
         );
 
-        let mut handle = start(&linked_root, &linked_git_dir, &common_git_dir)
-            .expect("start watcher with common git dir");
+        // Linked worktree starts on `feature-branch`, resolve that
+        // at runtime instead of hard-coding.
+        let linked_branch = crate::git::current_branch_ref(&linked_root).expect("linked branch");
+
+        let mut handle = start(
+            &linked_root,
+            &linked_git_dir,
+            &common_git_dir,
+            linked_branch.as_deref(),
+        )
+        .expect("start watcher with common git dir");
 
         tokio::time::sleep(TokioDuration::from_millis(150)).await;
 
         // Commit inside the linked worktree. This writes the new commit
         // object + updates `refs/heads/feature-branch` in the common git
         // dir. The per-worktree git dir only gets index/logs churn,
-        // which `is_baseline_path` correctly rejects.
+        // which the BaselineMatcher correctly rejects.
         fs::write(linked_root.join("new.txt"), "hi\n").expect("write new");
         run_git(&linked_root, &["add", "new.txt"]);
         run_git(&linked_root, &["commit", "--quiet", "-m", "linked commit"]);
@@ -405,6 +570,7 @@ mod tests {
                     break;
                 }
                 Ok(Some(WatchEvent::Worktree)) => continue,
+                Ok(Some(WatchEvent::Error(_))) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
@@ -419,40 +585,78 @@ mod tests {
     }
 
     #[test]
-    fn is_baseline_path_matches_head_and_refs() {
+    fn baseline_matcher_accepts_head_branch_ref_and_packed_refs_only() {
+        // The matcher must recognize exactly three path classes: the
+        // per-worktree HEAD, the common-dir branch ref the session
+        // baseline was captured from, and common-dir packed-refs.
+        // Anything else — unrelated refs, remotes, tags, bookkeeping
+        // files — must be rejected.
         let git_dir = Path::new("/tmp/repo/.git");
-        assert!(is_baseline_path(&git_dir.join("HEAD"), git_dir));
-        assert!(is_baseline_path(&git_dir.join("packed-refs"), git_dir));
-        assert!(is_baseline_path(
-            &git_dir.join("refs").join("heads").join("main"),
-            git_dir
-        ));
-        assert!(is_baseline_path(
-            &git_dir.join("refs").join("tags").join("v1.0"),
-            git_dir
-        ));
-        // Linked worktree HEAD
-        assert!(is_baseline_path(
-            &git_dir.join("worktrees").join("wt1").join("HEAD"),
-            git_dir
-        ));
+        let matcher = BaselineMatcher::new(git_dir, git_dir, Some("refs/heads/main"));
+
+        // Accepted: HEAD, the current branch ref, packed-refs.
+        assert!(matcher.matches(&git_dir.join("HEAD")));
+        assert!(matcher.matches(&git_dir.join("refs").join("heads").join("main")));
+        assert!(matcher.matches(&git_dir.join("packed-refs")));
+
+        // Rejected: unrelated refs.
+        assert!(!matcher.matches(&git_dir.join("refs").join("heads").join("feature")));
+        assert!(
+            !matcher.matches(
+                &git_dir
+                    .join("refs")
+                    .join("remotes")
+                    .join("origin")
+                    .join("main")
+            )
+        );
+        assert!(!matcher.matches(&git_dir.join("refs").join("tags").join("v1.0")));
+
+        // Rejected: pure bookkeeping.
+        assert!(!matcher.matches(&git_dir.join("index")));
+        assert!(!matcher.matches(&git_dir.join("index.lock")));
+        assert!(!matcher.matches(&git_dir.join("logs").join("HEAD")));
+        assert!(!matcher.matches(&git_dir.join("objects").join("pack").join("pack-abc.idx")));
+        assert!(!matcher.matches(&git_dir.join("COMMIT_EDITMSG")));
+        assert!(!matcher.matches(&git_dir.join("ORIG_HEAD")));
+        assert!(!matcher.matches(&git_dir.join("FETCH_HEAD")));
     }
 
     #[test]
-    fn is_baseline_path_rejects_bookkeeping_paths() {
+    fn baseline_matcher_detached_head_tracks_head_file_only() {
+        // Detached HEAD: no current branch ref, so only the HEAD
+        // file and packed-refs matter. Every refs/** path — including
+        // what would otherwise have been "our" branch — must be
+        // rejected, because in a detached session the baseline is a
+        // raw SHA and no branch ref can move it.
         let git_dir = Path::new("/tmp/repo/.git");
-        assert!(!is_baseline_path(&git_dir.join("index"), git_dir));
-        assert!(!is_baseline_path(&git_dir.join("index.lock"), git_dir));
-        assert!(!is_baseline_path(
-            &git_dir.join("logs").join("HEAD"),
-            git_dir
-        ));
-        assert!(!is_baseline_path(
-            &git_dir.join("objects").join("pack").join("pack-abc.idx"),
-            git_dir
-        ));
-        assert!(!is_baseline_path(&git_dir.join("COMMIT_EDITMSG"), git_dir));
-        assert!(!is_baseline_path(&git_dir.join("ORIG_HEAD"), git_dir));
-        assert!(!is_baseline_path(&git_dir.join("FETCH_HEAD"), git_dir));
+        let matcher = BaselineMatcher::new(git_dir, git_dir, None);
+
+        assert!(matcher.matches(&git_dir.join("HEAD")));
+        assert!(matcher.matches(&git_dir.join("packed-refs")));
+        assert!(!matcher.matches(&git_dir.join("refs").join("heads").join("main")));
+        assert!(!matcher.matches(&git_dir.join("refs").join("heads").join("feature")));
+    }
+
+    #[test]
+    fn baseline_matcher_linked_worktree_splits_head_and_branch_ref() {
+        // Linked worktree: the per-worktree HEAD lives inside
+        // `.git/worktrees/<name>/`, while the branch ref lives under
+        // the main repo's `.git/refs/heads/`. The matcher must
+        // recognize HEAD in the per-worktree dir and the branch ref
+        // in the common dir simultaneously.
+        let per = Path::new("/tmp/repo/.git/worktrees/wt1");
+        let common = Path::new("/tmp/repo/.git");
+        let matcher = BaselineMatcher::new(per, common, Some("refs/heads/feature"));
+
+        assert!(matcher.matches(&per.join("HEAD")));
+        assert!(matcher.matches(&common.join("refs").join("heads").join("feature")));
+        assert!(matcher.matches(&common.join("packed-refs")));
+        // HEAD in the common dir (the main worktree's HEAD) must NOT
+        // match — a checkout in the main worktree is a different
+        // session's concern.
+        assert!(!matcher.matches(&common.join("HEAD")));
+        // A sibling linked worktree's HEAD file is also unrelated.
+        assert!(!matcher.matches(&common.join("worktrees").join("wt2").join("HEAD")));
     }
 }
