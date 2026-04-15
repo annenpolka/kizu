@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 /// Maximum number of bytes read from an untracked file when synthesizing its
 /// "all-added" diff. See M1.9 / Decision Log for rationale.
@@ -18,6 +19,10 @@ pub struct FileDiff {
     pub added: usize,
     pub deleted: usize,
     pub content: DiffContent,
+    /// Last modification time of the worktree file. Filled by the app layer
+    /// after `compute_diff` returns; the parser leaves this at
+    /// [`SystemTime::UNIX_EPOCH`] so it is always defined.
+    pub mtime: SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +134,7 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
             added: 0,
             deleted: 0,
             content: DiffContent::Binary,
+            mtime: SystemTime::UNIX_EPOCH,
         });
     }
 
@@ -158,6 +164,7 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
             new_count,
             lines,
         }]),
+        mtime: SystemTime::UNIX_EPOCH,
     })
 }
 
@@ -269,6 +276,7 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
                 added: 0,
                 deleted: 0,
                 content: DiffContent::Text(Vec::new()),
+                mtime: SystemTime::UNIX_EPOCH,
             });
             continue;
         }
