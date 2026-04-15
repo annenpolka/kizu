@@ -311,13 +311,20 @@ fn parse_quoted_token(bytes: &[u8]) -> Option<(Vec<u8>, &[u8])> {
 /// [`DiffContent::Binary`].
 fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
     let abs = root.join(rel_path);
+    let total_size = std::fs::metadata(&abs)
+        .with_context(|| format!("statting untracked file {}", abs.display()))?
+        .len() as usize;
     let mut file = std::fs::File::open(&abs)
         .with_context(|| format!("opening untracked file {}", abs.display()))?;
-    let mut buf: Vec<u8> = Vec::with_capacity(UNTRACKED_READ_CAP);
+    let mut buf: Vec<u8> = Vec::with_capacity(UNTRACKED_READ_CAP + 1);
     file.by_ref()
-        .take(UNTRACKED_READ_CAP as u64)
+        .take((UNTRACKED_READ_CAP + 1) as u64)
         .read_to_end(&mut buf)
         .with_context(|| format!("reading untracked file {}", abs.display()))?;
+    let truncated = buf.len() > UNTRACKED_READ_CAP;
+    if truncated {
+        buf.truncate(UNTRACKED_READ_CAP);
+    }
 
     if buf.contains(&0u8) {
         return Ok(FileDiff {
@@ -341,7 +348,19 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
             has_trailing_newline,
         })
         .collect();
-    let added = lines.len();
+    let mut lines = lines;
+    if truncated {
+        let remaining = total_size.saturating_sub(UNTRACKED_READ_CAP);
+        lines.push(DiffLine {
+            kind: LineKind::Context,
+            content: format!("[+{remaining} more bytes from new file]"),
+            has_trailing_newline: false,
+        });
+    }
+    let added = lines
+        .iter()
+        .filter(|line| line.kind == LineKind::Added)
+        .count();
     let new_count = added;
     let new_start = if new_count == 0 { 0 } else { 1 };
 
@@ -1389,6 +1408,13 @@ index 1111111..2222222 100644
         assert!(
             total_bytes <= UNTRACKED_READ_CAP + 100,
             "untracked content should be capped near {UNTRACKED_READ_CAP} bytes, got {total_bytes}"
+        );
+        assert!(
+            hunks[0]
+                .lines
+                .iter()
+                .any(|line| line.content.contains("more bytes from new file")),
+            "expected a visible truncation marker instead of silent truncation"
         );
         assert!(
             big.added < 200,
