@@ -737,6 +737,7 @@ mod tests {
         App {
             root: PathBuf::from("/tmp/fake"),
             git_dir: PathBuf::from("/tmp/fake/.git"),
+            common_git_dir: PathBuf::from("/tmp/fake/.git"),
             baseline_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
             files: Vec::new(),
             layout: ScrollLayout::default(),

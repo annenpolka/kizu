@@ -90,39 +90,87 @@ pub fn compute_diff(root: &Path, baseline_sha: &str) -> Result<Vec<FileDiff>> {
     for rel in list_untracked(root)? {
         match synthesize_untracked(root, &rel) {
             Ok(synth) => files.push(synth),
-            // A read failure (e.g. the file vanished between status and read)
-            // shouldn't abort the entire diff — just skip the entry.
-            Err(_) => continue,
+            // If the file genuinely vanished between `status` and our
+            // read (an agent deleted it in the same burst), skip it.
+            // Any other failure (pathname parse bug, decode bug, …)
+            // must surface so tests catch it instead of the file
+            // silently disappearing from the TUI.
+            Err(e) => {
+                let vanished = e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                });
+                if vanished {
+                    continue;
+                }
+                return Err(e)
+                    .with_context(|| format!("synthesizing untracked file {}", rel.display()));
+            }
         }
     }
 
     Ok(files)
 }
 
-/// List untracked files reported by `git status --porcelain`.
+/// List untracked files reported by `git status --porcelain=v1 -z`.
+///
+/// Why `-z`: porcelain v1 (the default) quotes and C-escapes filenames
+/// with spaces or special characters, so a plain line parser would see
+/// `?? "design draft.md"` and try to open a path that includes the
+/// surrounding quotes. `-z` switches to NUL-delimited records with
+/// **literal** pathnames, so `design draft.md` round-trips byte-for-byte
+/// and non-UTF8 filenames survive as-is on Unix.
 ///
 /// `--untracked-files=all` is required so git expands sub-directories
 /// containing only untracked files into individual entries. Without
-/// it, default "normal" mode collapses `scratch/a.rs` and
-/// `scratch/b.rs` into a single `?? scratch/` line and kizu would
-/// try to open the directory itself as a file.
+/// it, "normal" mode collapses `scratch/a.rs` and `scratch/b.rs` into
+/// a single `?? scratch/` line and kizu would try to open the
+/// directory itself as a file.
 fn list_untracked(root: &Path) -> Result<Vec<PathBuf>> {
     let output = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=all"])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(root)
         .output()
-        .context("failed to spawn `git status --porcelain`")?;
+        .context("failed to spawn `git status --porcelain -z`")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("`git status` failed: {}", stderr.trim()));
     }
 
-    let raw = String::from_utf8(output.stdout).context("`git status` produced non-UTF8 output")?;
-    Ok(raw
-        .lines()
-        .filter_map(|line| line.strip_prefix("?? ").map(PathBuf::from))
-        .collect())
+    // `-z` output is NUL-delimited. Each record is `XY <path>\0` where
+    // `XY` is the two-character status code followed by a single space.
+    // Non-untracked records (`M `, ` M`, `A `, …) are ignored here —
+    // they already show up in `git diff` output.
+    let mut paths = Vec::new();
+    for record in output.stdout.split(|&b| b == 0) {
+        // Skip empty records (trailing NUL, leading NUL, …).
+        if record.len() < 3 {
+            continue;
+        }
+        if &record[..3] == b"?? " {
+            let path_bytes = &record[3..];
+            paths.push(bytes_to_path(path_bytes));
+        }
+    }
+    Ok(paths)
+}
+
+/// Convert raw filesystem bytes coming out of git into a `PathBuf`.
+/// On Unix this preserves non-UTF8 filenames byte-for-byte via
+/// [`std::os::unix::ffi::OsStrExt`]. On other platforms we fall back
+/// to a lossy UTF-8 decode, which covers every filename people actually
+/// ship but can corrupt genuinely invalid byte sequences on Windows.
+#[cfg(unix)]
+fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Build a synthetic [`FileDiff`] for an untracked file, treating every line
@@ -204,6 +252,11 @@ pub fn head_sha(root: &Path) -> Result<String> {
 
 /// Resolve the absolute git directory (works for normal and linked worktrees).
 /// See ADR-0005 for why we don't hardcode `<root>/.git`.
+///
+/// In a linked worktree this returns the **per-worktree** git dir
+/// (`.git/worktrees/<name>/`), which holds per-worktree HEAD/index/logs
+/// but **not** the shared `refs/` tree. Use [`git_common_dir`] to find
+/// the shared location.
 pub fn git_dir(root: &Path) -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--absolute-git-dir"])
@@ -221,6 +274,37 @@ pub fn git_dir(root: &Path) -> Result<PathBuf> {
 
     let raw = String::from_utf8(output.stdout)
         .context("`git rev-parse --absolute-git-dir` produced non-UTF8 output")?;
+    Ok(PathBuf::from(raw.trim()))
+}
+
+/// Resolve the **common** git dir — the shared location where
+/// `refs/heads/**`, `packed-refs`, and other branch-wide state live.
+///
+/// For a normal repository this equals [`git_dir`]. In a linked
+/// worktree it points at the main repo's `.git/` directory, which is
+/// where branch refs move when you commit — the watcher needs to see
+/// that directory to catch linked-worktree commits.
+///
+/// The returned path is canonicalized where possible so callers can
+/// compare it byte-for-byte against [`git_dir`] to decide whether
+/// they're looking at a linked worktree.
+pub fn git_common_dir(root: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(root)
+        .output()
+        .context("failed to spawn `git rev-parse --git-common-dir`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "`git rev-parse --git-common-dir` failed: {}",
+            stderr.trim()
+        ));
+    }
+
+    let raw = String::from_utf8(output.stdout)
+        .context("`git rev-parse --git-common-dir` produced non-UTF8 output")?;
     Ok(PathBuf::from(raw.trim()))
 }
 
@@ -757,6 +841,32 @@ index 1111111..0000000
             vec![PathBuf::from("subdir/a.rs"), PathBuf::from("subdir/b.rs"),],
             "expected both subdirectory files listed individually"
         );
+    }
+
+    #[test]
+    fn compute_diff_includes_untracked_file_with_spaces_in_name() {
+        // Regression: `git status --porcelain` (v1, no `-z`) quotes
+        // filenames with spaces/special chars, so the old line parser
+        // produced a literal `"design draft.md"` path that
+        // `synthesize_untracked` then failed to open. The failure was
+        // silently dropped and the file never showed up in the TUI.
+        let repo = init_repo();
+        fs::write(repo.path().join("seed.txt"), "seed").expect("write seed");
+        run_git(repo.path(), &["add", "seed.txt"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "initial"]);
+        let baseline = head_sha(repo.path()).expect("head_sha");
+
+        // Filename with a real space in it — porcelain v1 wraps this in
+        // double quotes; porcelain v1 `-z` returns it as literal bytes.
+        fs::write(repo.path().join("design draft.md"), "alpha\nbeta\n").expect("write quoted file");
+
+        let files = compute_diff(repo.path(), &baseline).expect("compute_diff");
+        let found = files
+            .iter()
+            .find(|f| f.path == Path::new("design draft.md"))
+            .expect("untracked file with space in name must be visible");
+        assert_eq!(found.status, FileStatus::Untracked);
+        assert_eq!(found.added, 2);
     }
 
     #[test]

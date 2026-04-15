@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// the "noticeable but not slow" band and matches the research doc.
 const SCROLL_ANIM_DURATION: Duration = Duration::from_millis(150);
 
-use crate::git::{self, DiffContent, FileDiff, LineKind};
+use crate::git::{self, DiffContent, FileDiff, FileStatus, LineKind};
 use crate::watcher::{self, WatchEvent};
 
 /// Half-page scroll constant for `Ctrl-d` / `Ctrl-u`. M5+ may swap this for
@@ -22,6 +22,11 @@ const HALF_PAGE: usize = 12;
 pub struct App {
     pub root: PathBuf,
     pub git_dir: PathBuf,
+    /// Shared "common" git dir — equal to `git_dir` for normal repos,
+    /// distinct for linked worktrees where `refs/heads/**` lives in the
+    /// main repo's `.git/`. The watcher needs both to catch commits
+    /// performed inside a linked worktree (ADR-0005 addendum).
+    pub common_git_dir: PathBuf,
     pub baseline_sha: String,
     /// Files in the diff, sorted by `mtime` descending. Index 0 is the
     /// most-recently-modified file.
@@ -222,9 +227,11 @@ impl App {
     pub fn bootstrap(root: PathBuf) -> Result<Self> {
         let root = git::find_root(&root).context("resolving worktree root")?;
         let git_dir = git::git_dir(&root).context("resolving git directory")?;
+        let common_git_dir =
+            git::git_common_dir(&root).context("resolving common git directory")?;
         let baseline_sha = git::head_sha(&root).context("capturing baseline HEAD")?;
         let diff = git::compute_diff(&root, &baseline_sha);
-        Self::bootstrap_with_diff(root, git_dir, baseline_sha, diff)
+        Self::bootstrap_with_diff(root, git_dir, common_git_dir, baseline_sha, diff)
     }
 
     /// Inner bootstrap: takes already-resolved git layout plus the
@@ -236,6 +243,7 @@ impl App {
     pub(crate) fn bootstrap_with_diff(
         root: PathBuf,
         git_dir: PathBuf,
+        common_git_dir: PathBuf,
         baseline_sha: String,
         diff: Result<Vec<FileDiff>>,
     ) -> Result<Self> {
@@ -244,6 +252,7 @@ impl App {
         let mut app = Self {
             root,
             git_dir,
+            common_git_dir,
             baseline_sha,
             files: Vec::new(),
             layout: ScrollLayout::default(),
@@ -790,7 +799,19 @@ impl App {
     // ---- layout build / anchor ----------------------------------------
 
     fn populate_mtimes(&self, files: &mut [FileDiff]) {
+        // Single `now` sample shared across every deleted file in this
+        // batch so that a mixed edit+delete burst keeps the destructive
+        // action at the top of the recency order (= bottom of the
+        // ascending layout, which is where follow mode parks). A deleted
+        // file has no on-disk mtime to read — the filesystem lookup
+        // would fail and the pre-fix fallback pushed it to UNIX_EPOCH,
+        // burying the delete under every real change.
+        let now = SystemTime::now();
         for f in files {
+            if matches!(f.status, FileStatus::Deleted) {
+                f.mtime = now;
+                continue;
+            }
             f.mtime = self
                 .root
                 .join(&f.path)
@@ -999,7 +1020,7 @@ impl App {
 pub async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let mut app = App::bootstrap(cwd)?;
-    let mut watch = watcher::start(&app.root, &app.git_dir)?;
+    let mut watch = watcher::start(&app.root, &app.git_dir, &app.common_git_dir)?;
 
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
     let result = run_loop(&mut terminal, &mut app, &mut watch).await;
@@ -1144,6 +1165,7 @@ mod tests {
         let mut app = App {
             root: PathBuf::from("/tmp/fake"),
             git_dir: PathBuf::from("/tmp/fake/.git"),
+            common_git_dir: PathBuf::from("/tmp/fake/.git"),
             baseline_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
             files: Vec::new(),
             layout: ScrollLayout::default(),
@@ -1965,6 +1987,67 @@ mod tests {
     }
 
     #[test]
+    fn populate_mtimes_keeps_deleted_files_recent_so_follow_mode_lands_on_them() {
+        // Regression for the Codex finding: a freshly-deleted file used
+        // to fall to `UNIX_EPOCH` because `metadata()` failed, which
+        // sorted it to the very **top** of the mtime-ascending layout
+        // and pushed follow mode onto the newest surviving file. That
+        // hid destructive actions in the exact moment they most needed
+        // to be visible.
+        //
+        // Setup: one real file on disk with its mtime backdated into
+        // the early 70s, plus one deleted file whose path does not
+        // exist. After bootstrap the deleted file must sort **last**
+        // (= newest) and follow mode must park on it.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let kept_path = tmp.path().join("kept.rs");
+        std::fs::write(&kept_path, "hi\n").expect("write kept");
+        let ancient = SystemTime::UNIX_EPOCH + Duration::from_secs(60 * 60 * 24);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&kept_path)
+            .expect("reopen kept for mtime set");
+        f.set_modified(ancient).expect("backdate kept.rs");
+
+        let kept = FileDiff {
+            path: PathBuf::from("kept.rs"),
+            status: FileStatus::Modified,
+            added: 1,
+            deleted: 0,
+            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "hi2")])]),
+            mtime: SystemTime::UNIX_EPOCH,
+        };
+        let gone = FileDiff {
+            path: PathBuf::from("gone.rs"),
+            status: FileStatus::Deleted,
+            added: 0,
+            deleted: 1,
+            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Deleted, "bye")])]),
+            mtime: SystemTime::UNIX_EPOCH,
+        };
+
+        let app = App::bootstrap_with_diff(
+            tmp.path().to_path_buf(),
+            tmp.path().join(".git"),
+            tmp.path().join(".git"),
+            "abcdef1234567890abcdef1234567890abcdef12".into(),
+            Ok(vec![kept, gone]),
+        )
+        .expect("bootstrap succeeds");
+
+        assert_eq!(
+            app.files.last().map(|f| f.path.as_path()),
+            Some(Path::new("gone.rs")),
+            "deleted file must land at the newest end of the mtime sort"
+        );
+        assert_eq!(
+            app.current_file_path(),
+            Some(Path::new("gone.rs")),
+            "follow mode must keep the deletion on screen"
+        );
+    }
+
+    #[test]
     fn bootstrap_with_diff_propagates_initial_compute_diff_error() {
         // If the very first `git diff` fails, bootstrap must abort — we
         // refuse to enter the event loop in a state where the main pane
@@ -1972,6 +2055,7 @@ mod tests {
         let diff: Result<Vec<FileDiff>> = Err(anyhow::anyhow!("object file missing"));
         let result = App::bootstrap_with_diff(
             PathBuf::from("/tmp/fake"),
+            PathBuf::from("/tmp/fake/.git"),
             PathBuf::from("/tmp/fake/.git"),
             "abcdef1234567890abcdef1234567890abcdef12".into(),
             diff,
@@ -2009,6 +2093,7 @@ mod tests {
         ]);
         let app = App::bootstrap_with_diff(
             PathBuf::from("/tmp/fake"),
+            PathBuf::from("/tmp/fake/.git"),
             PathBuf::from("/tmp/fake/.git"),
             "abcdef1234567890abcdef1234567890abcdef12".into(),
             diff,
