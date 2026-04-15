@@ -61,6 +61,12 @@ pub struct App {
     /// Active viewport-top tween. `None` when the renderer should
     /// draw at the logical target.
     pub anim: Option<ScrollAnim>,
+    /// Line-wrap mode. When `true`, long diff lines wrap to the
+    /// viewport width (preserving the `+`/`-`/` ` prefix on every
+    /// continuation row) and a `¶` marker is drawn at the end of
+    /// each logical line so real newlines can be distinguished from
+    /// wrap boundaries. Toggled by the `w` key.
+    pub wrap_lines: bool,
 }
 
 /// Two ways the renderer can park the cursor inside the viewport.
@@ -226,6 +232,7 @@ impl App {
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
             visual_top: Cell::new(0.0),
             anim: None,
+            wrap_lines: false,
         };
         app.recompute_diff();
         Ok(app)
@@ -246,6 +253,13 @@ impl App {
             CursorPlacement::Centered => CursorPlacement::Top,
             CursorPlacement::Top => CursorPlacement::Centered,
         };
+    }
+
+    /// Toggle line-wrap mode. `w` calls this. When on, the renderer
+    /// wraps long diff lines at the viewport width and decorates every
+    /// logical line end with a `¶` marker.
+    pub fn toggle_wrap_lines(&mut self) {
+        self.wrap_lines = !self.wrap_lines;
     }
 
     /// Re-run `git diff`, populate per-file mtimes, sort files by mtime
@@ -329,25 +343,26 @@ impl App {
         }
 
         match key.code {
-            // Lowercase + arrows = the *common* case: hunk-by-hunk motion.
-            // hunk is kizu's primary unit of attention, so it gets the easy
-            // keys. SHIFT-J / SHIFT-K stay inside the current hunk and walk
-            // change run by change run (each contiguous +/- block) so the
-            // user can step over edit clusters without counting context lines.
+            // Lowercase `j`/`k` + arrows are the *daily driver*: adaptive
+            // motion that reads like continuous scrolling in long hunks
+            // (chunk scroll) but collapses to a one-press hunk jump in
+            // short hunks. SHIFT-J / SHIFT-K are the strict "skip to
+            // next hunk header" motion, for when you want to blow past
+            // the current hunk regardless of its size.
             KeyCode::Char('j') | KeyCode::Down => {
-                self.next_hunk();
-                self.follow_mode = false;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.prev_hunk();
-                self.follow_mode = false;
-            }
-            KeyCode::Char('J') => {
                 self.next_change();
                 self.follow_mode = false;
             }
-            KeyCode::Char('K') => {
+            KeyCode::Char('k') | KeyCode::Up => {
                 self.prev_change();
+                self.follow_mode = false;
+            }
+            KeyCode::Char('J') => {
+                self.next_hunk();
+                self.follow_mode = false;
+            }
+            KeyCode::Char('K') => {
+                self.prev_hunk();
                 self.follow_mode = false;
             }
             KeyCode::Char('g') => {
@@ -369,6 +384,9 @@ impl App {
             }
             KeyCode::Char('z') => {
                 self.toggle_cursor_placement();
+            }
+            KeyCode::Char('w') => {
+                self.toggle_wrap_lines();
             }
             _ => {}
         }
@@ -1099,6 +1117,7 @@ mod tests {
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
             visual_top: Cell::new(0.0),
             anim: None,
+            wrap_lines: false,
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
@@ -1315,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn capital_j_in_long_run_scrolls_within_run_by_chunk() {
+    fn lowercase_j_in_long_hunk_scrolls_by_chunk() {
         // Force a small body height so the chunk size is exactly 5 rows
         // (15 / 3 = 5) — this way the test's expected scroll positions
         // are fixed regardless of the DEFAULT_BODY_HEIGHT used outside
@@ -1331,17 +1350,17 @@ mod tests {
         let last = end - 1;
 
         app.scroll_to(start);
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, start + chunk);
 
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, start + 2 * chunk);
 
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, start + 3 * chunk);
 
         // Subsequent presses clamp at the last row of the run.
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, last);
     }
 
@@ -1375,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn capital_k_in_long_hunk_walks_back_by_chunk() {
+    fn lowercase_k_in_long_hunk_walks_back_by_chunk() {
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
@@ -1383,19 +1402,19 @@ mod tests {
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
         // Hunk spans header + 20 diff rows → [1, 22). viewport = 15 < 21,
-        // so SHIFT-K chunk-scrolls back clamped to the header row.
+        // so `k` chunk-scrolls back clamped to the header row.
         let hunk_top = app.layout.hunk_starts[0];
         let last = 21;
 
         app.scroll_to(last);
-        app.handle_key(key(KeyCode::Char('K')));
+        app.handle_key(key(KeyCode::Char('k')));
         assert_eq!(app.scroll, last - chunk);
 
         // Continue back; scroll must stay within the hunk's row range,
         // flooring at the hunk header.
-        app.handle_key(key(KeyCode::Char('K')));
-        app.handle_key(key(KeyCode::Char('K')));
-        app.handle_key(key(KeyCode::Char('K')));
+        app.handle_key(key(KeyCode::Char('k')));
+        app.handle_key(key(KeyCode::Char('k')));
+        app.handle_key(key(KeyCode::Char('k')));
         assert!(app.scroll >= hunk_top);
     }
 
@@ -1747,6 +1766,16 @@ mod tests {
         );
         let (start, end) = app.layout.change_runs[0];
         assert_eq!(end - start, 3);
+    }
+
+    #[test]
+    fn w_key_toggles_wrap_lines() {
+        let mut app = fake_app(vec![]);
+        assert!(!app.wrap_lines);
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(app.wrap_lines);
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(!app.wrap_lines);
     }
 
     #[test]

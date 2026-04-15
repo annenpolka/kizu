@@ -91,24 +91,41 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     app.last_body_height.set(viewport_height);
     let viewport_top = app.visual_viewport_top(viewport_height, now);
 
-    let start = viewport_top;
-    let cap_end = start.saturating_add(SCROLL_ROW_LIMIT.min(viewport_height));
-    let end = cap_end.min(total_rows);
+    // In wrap mode we reserve 7 cells per row: 5 for the left bar,
+    // 1 for the `+`/`-`/` ` prefix, 1 for the `¶` newline marker.
+    let wrap_body_width: Option<usize> = if app.wrap_lines {
+        Some((content_area.width as usize).saturating_sub(7).max(1))
+    } else {
+        None
+    };
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(end.saturating_sub(start));
-    for row_idx in start..end {
+    // Walk logical rows from `viewport_top` and accumulate visual
+    // lines until we've filled the viewport or run out of rows.
+    // Wrapped DiffLines contribute multiple visual rows per logical
+    // row; everything else contributes exactly one.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport_height);
+    let mut row_idx = viewport_top;
+    while row_idx < total_rows && lines.len() < viewport_height {
         let is_cursor = row_idx == cursor_row;
-        lines.push(render_row(
+        let row_lines = render_row(
             &app.layout.rows[row_idx],
             &app.files,
             selected,
             is_cursor,
-        ));
+            wrap_body_width,
+        );
+        for line in row_lines {
+            if lines.len() >= viewport_height {
+                break;
+            }
+            lines.push(line);
+        }
+        row_idx += 1;
     }
 
-    if total_rows > SCROLL_ROW_LIMIT && (start + viewport_height) < total_rows {
-        let remaining = total_rows - end;
-        if remaining > 0 {
+    if total_rows > SCROLL_ROW_LIMIT && row_idx < total_rows {
+        let remaining = total_rows - row_idx;
+        if remaining > 0 && lines.len() < viewport_height {
             lines.push(Line::from(Span::styled(
                 format!("[+{remaining} more rows]"),
                 Style::default().fg(Color::DarkGray),
@@ -142,28 +159,35 @@ fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> O
     })
 }
 
-/// Build the styled `Line` for a single layout row. `selected_hunk`
-/// identifies the (file_idx, hunk_idx) the cursor is currently inside;
-/// rows belonging to that hunk render at full saturation, all other
-/// hunk rows render with `Modifier::DIM` so the cursor's hunk pops out
-/// of the surrounding diff without hiding it. `is_cursor` is `true` for
-/// the *single* row that `app.scroll` points at — that row gets a
-/// stronger left-margin marker so the user can find their position
-/// inside a long hunk.
+/// Build the styled visual `Line`s for a single logical layout row.
+/// Most row types produce exactly one `Line`; a `DiffLine` in wrap
+/// mode (`wrap_body_width.is_some()`) can produce multiple lines
+/// when its content exceeds the body width.
+///
+/// `selected_hunk` identifies the (file_idx, hunk_idx) the cursor is
+/// currently inside; rows belonging to that hunk render at full
+/// saturation, all other hunk rows render with `Modifier::DIM`.
+/// `is_cursor` is `true` for the logical row that `app.scroll` points
+/// at — in wrap mode the cursor arrow appears on the first visual
+/// row of that logical row, the rest keep the normal selected
+/// ribbon.
 fn render_row(
     row: &RowKind,
     files: &[FileDiff],
     selected_hunk: Option<(usize, usize)>,
     is_cursor: bool,
-) -> Line<'static> {
+    wrap_body_width: Option<usize>,
+) -> Vec<Line<'static>> {
     match row {
-        RowKind::FileHeader { file_idx } => render_file_header(*file_idx, &files[*file_idx]),
+        RowKind::FileHeader { file_idx } => {
+            vec![render_file_header(*file_idx, &files[*file_idx])]
+        }
         RowKind::HunkHeader { file_idx, hunk_idx } => {
             let DiffContent::Text(hunks) = &files[*file_idx].content else {
-                return Line::raw("");
+                return vec![Line::raw("")];
             };
             let is_selected = selected_hunk == Some((*file_idx, *hunk_idx));
-            render_hunk_header(&hunks[*hunk_idx], is_selected)
+            vec![render_hunk_header(&hunks[*hunk_idx], is_selected)]
         }
         RowKind::DiffLine {
             file_idx,
@@ -171,18 +195,116 @@ fn render_row(
             line_idx,
         } => {
             let DiffContent::Text(hunks) = &files[*file_idx].content else {
-                return Line::raw("");
+                return vec![Line::raw("")];
             };
             let is_selected = selected_hunk == Some((*file_idx, *hunk_idx));
             let line = &hunks[*hunk_idx].lines[*line_idx];
-            render_diff_line(line, is_selected, is_cursor)
+            match wrap_body_width {
+                Some(width) => render_diff_line_wrapped(line, is_selected, is_cursor, width),
+                None => vec![render_diff_line(line, is_selected, is_cursor)],
+            }
         }
-        RowKind::BinaryNotice { .. } => Line::from(Span::styled(
+        RowKind::BinaryNotice { .. } => vec![Line::from(Span::styled(
             "       [binary file - diff suppressed]",
             Style::default().fg(Color::DarkGray),
-        )),
-        RowKind::Spacer => Line::raw(""),
+        ))],
+        RowKind::Spacer => vec![Line::raw("")],
     }
+}
+
+/// Split `content` into chunks of at most `width` chars. Always
+/// returns at least one chunk; an empty input produces `[""]`. Char-
+/// based, not display-width-based — CJK wide characters count as
+/// 1 char, so wrap is approximate for those. Fine for the ASCII-
+/// heavy diffs kizu cares about.
+fn wrap_at_chars(content: &str, width: usize) -> Vec<&str> {
+    if content.is_empty() || width == 0 {
+        return vec![content];
+    }
+    let mut chunks = Vec::new();
+    let mut chunk_start = 0usize;
+    let mut chunk_chars = 0usize;
+    for (idx, _) in content.char_indices() {
+        if chunk_chars == width {
+            chunks.push(&content[chunk_start..idx]);
+            chunk_start = idx;
+            chunk_chars = 0;
+        }
+        chunk_chars += 1;
+    }
+    if chunk_start < content.len() {
+        chunks.push(&content[chunk_start..]);
+    }
+    if chunks.is_empty() {
+        chunks.push(content);
+    }
+    chunks
+}
+
+/// Wrap-mode variant of [`render_diff_line`]. Splits `line.content`
+/// at `body_width` chars, preserves the `+`/`-`/` ` prefix on every
+/// continuation row, and decorates the *last* visual row with a `¶`
+/// newline marker so the reader can tell real newlines from wrap
+/// boundaries.
+fn render_diff_line_wrapped(
+    line: &crate::git::DiffLine,
+    is_selected: bool,
+    is_cursor: bool,
+    body_width: usize,
+) -> Vec<Line<'static>> {
+    let (prefix_char, color) = match line.kind {
+        LineKind::Added => ('+', Some(Color::Green)),
+        LineKind::Deleted => ('-', Some(Color::Red)),
+        LineKind::Context => (' ', None),
+    };
+    let body_style = match (color, is_selected) {
+        (Some(c), true) => Style::default().fg(c),
+        (Some(c), false) => Style::default().fg(c).add_modifier(Modifier::DIM),
+        (None, true) => Style::default(),
+        (None, false) => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    };
+    let prefix_style = match (color, is_selected) {
+        (Some(c), true) => Style::default().fg(c),
+        (Some(c), false) => Style::default().fg(c).add_modifier(Modifier::DIM),
+        (None, true) => Style::default(),
+        (None, false) => Style::default().add_modifier(Modifier::DIM),
+    };
+    let marker_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+
+    let chunks = wrap_at_chars(&line.content, body_width.max(1));
+    let last_idx = chunks.len().saturating_sub(1);
+
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let is_first = i == 0;
+            let is_last = i == last_idx;
+            let bar = if is_cursor && is_first {
+                Span::styled(
+                    "  ▶  ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if is_selected {
+                Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
+            } else {
+                Span::raw("     ")
+            };
+            let prefix_span = Span::styled(prefix_char.to_string(), prefix_style);
+            let body_span = Span::styled(chunk.to_string(), body_style);
+            let mut spans = vec![bar, prefix_span, body_span];
+            if is_last {
+                spans.push(Span::styled("¶", marker_style));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Bottom-up file header: `  path                                14:03   +12 -3`.
@@ -425,6 +547,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Cyan).add_modifier(bold),
         ));
 
+        // Line-wrap indicator. `w` toggles wrap on/off.
+        spans.push(sep());
+        spans.push(Span::styled("w", Style::default().fg(Color::Cyan)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            if app.wrap_lines { "wrap" } else { "nowrap" },
+            Style::default().fg(Color::Cyan).add_modifier(bold),
+        ));
+
         spans.push(sep());
         spans.push(Span::styled("⎵", Style::default().fg(Color::Magenta)));
         spans.push(Span::raw(" "));
@@ -612,6 +743,7 @@ mod tests {
             last_body_height: std::cell::Cell::new(24),
             visual_top: std::cell::Cell::new(0.0),
             anim: None,
+            wrap_lines: false,
         }
     }
 
@@ -712,6 +844,64 @@ mod tests {
         }
         assert!(found_added_green, "expected an added '+' rendered in green");
         assert!(found_deleted_red, "expected a deleted '-' rendered in red");
+    }
+
+    #[test]
+    fn wrap_mode_renders_newline_marker_and_wraps_long_line() {
+        // 120-char diff line inside an 80-col terminal. In wrap mode
+        // the line should wrap to at least two visual rows and the
+        // last visible segment should end with a `¶` newline marker.
+        let long_content: String = (0..120u8).map(|i| (b'a' + (i % 26)) as char).collect();
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, &long_content)])],
+            100,
+        )]);
+        app.wrap_lines = true;
+
+        let view = render_to_string(&app, 80, 14);
+        assert!(
+            view.contains("¶"),
+            "wrap mode should draw a ¶ newline marker:\n{view}"
+        );
+        // The second half of the content must be visible — i.e. the
+        // line wrapped onto another visual row instead of being
+        // truncated at the viewport edge.
+        assert!(
+            view.contains(&long_content[90..110]),
+            "expected wrapped continuation to be visible:\n{view}"
+        );
+    }
+
+    #[test]
+    fn nowrap_mode_has_no_newline_marker() {
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "short")])],
+            100,
+        )]);
+        app.wrap_lines = false;
+        let view = render_to_string(&app, 80, 10);
+        assert!(
+            !view.contains("¶"),
+            "nowrap mode should not draw newline markers:\n{view}"
+        );
+    }
+
+    #[test]
+    fn wrap_nowrap_indicator_appears_in_footer() {
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        let nowrap_view = render_to_string(&app, 80, 8);
+        assert!(nowrap_view.contains("nowrap"));
+
+        app.wrap_lines = true;
+        let wrap_view = render_to_string(&app, 80, 8);
+        assert!(wrap_view.contains("wrap"));
+        assert!(!wrap_view.contains("nowrap"));
     }
 
     #[test]
