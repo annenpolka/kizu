@@ -215,7 +215,7 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let (Some(header_rect), Some((file_idx, hunk_idx))) = (header_area, sticky)
         && let DiffContent::Text(hunks) = &app.files[file_idx].content
     {
-        let line = render_hunk_header(&hunks[hunk_idx], true);
+        let line = render_hunk_header(&hunks[hunk_idx], true, false);
         frame.render_widget(Paragraph::new(line), header_rect);
     }
 }
@@ -258,14 +258,22 @@ fn render_row(
 ) -> Vec<Line<'static>> {
     match row {
         RowKind::FileHeader { file_idx } => {
-            vec![render_file_header(*file_idx, &files[*file_idx])]
+            vec![render_file_header(
+                *file_idx,
+                &files[*file_idx],
+                cursor_sub.is_some(),
+            )]
         }
         RowKind::HunkHeader { file_idx, hunk_idx } => {
             let DiffContent::Text(hunks) = &files[*file_idx].content else {
                 return vec![Line::raw("")];
             };
             let is_selected = selected_hunk == Some((*file_idx, *hunk_idx));
-            vec![render_hunk_header(&hunks[*hunk_idx], is_selected)]
+            vec![render_hunk_header(
+                &hunks[*hunk_idx],
+                is_selected,
+                cursor_sub.is_some(),
+            )]
         }
         RowKind::DiffLine {
             file_idx,
@@ -404,7 +412,7 @@ fn render_diff_line_wrapped(
 /// Bottom-up file header: `  path                                14:03   +12 -3`.
 /// Path color encodes the status (cyan / green / red / yellow), no `M`/`A`/`D`
 /// label needed.
-fn render_file_header(_file_idx: usize, file: &FileDiff) -> Line<'static> {
+fn render_file_header(_file_idx: usize, file: &FileDiff, is_cursor: bool) -> Line<'static> {
     let path_color = match file.status {
         FileStatus::Modified => Color::Cyan,
         FileStatus::Added => Color::Green,
@@ -419,7 +427,16 @@ fn render_file_header(_file_idx: usize, file: &FileDiff) -> Line<'static> {
     let mtime = format_mtime(file.mtime);
 
     let mut spans = vec![
-        Span::raw("  "),
+        if is_cursor {
+            Span::styled(
+                "▶ ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("  ")
+        },
         Span::styled(
             file.path.display().to_string(),
             Style::default().fg(path_color).add_modifier(Modifier::BOLD),
@@ -435,11 +452,12 @@ fn render_file_header(_file_idx: usize, file: &FileDiff) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_hunk_header(hunk: &Hunk, is_selected: bool) -> Line<'static> {
+fn render_hunk_header(hunk: &Hunk, is_selected: bool, is_cursor: bool) -> Line<'static> {
     let body = match &hunk.context {
-        Some(ctx) => format!("       @@ {ctx}"),
+        Some(ctx) => format!("{}  @@ {ctx}", if is_cursor { "  ▶  " } else { "     " }),
         None => format!(
-            "       @@ -{},{} +{},{} @@",
+            "{}  @@ -{},{} +{},{} @@",
+            if is_cursor { "  ▶  " } else { "     " },
             hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
         ),
     };
@@ -1398,6 +1416,37 @@ mod tests {
         assert!(
             had_plain_bar,
             "expected a yellow '▎' ribbon on the other selected row"
+        );
+    }
+
+    #[test]
+    fn hunk_header_cursor_displays_arrow_marker() {
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
+            100,
+        )]);
+        app.scroll_to(app.layout.hunk_starts[0]);
+
+        let view = render_to_string(&app, 80, 10);
+        assert!(
+            view.contains("▶"),
+            "cursor parked on a hunk header must still be visible:\n{view}"
+        );
+    }
+
+    #[test]
+    fn file_header_cursor_displays_arrow_marker() {
+        let app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
+            100,
+        )]);
+
+        let view = render_to_string(&app, 80, 10);
+        assert!(
+            view.contains("▶"),
+            "cursor parked on a file header must still be visible:\n{view}"
         );
     }
 
