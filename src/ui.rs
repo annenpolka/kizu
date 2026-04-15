@@ -416,6 +416,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ));
         }
 
+        // Cursor placement indicator. `z` toggles Centered ↔ Top.
+        spans.push(sep());
+        spans.push(Span::styled("z", Style::default().fg(Color::Cyan)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            app.cursor_placement.label(),
+            Style::default().fg(Color::Cyan).add_modifier(bold),
+        ));
+
         spans.push(sep());
         spans.push(Span::styled("⎵", Style::default().fg(Color::Magenta)));
         spans.push(Span::raw(" "));
@@ -1080,9 +1089,10 @@ mod tests {
     }
 
     #[test]
-    fn bottom_cursor_renders_arrow_near_viewport_bottom() {
-        // Same fixture, toggled to Bottom placement. The arrow should
-        // sit near the very last visible row.
+    fn top_cursor_renders_arrow_near_viewport_top() {
+        // Same fixture, toggled to Top placement. The arrow should
+        // sit at the body's top row, just below the pinned sticky
+        // hunk header.
         let lines: Vec<DiffLine> = (0..40)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
@@ -1095,7 +1105,7 @@ mod tests {
         let header = app.layout.hunk_starts[0];
         app.scroll_to(header + 20);
         app.anim = None;
-        app.cursor_placement = crate::app::CursorPlacement::Bottom;
+        app.cursor_placement = crate::app::CursorPlacement::Top;
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1112,14 +1122,10 @@ mod tests {
             }
         }
         let y = cursor_y.expect("expected the cursor `▶` to be drawn");
-        // Bottom mode + sticky header (row 0) + footer (last row): the
-        // cursor should be on the last body row, which is two rows up
-        // from the absolute bottom of the buffer.
-        assert_eq!(
-            y,
-            buffer.area().height - 2,
-            "expected cursor at viewport floor, was at row {y}"
-        );
+        // Top mode + sticky header (row 0): the cursor should sit at
+        // the first body row, which is y=1 (right below the sticky
+        // header).
+        assert_eq!(y, 1, "expected cursor at viewport ceiling, was at row {y}");
     }
 
     #[test]

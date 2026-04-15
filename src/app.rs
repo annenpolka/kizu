@@ -65,12 +65,13 @@ pub struct App {
 
 /// Two ways the renderer can park the cursor inside the viewport.
 /// Defaults to [`CursorPlacement::Centered`]; `z` toggles to
-/// [`CursorPlacement::Bottom`] (a `tail -f`-flavoured layout where new
-/// hunks scroll up from the floor).
+/// [`CursorPlacement::Top`] (the cursor sits at the viewport ceiling
+/// and the selected hunk body reads downward from there — the
+/// natural direction for diff reading).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorPlacement {
     Centered,
-    Bottom,
+    Top,
 }
 
 impl CursorPlacement {
@@ -85,9 +86,19 @@ impl CursorPlacement {
         let max_top = total - height;
         let raw = match self {
             CursorPlacement::Centered => cursor.saturating_sub(height / 2),
-            CursorPlacement::Bottom => cursor.saturating_sub(height.saturating_sub(1)),
+            // Cursor at viewport row 0. The selected hunk flows
+            // downward from there into the body.
+            CursorPlacement::Top => cursor,
         };
         raw.min(max_top)
+    }
+
+    /// Short human label used in the footer indicator.
+    pub fn label(self) -> &'static str {
+        match self {
+            CursorPlacement::Centered => "center",
+            CursorPlacement::Top => "top",
+        }
     }
 }
 
@@ -232,8 +243,8 @@ impl App {
     /// `z` calls this — same vibe as `vim`'s `zz` (centre on cursor).
     pub fn toggle_cursor_placement(&mut self) {
         self.cursor_placement = match self.cursor_placement {
-            CursorPlacement::Centered => CursorPlacement::Bottom,
-            CursorPlacement::Bottom => CursorPlacement::Centered,
+            CursorPlacement::Centered => CursorPlacement::Top,
+            CursorPlacement::Top => CursorPlacement::Centered,
         };
     }
 
@@ -683,14 +694,11 @@ impl App {
     ///
     /// - `Centered` + short hunk: centre the hunk in the viewport,
     ///   breathing room above and below.
-    /// - `Bottom` + short hunk: pin the hunk's **last** row to the
-    ///   viewport floor, so walking into the hunk reveals its whole
-    ///   body above the cursor (the cursor row — usually the hunk
-    ///   header — sits higher up in the viewport, not at the floor).
-    ///   Without this, bottom mode would put the hunk header at the
-    ///   floor and the hunk body would flow off-screen below.
+    /// - `Top` + short hunk: pin the hunk's **first** row (its
+    ///   header) to the viewport ceiling, so the whole hunk body
+    ///   flows downward from the top into the rest of the viewport.
     /// - Either mode + long hunk: fall back to the placement's raw
-    ///   cursor-row rule (centred or floor-pinned), which is the
+    ///   cursor-row rule (centred or ceiling-pinned), which is the
     ///   correct behaviour while the user is walking through a hunk
     ///   that can't fit in one screen.
     pub fn viewport_top(&self, viewport_height: usize) -> usize {
@@ -708,7 +716,7 @@ impl App {
                         let pad = (viewport_height - hunk_size) / 2;
                         hunk_top.saturating_sub(pad)
                     }
-                    CursorPlacement::Bottom => hunk_end.saturating_sub(viewport_height),
+                    CursorPlacement::Top => hunk_top,
                 };
                 return raw.min(max_top);
             }
@@ -1530,11 +1538,10 @@ mod tests {
     }
 
     #[test]
-    fn bottom_mode_anchors_short_hunk_to_viewport_floor() {
-        // Regression: cursor on a short hunk's header in Bottom mode
-        // used to put the header at the viewport floor, pushing the
-        // hunk body off-screen below. The fix anchors the hunk's
-        // *last* row at the floor so the whole hunk is visible above.
+    fn top_mode_anchors_short_hunk_to_viewport_ceiling() {
+        // Cursor on a short hunk's header in Top mode pins the hunk's
+        // *first* row (its header) to the viewport ceiling so the body
+        // flows downward into the rest of the viewport.
         //
         // Layout (mtime-ascending sort):
         //   0  FileHeader  before.rs
@@ -1552,8 +1559,8 @@ mod tests {
         //  18  Spacer
         // Total = 19 rows. Viewport = 9. max_top = 10.
         // target hunk spans [8, 11) → size 3.
-        // Bottom mode pins hunk_end (11) to viewport floor, so
-        // viewport_top = hunk_end - viewport_height = 11 - 9 = 2.
+        // Top mode pins hunk_top (8) to the viewport ceiling, so
+        // viewport_top = 8.
         let mut app = fake_app(vec![
             make_file(
                 "before.rs",
@@ -1593,7 +1600,7 @@ mod tests {
                 300,
             ),
         ]);
-        app.cursor_placement = CursorPlacement::Bottom;
+        app.cursor_placement = CursorPlacement::Top;
         let target_hunk_row = app.layout.hunk_starts[1];
         app.scroll_to(target_hunk_row);
         let (hunk_top, hunk_end) = app.current_hunk_range().unwrap();
@@ -1601,30 +1608,28 @@ mod tests {
 
         let viewport = app.viewport_top(9);
         assert_eq!(
-            viewport, 2,
-            "bottom mode should anchor hunk_end to the viewport floor, \
-             not put the cursor row at the floor with the body cut off"
+            viewport, 8,
+            "top mode should anchor hunk_top to the viewport ceiling"
         );
     }
 
     #[test]
-    fn bottom_mode_long_hunk_still_pins_cursor_row() {
-        // The short-hunk fix must NOT break the long-hunk walking
-        // flow: when hunk_size > viewport, Bottom mode falls back to
-        // pinning the cursor row itself to the floor so J/K chunk
-        // scroll keeps working.
+    fn top_mode_long_hunk_still_pins_cursor_row() {
+        // When hunk_size > viewport, Top mode falls back to pinning
+        // the cursor row itself to the ceiling so J/K chunk scroll
+        // keeps working.
         let lines: Vec<DiffLine> = (0..40)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
         let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
-        app.cursor_placement = CursorPlacement::Bottom;
+        app.cursor_placement = CursorPlacement::Top;
         let header = app.layout.hunk_starts[0];
         app.scroll_to(header + 20);
 
         let height = 12;
-        // Long-hunk fall-through: viewport_top = cursor - (height - 1).
+        // Long-hunk fall-through: viewport_top = cursor (cursor at row 0).
         let viewport = app.viewport_top(height);
-        assert_eq!(viewport, (header + 20) - (height - 1));
+        assert_eq!(viewport, header + 20);
     }
 
     #[test]
@@ -1688,18 +1693,26 @@ mod tests {
     }
 
     #[test]
-    fn cursor_placement_bottom_pins_cursor_to_the_floor() {
-        // Cursor at row 50, viewport 20: cursor visually at row 19 (last
-        // row of viewport), viewport_top = 50 - 19 = 31.
-        let placement = CursorPlacement::Bottom;
-        assert_eq!(placement.viewport_top(50, 100, 20), 31);
+    fn cursor_placement_top_pins_cursor_to_the_ceiling() {
+        // Cursor at row 50, viewport 20: cursor visually at row 0
+        // (top of viewport), viewport_top = 50.
+        let placement = CursorPlacement::Top;
+        assert_eq!(placement.viewport_top(50, 100, 20), 50);
+    }
+
+    #[test]
+    fn cursor_placement_top_clamps_against_max_top() {
+        // Cursor near the end of the layout: Top mode would push
+        // viewport_top past max_top, so it clamps.
+        let placement = CursorPlacement::Top;
+        assert_eq!(placement.viewport_top(95, 100, 20), 80);
     }
 
     #[test]
     fn cursor_placement_returns_zero_when_layout_fits_in_viewport() {
         // 5 rows, viewport 20 → no scrolling possible regardless of mode.
         assert_eq!(CursorPlacement::Centered.viewport_top(3, 5, 20), 0);
-        assert_eq!(CursorPlacement::Bottom.viewport_top(3, 5, 20), 0);
+        assert_eq!(CursorPlacement::Top.viewport_top(3, 5, 20), 0);
     }
 
     #[test]
@@ -1707,7 +1720,7 @@ mod tests {
         let mut app = fake_app(vec![]);
         assert_eq!(app.cursor_placement, CursorPlacement::Centered);
         app.handle_key(key(KeyCode::Char('z')));
-        assert_eq!(app.cursor_placement, CursorPlacement::Bottom);
+        assert_eq!(app.cursor_placement, CursorPlacement::Top);
         app.handle_key(key(KeyCode::Char('z')));
         assert_eq!(app.cursor_placement, CursorPlacement::Centered);
     }
