@@ -257,6 +257,14 @@ async fn run_loop(
     let mut events = EventStream::new();
 
     while !app.should_quit {
+        // Draw at the top of the loop so the initial App state is visible
+        // before we ever block on `select!`. Without this, the alternate
+        // screen stays blank until the first key press or watcher event
+        // arrives.
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .context("ratatui draw")?;
+
         tokio::select! {
             Some(Ok(event)) = events.next() => {
                 if let Event::Key(key) = event {
@@ -280,9 +288,6 @@ async fn run_loop(
                 }
             }
         }
-        terminal
-            .draw(|frame| crate::ui::render(frame, app))
-            .context("ratatui draw")?;
     }
 
     Ok(())
