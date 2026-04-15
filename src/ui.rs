@@ -56,9 +56,7 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // viewport_top with the *real* body height further down so the
     // sticky overlay never makes the cursor jitter.
     let raw_body_height = area.height as usize;
-    let provisional_top =
-        app.cursor_placement
-            .viewport_top(cursor_row, total_rows, raw_body_height);
+    let provisional_top = app.viewport_top(raw_body_height);
 
     // Sticky header: cursor is inside a hunk whose header sits above
     // the visible viewport top.
@@ -90,9 +88,7 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Tell the App layer how tall the body actually was so the next
     // `J`/`K` press can size its scroll chunk relative to this height.
     app.last_body_height.set(viewport_height);
-    let viewport_top = app
-        .cursor_placement
-        .viewport_top(cursor_row, total_rows, viewport_height);
+    let viewport_top = app.viewport_top(viewport_height);
 
     let start = viewport_top;
     let cap_end = start.saturating_add(SCROLL_ROW_LIMIT.min(viewport_height));

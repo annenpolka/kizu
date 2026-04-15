@@ -562,6 +562,70 @@ impl App {
         }
     }
 
+    /// `(start, end_exclusive)` row range of the cursor's current hunk.
+    /// Walks `layout.rows` from the start of the hunk header through
+    /// every consecutive `DiffLine` belonging to the same hunk. Returns
+    /// `None` when the cursor is not inside a hunk.
+    pub fn current_hunk_range(&self) -> Option<(usize, usize)> {
+        let (file_idx, hunk_idx) = self.current_hunk()?;
+        let mut start = None;
+        let mut end = None;
+        for (i, row) in self.layout.rows.iter().enumerate() {
+            let belongs = match row {
+                RowKind::HunkHeader {
+                    file_idx: f,
+                    hunk_idx: h,
+                } => *f == file_idx && *h == hunk_idx,
+                RowKind::DiffLine {
+                    file_idx: f,
+                    hunk_idx: h,
+                    ..
+                } => *f == file_idx && *h == hunk_idx,
+                _ => false,
+            };
+            if belongs {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                end = Some(i + 1);
+            } else if start.is_some() {
+                // Already walked past the hunk's last row.
+                break;
+            }
+        }
+        Some((start?, end?))
+    }
+
+    /// Where the renderer should park the viewport top, given a body
+    /// height. In `Centered` mode this prefers to vertically centre the
+    /// **whole hunk** the cursor is in (so a short hunk reads as a
+    /// floating block with breathing room above and below). When the
+    /// hunk doesn't fit, it falls back to centring the cursor row, the
+    /// same behaviour as long-hunk walking. `Bottom` mode keeps its
+    /// "cursor pinned to the floor" semantics regardless of hunk size.
+    pub fn viewport_top(&self, viewport_height: usize) -> usize {
+        let total = self.layout.rows.len();
+        if total <= viewport_height {
+            return 0;
+        }
+        let max_top = total - viewport_height;
+
+        if matches!(self.cursor_placement, CursorPlacement::Centered)
+            && let Some((hunk_top, hunk_end)) = self.current_hunk_range()
+        {
+            let hunk_size = hunk_end - hunk_top;
+            if hunk_size < viewport_height {
+                let pad = (viewport_height - hunk_size) / 2;
+                return hunk_top.saturating_sub(pad).min(max_top);
+            }
+        }
+
+        // Long hunk, no current hunk, or bottom mode → defer to the
+        // simple placement-based viewport_top.
+        self.cursor_placement
+            .viewport_top(self.scroll, total, viewport_height)
+    }
+
     // ---- layout build / anchor ----------------------------------------
 
     fn populate_mtimes(&self, files: &mut [FileDiff]) {
@@ -1236,6 +1300,121 @@ mod tests {
         app.scroll_to(second_start);
         app.handle_key(key(KeyCode::Char('K')));
         assert_eq!(app.scroll, first_start);
+    }
+
+    #[test]
+    fn viewport_top_centers_short_hunk_inside_viewport() {
+        // Layout shape (after mtime-ascending sort):
+        //   0  FileHeader  before.rs
+        //   1  HunkHeader
+        //   2..5 four context lines
+        //   6  Spacer
+        //   7  FileHeader  target.rs   (← cursor will park here)
+        //   8  HunkHeader
+        //   9  +alpha
+        //  10  +beta
+        //  11  Spacer
+        //  12 FileHeader  after.rs     (lots of trailing space so we
+        //  13  HunkHeader               aren't clamped against max_top)
+        //  14..17 four context lines
+        //  18  Spacer
+        // Total = 19 rows. Viewport = 9. max_top = 10.
+        // Hunk spans rows [8, 11) → size 3.
+        // Centring 3 rows in a 9-row viewport means
+        // viewport_top = 8 - (9 - 3)/2 = 8 - 3 = 5.
+        let mut app = fake_app(vec![
+            make_file(
+                "before.rs",
+                vec![hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Context, " a"),
+                        diff_line(LineKind::Context, " b"),
+                        diff_line(LineKind::Context, " c"),
+                        diff_line(LineKind::Context, " d"),
+                    ],
+                )],
+                100,
+            ),
+            make_file(
+                "target.rs",
+                vec![hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Added, "alpha"),
+                        diff_line(LineKind::Added, "beta"),
+                    ],
+                )],
+                200,
+            ),
+            make_file(
+                "after.rs",
+                vec![hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Context, " a"),
+                        diff_line(LineKind::Context, " b"),
+                        diff_line(LineKind::Context, " c"),
+                        diff_line(LineKind::Context, " d"),
+                    ],
+                )],
+                300,
+            ),
+        ]);
+        // Park the cursor on target.rs's hunk header.
+        let target_hunk_row = app.layout.hunk_starts[1];
+        app.scroll_to(target_hunk_row);
+        let (hunk_top, hunk_end) = app.current_hunk_range().unwrap();
+        assert_eq!(hunk_end - hunk_top, 3);
+
+        let viewport = app.viewport_top(9);
+        assert_eq!(
+            viewport, 5,
+            "expected the 3-row hunk centred at viewport_top = 5 in a 9-row viewport"
+        );
+    }
+
+    #[test]
+    fn viewport_top_falls_back_to_cursor_centered_for_long_hunks() {
+        // Single long hunk, much taller than the viewport: should fall
+        // back to centring the cursor row instead of trying to centre
+        // the whole hunk.
+        let lines: Vec<DiffLine> = (0..40)
+            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+            .collect();
+        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let header = app.layout.hunk_starts[0];
+        // Park well inside the long hunk.
+        app.scroll_to(header + 20);
+
+        let height = 12;
+        let viewport = app.viewport_top(height);
+        // For the long-hunk fall-through, viewport_top = cursor - height/2.
+        assert_eq!(viewport, (header + 20) - height / 2);
+    }
+
+    #[test]
+    fn viewport_top_clamps_short_hunk_centring_against_layout_edges() {
+        // A short hunk near the very start of the layout: padding above
+        // would push viewport_top below 0 → clamp at 0.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "alpha"),
+                    diff_line(LineKind::Added, "beta"),
+                ],
+            )],
+            100,
+        )]);
+        let hunk_row = app.layout.hunk_starts[0];
+        app.scroll_to(hunk_row);
+
+        // 12-row viewport, but hunk starts at row 1 (after the file
+        // header). hunk_top - pad would be negative; clamped to 0.
+        let viewport = app.viewport_top(12);
+        assert_eq!(viewport, 0);
     }
 
     #[test]
