@@ -100,9 +100,15 @@ pub fn compute_diff(root: &Path, baseline_sha: &str) -> Result<Vec<FileDiff>> {
 }
 
 /// List untracked files reported by `git status --porcelain`.
+///
+/// `--untracked-files=all` is required so git expands sub-directories
+/// containing only untracked files into individual entries. Without
+/// it, default "normal" mode collapses `scratch/a.rs` and
+/// `scratch/b.rs` into a single `?? scratch/` line and kizu would
+/// try to open the directory itself as a file.
 fn list_untracked(root: &Path) -> Result<Vec<PathBuf>> {
     let output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(root)
         .output()
         .context("failed to spawn `git status --porcelain`")?;
@@ -720,6 +726,37 @@ index 1111111..0000000
         assert_eq!(hunks[0].lines.len(), 2);
         assert_eq!(hunks[0].lines[0].content, "line one");
         assert_eq!(hunks[0].lines[1].content, "line two");
+    }
+
+    #[test]
+    fn compute_diff_expands_untracked_files_inside_subdirectories() {
+        // Regression: default `git status --porcelain` collapses a
+        // directory containing only untracked files into a single
+        // `?? subdir/` entry. kizu must pass `--untracked-files=all`
+        // so each file is listed individually — otherwise untracked
+        // files dropped into subdirectories are invisible in the TUI.
+        let repo = init_repo();
+        fs::write(repo.path().join("seed.txt"), "seed").expect("write seed");
+        run_git(repo.path(), &["add", "seed.txt"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "initial"]);
+        let baseline = head_sha(repo.path()).expect("head_sha");
+
+        fs::create_dir_all(repo.path().join("subdir")).expect("mkdir subdir");
+        fs::write(repo.path().join("subdir/a.rs"), "alpha\n").expect("write a");
+        fs::write(repo.path().join("subdir/b.rs"), "beta\n").expect("write b");
+
+        let files = compute_diff(repo.path(), &baseline).expect("compute_diff");
+        let mut untracked: Vec<_> = files
+            .iter()
+            .filter(|f| f.status == FileStatus::Untracked)
+            .map(|f| f.path.clone())
+            .collect();
+        untracked.sort();
+        assert_eq!(
+            untracked,
+            vec![PathBuf::from("subdir/a.rs"), PathBuf::from("subdir/b.rs"),],
+            "expected both subdirectory files listed individually"
+        );
     }
 
     #[test]
