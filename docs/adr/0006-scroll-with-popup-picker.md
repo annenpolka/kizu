@@ -49,6 +49,18 @@ UI を以下の形に作り直す:
 - **ファイルは mtime 昇順** (古い順) で並べる。「テキストは下に流れる」という前提と「最新が上にいる」が認知的に矛盾しているため、`tail -f` / chat log と同じ方向 (古い → 新しいが top → bottom) に揃える。`App.files[0]` が最古、`App.files.len()-1` が最新。`build_layout` はそのまま順方向に rows を生成し、巻物は古→新の自然な時系列になる。`follow_target_row` は `files.last()` の最後の hunk = **巻物の底**。
 - **picker は逆方向 (mtime 降順)** で表示する。ファイルピッカーの慣例は「いま編集したファイルが最初」なので、`picker_results` は `(0..files.len()).rev()` を返す。`Space` → そのまま `Enter` で「いまエージェントが書いた最新ファイル」に飛ぶ。スクロールと picker で並び順は逆になるが、それぞれの UI 構造 (連続的な巻物 / 離散的なリスト) に合った convention を優先する。
 
+### 視野階層 (M4v 改訂)
+
+巻物全体を常に展開しつつ、注意の階層を **色の濃淡** で立てる。視線を動かせばすべての hunk の本文が読めるが、視野のコアは選択中の hunk と accent マーカーだけ。
+
+- **selected hunk**: フル彩度。`+` Color::Green / `-` Color::Red / context white、`@@` ヘッダ Color::Cyan、左端に Color::Yellow の `▎` 1 文字
+- **unselected hunk**: 同じ色 + `Modifier::DIM`。type info は読めるが視線が引きつけられない
+- **file header の path 色 = ステータス**: Modified=Cyan / Added=Green / Deleted=Red / Untracked=Yellow。`M`/`A`/`D`/`??` ラベルは廃止
+- **file header に mtime と +N -M を常時表示**。視線スキャンで「いつ・どれくらい・どこ」が把握できる
+- **hunk header は xfuncname を優先**: git の `@@ -10,6 +10,9 @@ fn verify_token(...) {` 形式から trailing context を `Hunk.context` として保持し、`@@ fn verify_token(...) {` の形で表示する。context が無いときは従来の `@@ -10,6 +10,9 @@` に fallback
+- **scar `◇` プレースホルダー**: file header 末尾に scar 列を確保しておくが、scar 機能本体 (v0.2) が land するまで実データは入らない
+- 完全な静寂 (γ) より騒がしいが、視線スキャンで全状態が拾える「**情報を持った静寂**」を選ぶ。`Modifier::DIM` が効かないターミナルでも色だけは出るので最低限の type info は維持される
+
 ## Consequences
 
 **ポジティブ**:

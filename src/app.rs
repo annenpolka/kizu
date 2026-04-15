@@ -418,6 +418,20 @@ impl App {
             .map(|f| f.path.as_path())
     }
 
+    /// `(file_idx, hunk_idx)` of the hunk the cursor is currently inside,
+    /// or `None` when scroll is parked on a non-hunk row (file header,
+    /// binary notice, spacer). The renderer uses this to pick the bright
+    /// style for selected hunk rows and DIM for everyone else.
+    pub fn current_hunk(&self) -> Option<(usize, usize)> {
+        match self.layout.rows.get(self.scroll)? {
+            RowKind::HunkHeader { file_idx, hunk_idx } => Some((*file_idx, *hunk_idx)),
+            RowKind::DiffLine {
+                file_idx, hunk_idx, ..
+            } => Some((*file_idx, *hunk_idx)),
+            _ => None,
+        }
+    }
+
     // ---- layout build / anchor ----------------------------------------
 
     fn populate_mtimes(&self, files: &mut [FileDiff]) {
@@ -678,6 +692,7 @@ mod tests {
             new_start: old_start,
             new_count: added,
             lines,
+            context: None,
         }
     }
 

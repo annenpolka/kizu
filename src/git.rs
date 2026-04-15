@@ -46,6 +46,12 @@ pub struct Hunk {
     pub new_start: usize,
     pub new_count: usize,
     pub lines: Vec<DiffLine>,
+    /// Trailing context that git puts after the closing `@@` of a hunk
+    /// header — usually the enclosing function signature for languages
+    /// where git's xfuncname pattern is configured (Rust, C, Go, Python,
+    /// JS/TS, Ruby, …). The UI uses this as a human-readable hunk title
+    /// instead of `@@ -10,6 +10,9 @@`.
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +169,7 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
             new_start,
             new_count,
             lines,
+            context: None,
         }]),
         mtime: SystemTime::UNIX_EPOCH,
     })
@@ -303,9 +310,24 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
         }
 
         if let Some(rest) = line.strip_prefix("@@ ") {
-            // Hunk header: `@@ -old_start,old_count +new_start,new_count @@`
+            // Hunk header. Two flavours:
+            //   `@@ -10,6 +10,9 @@`
+            //   `@@ -10,6 +10,9 @@ fn verify_token(claims: &Claims) -> ...`
+            // The trailing string after the second `@@` is git's xfuncname
+            // capture — keep it as Hunk.context for the UI.
             finish_hunk(&mut current_hunk, &mut current_hunks);
-            let header = rest.trim_end_matches(" @@").trim_end_matches("@@");
+            let (header, context) = match rest.split_once(" @@") {
+                Some((header, tail)) => {
+                    let trimmed = tail.trim();
+                    let context = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                    (header, context)
+                }
+                None => (rest.trim_end_matches("@@"), None),
+            };
             let mut parts = header.split_whitespace();
             let old = parts.next().unwrap_or("-0,0");
             let new = parts.next().unwrap_or("+0,0");
@@ -317,6 +339,7 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
                 new_start,
                 new_count,
                 lines: Vec::new(),
+                context,
             });
             continue;
         }
@@ -432,6 +455,36 @@ index e69de29..4b825dc 100644
         assert_eq!(hunk.lines.len(), 1);
         assert_eq!(hunk.lines[0].kind, LineKind::Added);
         assert_eq!(hunk.lines[0].content, "fn main() {}");
+        assert_eq!(hunk.context, None, "no xfuncname context expected");
+    }
+
+    #[test]
+    fn parse_unified_diff_captures_xfuncname_context_from_at_at_line() {
+        // git puts the enclosing function signature after the closing `@@`
+        // when an xfuncname pattern matches. The parser must surface that
+        // string as Hunk.context so the UI can use it as the hunk title.
+        let raw = "\
+diff --git a/src/auth.rs b/src/auth.rs
+index e69de29..4b825dc 100644
+--- a/src/auth.rs
++++ b/src/auth.rs
+@@ -10,6 +10,9 @@ fn verify_token(claims: &Claims) -> Result<bool> {
++    if claims.exp < Utc::now().timestamp() as u64 {
++        return Err(AuthError::Expired);
++    }
+";
+
+        let files = parse_unified_diff(raw);
+        assert_eq!(files.len(), 1);
+        let hunks = match &files[0].content {
+            DiffContent::Text(h) => h,
+            DiffContent::Binary => panic!("expected text"),
+        };
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(
+            hunks[0].context.as_deref(),
+            Some("fn verify_token(claims: &Claims) -> Result<bool> {")
+        );
     }
 
     #[test]
