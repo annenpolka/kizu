@@ -41,3 +41,33 @@ jobs:
 
       - name: cargo build (release)
         run: cargo build --release --locked
+
+      # tests/e2e/ scaffold は M6 で初めて land する。
+      # それまでは下記 3 ステップは hashFiles ガードでスキップされる。
+      - name: Check for e2e scaffold
+        id: e2e_scaffold
+        shell: bash
+        run: |
+          if [ -f tests/e2e/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup bun
+        if: steps.e2e_scaffold.outputs.present == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install tuistory e2e deps
+        if: steps.e2e_scaffold.outputs.present == 'true'
+        working-directory: tests/e2e
+        run: bun install --frozen-lockfile
+
+      - name: Run tuistory e2e tests
+        if: steps.e2e_scaffold.outputs.present == 'true'
+        working-directory: tests/e2e
+        run: bun test
+        env:
+          KIZU_BIN: ${{ github.workspace }}/target/release/kizu

@@ -1,7 +1,3 @@
-// v0.1 skeleton: most module items are stubs awaiting implementation.
-// Lifted once concrete code lands in app/git/watcher/ui modules.
-#![allow(dead_code)]
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -35,11 +31,12 @@ enum Command {
     HookStop,
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => app::run(),
+        None => app::run().await,
         Some(Command::Init) => unimplemented!("v0.2: kizu init"),
         Some(Command::Teardown) => unimplemented!("v0.2: kizu teardown"),
         Some(Command::HookPostTool) => unimplemented!("v0.2: kizu hook-post-tool"),
