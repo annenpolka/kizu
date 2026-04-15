@@ -230,7 +230,7 @@ const HALF_PAGE: usize = 12;
 
 /// Async event loop. Wires the watcher channel and crossterm's async event
 /// stream into a single `tokio::select!`, applies drain-based coalescing
-/// (ADR-0005), and yields control to [`crate::ui::render`] every iteration.
+/// (ADR-0005), and renders through [`crate::ui::render`] every iteration.
 ///
 /// Raw mode, alternate-screen entry, panic hook, and main wiring all live
 /// in M5. For now this function compiles and runs the core loop, but it is
@@ -239,11 +239,17 @@ const HALF_PAGE: usize = 12;
 pub async fn run() -> Result<()> {
     use crossterm::event::{Event, EventStream};
     use futures_util::StreamExt;
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+    use std::io::stdout;
 
     let cwd = std::env::current_dir().context("reading current directory")?;
     let mut app = App::bootstrap(cwd)?;
     let mut watch = watcher::start(&app.root, &app.git_dir)?;
     let mut events = EventStream::new();
+
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend).context("constructing ratatui terminal")?;
 
     while !app.should_quit {
         tokio::select! {
@@ -269,8 +275,9 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
-        // M4 will replace this with `terminal.draw(|f| ui::render(f, &app))?;`
-        crate::ui::render(&app);
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .context("ratatui draw")?;
     }
 
     Ok(())
