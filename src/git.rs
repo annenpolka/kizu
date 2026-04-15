@@ -58,6 +58,11 @@ pub struct Hunk {
 pub struct DiffLine {
     pub kind: LineKind,
     pub content: String,
+    /// Whether this logical diff line ended with a real newline in the
+    /// source material. Git signals a missing terminal newline via the
+    /// standalone marker `\ No newline at end of file`; wrap-mode UI uses
+    /// this to decide whether to draw the `¶` newline marker honestly.
+    pub has_trailing_newline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,11 +335,12 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
     // We may have stopped mid-codepoint at the 8KB boundary; fall back to a
     // lossy decode so we never refuse a valid file because of an awkward cut.
     let text = String::from_utf8_lossy(&buf);
-    let lines: Vec<DiffLine> = text
-        .lines()
-        .map(|line| DiffLine {
+    let lines: Vec<DiffLine> = split_logical_lines(&text)
+        .into_iter()
+        .map(|(line, has_trailing_newline)| DiffLine {
             kind: LineKind::Added,
-            content: line.to_string(),
+            content: line,
+            has_trailing_newline,
         })
         .collect();
     let added = lines.len();
@@ -640,10 +646,17 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
         }
 
         if let Some(hunk) = current_hunk.as_mut() {
+            if line == r"\ No newline at end of file" {
+                if let Some(last) = hunk.lines.last_mut() {
+                    last.has_trailing_newline = false;
+                }
+                continue;
+            }
             if let Some(content) = line.strip_prefix('+') {
                 hunk.lines.push(DiffLine {
                     kind: LineKind::Added,
                     content: content.to_string(),
+                    has_trailing_newline: true,
                 });
                 if let Some(file) = files.last_mut() {
                     file.added += 1;
@@ -654,6 +667,7 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
                 hunk.lines.push(DiffLine {
                     kind: LineKind::Deleted,
                     content: content.to_string(),
+                    has_trailing_newline: true,
                 });
                 if let Some(file) = files.last_mut() {
                     file.deleted += 1;
@@ -664,6 +678,7 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
                 hunk.lines.push(DiffLine {
                     kind: LineKind::Context,
                     content: content.to_string(),
+                    has_trailing_newline: true,
                 });
                 continue;
             }
@@ -675,6 +690,24 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     // Flush trailing hunk + file.
     finish_file(&mut files, &mut current_hunks, &mut current_hunk);
     files
+}
+
+fn split_logical_lines(text: &str) -> Vec<(String, bool)> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    text.split_inclusive('\n')
+        .map(|chunk| {
+            let has_trailing_newline = chunk.ends_with('\n');
+            let without_newline = chunk.strip_suffix('\n').unwrap_or(chunk);
+            let line = without_newline
+                .strip_suffix('\r')
+                .unwrap_or(without_newline)
+                .to_string();
+            (line, has_trailing_newline)
+        })
+        .collect()
 }
 
 /// Parse `start,count` (or just `start`, defaulting count to 1) from a hunk header range.
@@ -896,6 +929,32 @@ Binary files a/icon.png and b/icon.png differ
         assert!(matches!(files[0].content, DiffContent::Binary));
         assert_eq!(files[0].added, 0);
         assert_eq!(files[0].deleted, 0);
+    }
+
+    #[test]
+    fn parse_unified_diff_marks_missing_terminal_newline_on_previous_line() {
+        let raw = "\
+diff --git a/foo.rs b/foo.rs
+index e69de29..4b825dc 100644
+--- a/foo.rs
++++ b/foo.rs
+@@ -1 +1 @@
+-old line
++new line
+\\ No newline at end of file
+";
+
+        let files = parse_unified_diff(raw);
+        let hunks = match &files[0].content {
+            DiffContent::Text(hunks) => hunks,
+            DiffContent::Binary => panic!("expected text content"),
+        };
+        let last = hunks[0].lines.last().expect("line present");
+        assert_eq!(last.content, "new line");
+        assert!(
+            !last.has_trailing_newline,
+            "newline marker line must clear the previous diff line's newline flag"
+        );
     }
 
     #[test]

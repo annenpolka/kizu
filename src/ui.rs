@@ -393,7 +393,7 @@ fn render_diff_line_wrapped(
             };
             let body_span = Span::styled(chunk.to_string(), body_style);
             let mut spans = vec![bar, prefix_span, body_span];
-            if is_last {
+            if is_last && line.has_trailing_newline {
                 spans.push(Span::styled("¶", marker_style));
             }
             Line::from(spans)
@@ -787,6 +787,7 @@ mod tests {
         DiffLine {
             kind,
             content: content.to_string(),
+            has_trailing_newline: true,
         }
     }
 
@@ -985,6 +986,28 @@ mod tests {
         assert!(
             view.contains(&long_content[90..110]),
             "expected wrapped continuation to be visible:\n{view}"
+        );
+    }
+
+    #[test]
+    fn wrap_mode_omits_newline_marker_when_diff_line_has_no_terminal_newline() {
+        let long_content: String = (0..40u8).map(|i| (b'a' + (i % 26)) as char).collect();
+        let mut file = make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, &long_content)])],
+            100,
+        );
+        let DiffContent::Text(hunks) = &mut file.content else {
+            panic!("expected text diff");
+        };
+        hunks[0].lines[0].has_trailing_newline = false;
+
+        let mut app = populated_app(vec![file]);
+        app.wrap_lines = true;
+        let view = render_to_string(&app, 40, 10);
+        assert!(
+            !view.contains("¶"),
+            "wrap mode must not invent a newline marker for EOF-no-newline lines:\n{view}"
         );
     }
 
