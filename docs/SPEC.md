@@ -92,7 +92,7 @@ scar機能追加（a/r/c/xキーバインド、言語判定、ファイル書き
 - **変更検知**: notify crate でworktree + .git/HEAD + .git/refs を監視
 - **デバウンス**: ファイル変更300ms / HEAD変更100ms
 - **diff計算**: `git diff --no-renames <baseline_sha> --` をshell exec
-- **ベースライン**: セッション開始時のHEAD SHA。`r`キー（2回押し）でリセット
+- **ベースライン**: セッション開始時のHEAD SHA。`R`キー（Shift+r）でリセット
 
 ### フック層（v0.2）
 
