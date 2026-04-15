@@ -292,7 +292,11 @@ fn render_row(
             }
         }
         RowKind::BinaryNotice { .. } => vec![Line::from(Span::styled(
-            "       [binary file - diff suppressed]",
+            if cursor_sub.is_some() {
+                "  ▶    [binary file - diff suppressed]"
+            } else {
+                "       [binary file - diff suppressed]"
+            },
             Style::default().fg(Color::DarkGray),
         ))],
         RowKind::Spacer => vec![Line::raw("")],
@@ -1447,6 +1451,18 @@ mod tests {
         assert!(
             view.contains("▶"),
             "cursor parked on a file header must still be visible:\n{view}"
+        );
+    }
+
+    #[test]
+    fn binary_notice_cursor_displays_arrow_marker() {
+        let mut app = populated_app(vec![binary_file("assets/icon.png")]);
+        app.scroll_to(1);
+
+        let view = render_to_string(&app, 80, 8);
+        assert!(
+            view.contains("▶"),
+            "cursor parked on a binary notice row must still be visible:\n{view}"
         );
     }
 
