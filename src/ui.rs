@@ -529,7 +529,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .get(..7)
         .unwrap_or(&app.baseline_sha)
         .to_string();
-    let body = format!("No changes since baseline (HEAD: {short})");
+    let body = format!("No changes since baseline (baseline: {short})");
     let mid = centered_line(area);
     let p = Paragraph::new(body).alignment(Alignment::Center);
     frame.render_widget(p, mid);
@@ -893,7 +893,7 @@ mod tests {
         let app = fake_app();
         let view = render_to_string(&app, 70, 6);
         assert!(
-            view.contains("No changes since baseline (HEAD: abcdef1)"),
+            view.contains("No changes since baseline (baseline: abcdef1)"),
             "expected empty state with short SHA, got:\n{view}"
         );
         assert!(view.contains("[follow]"));

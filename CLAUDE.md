@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **kizu** は AI コーディングエージェント (主に Claude Code) と並走させるリアルタイム diff 監視 TUI。Rust 製の単一バイナリ。
 
-現状は **v0.1 MVP 実装中** (feat/v0.1-mvp ブランチ)。`src/{app,git,watcher,ui}.rs` は全て実装済みで、Rust 単体テスト 129 本 + tuistory e2e 11 本が green。
+現状は **v0.1 MVP 実装中** (feat/v0.1-mvp ブランチ)。`src/{app,git,watcher,ui}.rs` は全て実装済みで、Rust 単体テストと tuistory e2e が green。
 
 ## 実装前に必ず読むもの
 
@@ -88,7 +88,7 @@ cargo build --release --locked
 cd tests/e2e && bun install --frozen-lockfile && KIZU_BIN=../../target/release/kizu bun test
 ```
 
-`tests/e2e/` は TypeScript + bun:test で書かれた black-box e2e テスト群。kizu バイナリを実 pty で起動し、キー操作・`waitForText`・inline snapshot で検証する。5 シナリオ (smoke / navigation / reactive / reset / colors) = 11 test。ratatui の basic ANSI 色は tuistory の `foreground` フィルタでマッチしないので、色検証は Rust 単体テスト (`ui::tests::render_scroll_lines_carry_added_and_deleted_colors`) に寄せ、e2e では `+`/`-` テキストレイアウトを pin する。詳細は ADR-0004。
+`tests/e2e/` は TypeScript + bun:test で書かれた black-box e2e テスト群。kizu バイナリを実 pty で起動し、キー操作・`waitForText`・inline snapshot で検証する。代表シナリオは smoke / navigation / reactive / reset / colors。ratatui の basic ANSI 色は tuistory の `foreground` フィルタでマッチしないので、色検証は Rust 単体テスト (`ui::tests::render_scroll_lines_carry_added_and_deleted_colors`) に寄せ、e2e では `+`/`-` テキストレイアウトを pin する。詳細は ADR-0004。
 
 ## コミット / PR 規約
 
