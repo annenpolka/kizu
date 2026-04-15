@@ -94,8 +94,24 @@ fn spawn_git_dir_debouncer(
     git_dir: &Path,
     tx: UnboundedSender<WatchEvent>,
 ) -> Result<Debouncer<RecommendedWatcher, RecommendedCache>> {
+    let git_dir_owned = git_dir.to_path_buf();
     let mut debouncer = new_debouncer(HEAD_DEBOUNCE, None, move |result: DebounceEventResult| {
-        if result.is_ok() {
+        let Ok(events) = result else {
+            return;
+        };
+        // Only treat baseline-affecting paths (HEAD, packed-refs, refs/**,
+        // linked-worktree HEADs) as real head movement. Bookkeeping churn
+        // like `index`, `index.lock`, `logs/`, pack files, or reflog writes
+        // must not raise the stale-baseline indicator — otherwise a plain
+        // `git add` (or even the tool's own shell-outs refreshing index
+        // metadata) would wrongly flag HEAD as drifted.
+        let baseline_touched = events.iter().any(|ev| {
+            ev.event
+                .paths
+                .iter()
+                .any(|p| is_baseline_path(p, &git_dir_owned))
+        });
+        if baseline_touched {
             let _ = tx.send(WatchEvent::GitHead);
         }
     })
@@ -119,6 +135,39 @@ fn is_inside(path: &Path, git_dir: &Path) -> bool {
 
 fn canonicalize_or_self(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Classify `path` as a baseline-affecting path inside `git_dir`.
+///
+/// Returns `true` only when `path` is one of:
+/// - `<git_dir>/HEAD`
+/// - `<git_dir>/packed-refs`
+/// - `<git_dir>/refs/**`
+/// - `<git_dir>/worktrees/*/HEAD` (linked-worktree HEAD)
+///
+/// Plain `.git/index`, `.git/index.lock`, `.git/logs/**`, `.git/objects/**`,
+/// `.git/COMMIT_EDITMSG`, `.git/ORIG_HEAD`, `.git/FETCH_HEAD`, and any ad-hoc
+/// marker files are rejected so they never raise the stale-baseline signal.
+fn is_baseline_path(path: &Path, git_dir: &Path) -> bool {
+    let p = canonicalize_or_self(path);
+    let g = canonicalize_or_self(git_dir);
+    let Ok(rel) = p.strip_prefix(&g) else {
+        return false;
+    };
+    let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    match parts.as_slice() {
+        // `.git/HEAD`
+        [name] if *name == "HEAD" => true,
+        // `.git/packed-refs`
+        [name] if *name == "packed-refs" => true,
+        // `.git/refs/**` — any file under the refs subtree.
+        [head, ..] if *head == "refs" => true,
+        // `.git/worktrees/<name>/HEAD` — linked-worktree HEAD. Other files
+        // under `worktrees/<name>/` (commondir, gitdir, locked, …) are
+        // still rejected because they don't move the baseline SHA.
+        [head, _, tail] if *head == "worktrees" && *tail == "HEAD" => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -183,13 +232,16 @@ mod tests {
 
         tokio::time::sleep(TokioDuration::from_millis(150)).await;
         // Drop a file inside .git/ to mimic git's own bookkeeping. notify
-        // should fire — but the worktree filter must swallow it, while the
-        // git_dir watcher is allowed to emit GitHead.
+        // should fire — but the worktree filter must swallow it, and since
+        // the path is not HEAD/refs/packed-refs the git_dir watcher must
+        // also stay silent.
         fs::write(git_dir.join("kizu_test_marker"), b"x").expect("write inside git_dir");
 
         // Drain whatever shows up within the debounce window. We must not
-        // see a Worktree event; GitHead is fine and expected.
+        // see either event type: non-baseline writes inside `.git/` are
+        // git's own bookkeeping and should be completely swallowed.
         let mut saw_worktree = false;
+        let mut saw_head = false;
         let drain_until = tokio::time::Instant::now() + DRAIN_WAIT;
         while tokio::time::Instant::now() < drain_until {
             match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
@@ -197,7 +249,10 @@ mod tests {
                     saw_worktree = true;
                     break;
                 }
-                Ok(Some(WatchEvent::GitHead)) => continue,
+                Ok(Some(WatchEvent::GitHead)) => {
+                    saw_head = true;
+                    break;
+                }
                 Ok(None) => break,
                 Err(_) => continue, // recv timed out, keep draining
             }
@@ -206,5 +261,87 @@ mod tests {
             !saw_worktree,
             "git_dir-only writes must not surface as Worktree events"
         );
+        assert!(
+            !saw_head,
+            "non-HEAD/refs writes inside git_dir must not surface as GitHead"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writing_refs_heads_inside_git_dir_emits_head_event() {
+        let repo = init_repo();
+        let root = crate::git::find_root(repo.path()).expect("find_root");
+        let git_dir = crate::git::git_dir(&root).expect("git_dir");
+
+        let mut handle = start(&root, &git_dir).expect("start watcher");
+
+        tokio::time::sleep(TokioDuration::from_millis(150)).await;
+        // Simulate a real baseline move: create a ref under refs/heads/.
+        // The content doesn't have to be valid — we're only exercising the
+        // watcher's path classifier, not git itself.
+        let refs_heads = git_dir.join("refs").join("heads");
+        fs::create_dir_all(&refs_heads).expect("create refs/heads");
+        fs::write(
+            refs_heads.join("kizu-test-branch"),
+            b"0000000000000000000000000000000000000000\n",
+        )
+        .expect("write ref");
+
+        // We expect a GitHead within the drain window. Worktree events are
+        // fine (the refs path also sits inside git_dir so worktree filter
+        // should still swallow them, but we don't fail the test on stray
+        // Worktree signals).
+        let mut saw_head = false;
+        let drain_until = tokio::time::Instant::now() + DRAIN_WAIT;
+        while tokio::time::Instant::now() < drain_until {
+            match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
+                Ok(Some(WatchEvent::GitHead)) => {
+                    saw_head = true;
+                    break;
+                }
+                Ok(Some(WatchEvent::Worktree)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(saw_head, "writes under refs/heads must emit GitHead");
+    }
+
+    #[test]
+    fn is_baseline_path_matches_head_and_refs() {
+        let git_dir = Path::new("/tmp/repo/.git");
+        assert!(is_baseline_path(&git_dir.join("HEAD"), git_dir));
+        assert!(is_baseline_path(&git_dir.join("packed-refs"), git_dir));
+        assert!(is_baseline_path(
+            &git_dir.join("refs").join("heads").join("main"),
+            git_dir
+        ));
+        assert!(is_baseline_path(
+            &git_dir.join("refs").join("tags").join("v1.0"),
+            git_dir
+        ));
+        // Linked worktree HEAD
+        assert!(is_baseline_path(
+            &git_dir.join("worktrees").join("wt1").join("HEAD"),
+            git_dir
+        ));
+    }
+
+    #[test]
+    fn is_baseline_path_rejects_bookkeeping_paths() {
+        let git_dir = Path::new("/tmp/repo/.git");
+        assert!(!is_baseline_path(&git_dir.join("index"), git_dir));
+        assert!(!is_baseline_path(&git_dir.join("index.lock"), git_dir));
+        assert!(!is_baseline_path(
+            &git_dir.join("logs").join("HEAD"),
+            git_dir
+        ));
+        assert!(!is_baseline_path(
+            &git_dir.join("objects").join("pack").join("pack-abc.idx"),
+            git_dir
+        ));
+        assert!(!is_baseline_path(&git_dir.join("COMMIT_EDITMSG"), git_dir));
+        assert!(!is_baseline_path(&git_dir.join("ORIG_HEAD"), git_dir));
+        assert!(!is_baseline_path(&git_dir.join("FETCH_HEAD"), git_dir));
     }
 }

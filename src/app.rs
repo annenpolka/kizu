@@ -210,11 +210,37 @@ impl ScrollAnim {
 impl App {
     /// Construct an `App` for `root`. Resolves git layout, loads the initial
     /// diff, and parks the scroll cursor on the most-recently-modified hunk.
+    ///
+    /// **Fail-fast:** if the very first `git diff` errors out, bootstrap
+    /// propagates the error instead of entering the event loop with an
+    /// empty `files` snapshot. The watcher-driven path (see
+    /// [`Self::recompute_diff`]) still swallows errors into `last_error`
+    /// so that later transient failures preserve the last good snapshot,
+    /// but an initial-load failure must never render as a silent "clean"
+    /// view — the user would not be able to tell whether the worktree is
+    /// actually empty or the tool is broken.
     pub fn bootstrap(root: PathBuf) -> Result<Self> {
         let root = git::find_root(&root).context("resolving worktree root")?;
         let git_dir = git::git_dir(&root).context("resolving git directory")?;
         let baseline_sha = git::head_sha(&root).context("capturing baseline HEAD")?;
+        let diff = git::compute_diff(&root, &baseline_sha);
+        Self::bootstrap_with_diff(root, git_dir, baseline_sha, diff)
+    }
 
+    /// Inner bootstrap: takes already-resolved git layout plus the
+    /// **result** of the initial `compute_diff`. Propagates the diff
+    /// error with context when it is `Err`, otherwise constructs the
+    /// `App` and applies the computed files. Factored out so tests can
+    /// drive both branches deterministically without spinning up a
+    /// real repository.
+    pub(crate) fn bootstrap_with_diff(
+        root: PathBuf,
+        git_dir: PathBuf,
+        baseline_sha: String,
+        diff: Result<Vec<FileDiff>>,
+    ) -> Result<Self> {
+        let initial =
+            diff.with_context(|| format!("initial git diff against baseline {baseline_sha}"))?;
         let mut app = Self {
             root,
             git_dir,
@@ -234,7 +260,7 @@ impl App {
             anim: None,
             wrap_lines: false,
         };
-        app.recompute_diff();
+        app.apply_computed_files(initial);
         Ok(app)
     }
 
@@ -271,19 +297,25 @@ impl App {
     /// and keep the previous `files` snapshot intact.
     pub fn recompute_diff(&mut self) {
         match git::compute_diff(&self.root, &self.baseline_sha) {
-            Ok(mut files) => {
-                self.populate_mtimes(&mut files);
-                files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
-                self.last_error = None;
-                self.files = files;
-                self.build_layout();
-                self.refresh_anchor();
-            }
+            Ok(files) => self.apply_computed_files(files),
             Err(e) => {
                 self.last_error = Some(format!("{e:#}"));
                 // self.files / self.layout intentionally untouched.
             }
         }
+    }
+
+    /// Accept a freshly-computed file set: populate mtimes, sort, clear
+    /// any prior error, rebuild layout, and refresh the anchor. Shared
+    /// between [`Self::bootstrap_with_diff`] (initial load) and
+    /// [`Self::recompute_diff`] (watcher-driven refreshes).
+    fn apply_computed_files(&mut self, mut files: Vec<FileDiff>) {
+        self.populate_mtimes(&mut files);
+        files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        self.last_error = None;
+        self.files = files;
+        self.build_layout();
+        self.refresh_anchor();
     }
 
     /// Re-capture HEAD as the new baseline (R key).
@@ -416,6 +448,12 @@ impl App {
                 let target = results.get(cursor).copied();
                 self.close_picker();
                 if let Some(file_idx) = target {
+                    // Picker selection is an explicit manual navigation:
+                    // a subsequent watcher-driven recompute must not
+                    // snap the viewport back to the newest file via
+                    // follow mode. Drop follow before jumping so the
+                    // anchor captured by `scroll_to` sticks.
+                    self.follow_mode = false;
                     self.jump_to_file_first_hunk(file_idx);
                 }
             }
@@ -544,14 +582,17 @@ impl App {
     }
 
     pub fn next_hunk(&mut self) {
+        // Only advance when there is actually a hunk after the cursor.
+        // The previous fallback to `hunk_starts.last()` caused `j` to
+        // jump **backward** whenever the cursor sat past the final hunk
+        // header (e.g. on the last diff line of a long hunk), which is
+        // the opposite of what "next" should mean.
         if let Some(&row) = self
             .layout
             .hunk_starts
             .iter()
             .find(|&&start| start > self.scroll)
         {
-            self.scroll_to(row);
-        } else if let Some(&row) = self.layout.hunk_starts.last() {
             self.scroll_to(row);
         }
     }
@@ -1334,6 +1375,30 @@ mod tests {
     }
 
     #[test]
+    fn lowercase_j_at_last_row_of_only_hunk_stays_put() {
+        // Cursor parked on the bottom-most row of a long hunk. There is
+        // no next hunk to walk into, so pressing `j` must be a no-op
+        // instead of snapping back up to the hunk's header row — the
+        // old `next_hunk` fallback to `hunk_starts.last()` made the
+        // cursor leap backward, which is the opposite of what `j`
+        // should mean.
+        let lines: Vec<DiffLine> = (0..20)
+            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+            .collect();
+        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        app.last_body_height.set(15);
+        let (_start, end) = app.layout.change_runs[0];
+        let last = end - 1;
+
+        app.scroll_to(last);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.scroll, last,
+            "j at the bottom of the only change run must stay put"
+        );
+    }
+
+    #[test]
     fn lowercase_j_in_long_hunk_scrolls_by_chunk() {
         // Force a small body height so the chunk size is exactly 5 rows
         // (15 / 3 = 5) — this way the test's expected scroll positions
@@ -1897,6 +1962,117 @@ mod tests {
         let expected = app.layout.file_first_hunk[older].unwrap();
         assert_eq!(app.scroll, expected);
         assert_eq!(app.current_file_path(), Some(Path::new("older.rs")));
+    }
+
+    #[test]
+    fn bootstrap_with_diff_propagates_initial_compute_diff_error() {
+        // If the very first `git diff` fails, bootstrap must abort — we
+        // refuse to enter the event loop in a state where the main pane
+        // would render as "clean" rooted in a silent error.
+        let diff: Result<Vec<FileDiff>> = Err(anyhow::anyhow!("object file missing"));
+        let result = App::bootstrap_with_diff(
+            PathBuf::from("/tmp/fake"),
+            PathBuf::from("/tmp/fake/.git"),
+            "abcdef1234567890abcdef1234567890abcdef12".into(),
+            diff,
+        );
+        let err = match result {
+            Ok(_) => panic!("initial compute_diff failure must be propagated"),
+            Err(e) => e,
+        };
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("initial git diff"),
+            "error chain should mention the initial git diff context, got: {chain}"
+        );
+        assert!(
+            chain.contains("object file missing"),
+            "error chain should preserve the underlying cause, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_with_diff_applies_successful_diff_and_clears_error_state() {
+        // Success path: bootstrap populates files, sorts them ascending by
+        // mtime, builds a layout, and lands on the follow target.
+        let diff = Ok(vec![
+            make_file(
+                "newer.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
+                200,
+            ),
+            make_file(
+                "older.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "b")])],
+                100,
+            ),
+        ]);
+        let app = App::bootstrap_with_diff(
+            PathBuf::from("/tmp/fake"),
+            PathBuf::from("/tmp/fake/.git"),
+            "abcdef1234567890abcdef1234567890abcdef12".into(),
+            diff,
+        )
+        .expect("bootstrap should succeed on Ok diff");
+        assert_eq!(app.files.len(), 2);
+        assert!(app.last_error.is_none());
+        assert!(app.follow_mode);
+        assert!(
+            !app.layout.rows.is_empty(),
+            "layout should be built from the initial diff"
+        );
+    }
+
+    #[test]
+    fn picker_enter_disables_follow_mode_so_selection_survives_recompute() {
+        // bootstrap lands in follow mode. A picker selection is an
+        // explicit manual navigation — the next recompute must not yank
+        // the user back to the newest file's last hunk.
+        let mut app = fake_app(vec![
+            make_file(
+                "newest.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                300,
+            ),
+            make_file(
+                "older.rs",
+                vec![hunk(50, vec![diff_line(LineKind::Added, "y")])],
+                100,
+            ),
+        ]);
+        assert!(app.follow_mode, "bootstrap starts in follow mode");
+
+        app.open_picker();
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.current_file_path(), Some(Path::new("older.rs")));
+        assert!(
+            !app.follow_mode,
+            "picker Enter is a manual navigation and must disable follow mode"
+        );
+
+        // Simulate a watcher-driven recompute (another file write bumping
+        // newest.rs again, picking up a second hunk). refresh_anchor
+        // should honour the anchor on older.rs instead of snapping us back
+        // to newest.rs's last hunk.
+        let newest = file_idx(&app, "newest.rs");
+        app.files[newest] = make_file(
+            "newest.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "x")]),
+                hunk(30, vec![diff_line(LineKind::Added, "z")]),
+            ],
+            400,
+        );
+        app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        app.build_layout();
+        app.refresh_anchor();
+
+        assert_eq!(
+            app.current_file_path(),
+            Some(Path::new("older.rs")),
+            "picker-selected file must survive a subsequent recompute"
+        );
     }
 
     #[test]
