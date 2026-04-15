@@ -577,11 +577,13 @@ impl App {
     /// between [`Self::bootstrap_with_diff`] (initial load) and
     /// [`Self::recompute_diff`] (watcher-driven refreshes).
     fn apply_computed_files(&mut self, mut files: Vec<FileDiff>) {
+        let picker_selected_path = self.picker_selected_path();
         self.populate_mtimes(&mut files);
         files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
         self.last_error = None;
         self.files = files;
         self.build_layout();
+        self.refresh_picker_cursor(picker_selected_path.as_deref());
         // Layout rebuild may shift row counts and wrap geometry, so
         // any previously-stored intra-row offset is no longer valid.
         // `refresh_anchor` then repositions the cursor on the same
@@ -899,6 +901,33 @@ impl App {
             .collect()
     }
 
+    fn picker_selected_path(&self) -> Option<PathBuf> {
+        let picker = self.picker.as_ref()?;
+        let results = self.picker_results();
+        let file_idx = results.get(picker.cursor).copied()?;
+        self.files.get(file_idx).map(|f| f.path.clone())
+    }
+
+    fn refresh_picker_cursor(&mut self, selected_path: Option<&Path>) {
+        let Some(cursor) = self.picker.as_ref().map(|p| p.cursor) else {
+            return;
+        };
+        let results = self.picker_results();
+        let new_cursor = if results.is_empty() {
+            0
+        } else if let Some(path) = selected_path {
+            results
+                .iter()
+                .position(|&idx| self.files.get(idx).is_some_and(|f| f.path == path))
+                .unwrap_or_else(|| cursor.min(results.len() - 1))
+        } else {
+            cursor.min(results.len() - 1)
+        };
+        if let Some(picker) = self.picker.as_mut() {
+            picker.cursor = new_cursor;
+        }
+    }
+
     fn picker_cursor_down(&mut self) {
         let len = self.picker_results().len();
         if let Some(picker) = self.picker.as_mut()
@@ -925,6 +954,7 @@ impl App {
             // sub-row is always 0. Delegate to `scroll_to` which
             // resets `cursor_sub_row` unconditionally.
             let next = (self.scroll as isize + delta).clamp(0, last as isize) as usize;
+            let next = self.normalize_row_target(next, delta.signum());
             self.scroll_to(next);
             return;
         }
@@ -945,7 +975,8 @@ impl App {
         let new_y = (cur_y as isize + delta).max(0) as usize;
         let clamped = new_y.min(vi.total_visual().saturating_sub(1));
         let (target_row, target_sub) = vi.logical_at(clamped);
-        self.scroll_to_visual(target_row.min(last), target_sub, &vi);
+        let target_row = self.normalize_row_target(target_row.min(last), delta.signum());
+        self.scroll_to_visual(target_row, target_sub, &vi);
     }
 
     /// Wrap-aware cursor move that preserves an intra-row visual
@@ -990,7 +1021,7 @@ impl App {
     /// instead.
     pub fn scroll_to(&mut self, row: usize) {
         let last = self.last_row_index();
-        let target = row.min(last);
+        let target = self.normalize_row_target(row.min(last), 1);
         if target != self.scroll || self.cursor_sub_row != 0 {
             self.anim = Some(ScrollAnim {
                 from: self.visual_top.get(),
@@ -1001,6 +1032,31 @@ impl App {
         self.scroll = target;
         self.cursor_sub_row = 0;
         self.update_anchor_from_scroll();
+    }
+
+    fn normalize_row_target(&self, row: usize, preferred_direction: isize) -> usize {
+        if !matches!(self.layout.rows.get(row), Some(RowKind::Spacer)) {
+            return row;
+        }
+
+        if preferred_direction >= 0
+            && let Some(next) = self
+                .layout
+                .rows
+                .iter()
+                .enumerate()
+                .skip(row + 1)
+                .find_map(|(idx, r)| (!matches!(r, RowKind::Spacer)).then_some(idx))
+        {
+            return next;
+        }
+        if let Some(prev) = self.layout.rows[..row]
+            .iter()
+            .rposition(|r| !matches!(r, RowKind::Spacer))
+        {
+            return prev;
+        }
+        row
     }
 
     /// Mark the active animation as finished if enough time has passed.
@@ -1543,7 +1599,7 @@ impl App {
                     self.scroll = row;
                     return;
                 }
-                if let Some(row) = self.find_anchor_file_row(&anchor.path) {
+                if let Some(row) = self.find_anchor_file_row(&anchor) {
                     self.scroll = row;
                     self.update_anchor_from_scroll();
                     return;
@@ -1589,21 +1645,37 @@ impl App {
         }
     }
 
-    fn find_anchor_file_row(&self, path: &Path) -> Option<usize> {
-        let file_idx = self.files.iter().position(|f| f.path == path)?;
-        self.layout
-            .file_first_hunk
-            .get(file_idx)
-            .copied()
-            .flatten()
-            .or_else(|| {
+    fn find_anchor_file_row(&self, anchor: &HunkAnchor) -> Option<usize> {
+        let file_idx = self.files.iter().position(|f| f.path == anchor.path)?;
+        match &self.files[file_idx].content {
+            DiffContent::Text(hunks) if !hunks.is_empty() => {
+                let nearest_hunk = hunks
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, hunk)| hunk.old_start.abs_diff(anchor.hunk_old_start))
+                    .map(|(idx, _)| idx)?;
                 self.layout.rows.iter().position(|row| {
                     matches!(
                         row,
-                        RowKind::FileHeader { file_idx: f } if *f == file_idx
+                        RowKind::HunkHeader { file_idx: f, hunk_idx } if *f == file_idx && *hunk_idx == nearest_hunk
                     )
                 })
-            })
+            }
+            _ => self
+                .layout
+                .file_first_hunk
+                .get(file_idx)
+                .copied()
+                .flatten()
+                .or_else(|| {
+                    self.layout.rows.iter().position(|row| {
+                        matches!(
+                            row,
+                            RowKind::FileHeader { file_idx: f } if *f == file_idx
+                        )
+                    })
+                }),
+        }
     }
 
     fn update_anchor_from_scroll(&mut self) {
@@ -2610,6 +2682,71 @@ mod tests {
     }
 
     #[test]
+    fn scroll_to_does_not_land_on_spacer_rows() {
+        let mut app = fake_app(vec![
+            make_file(
+                "a.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                100,
+            ),
+            make_file(
+                "b.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
+                200,
+            ),
+        ]);
+
+        let spacer = app
+            .layout
+            .rows
+            .iter()
+            .position(|row| matches!(row, RowKind::Spacer))
+            .expect("layout has spacer");
+        app.scroll_to(spacer);
+
+        assert!(
+            !matches!(app.layout.rows[app.scroll], RowKind::Spacer),
+            "scroll_to must normalize spacer targets to real content rows"
+        );
+    }
+
+    #[test]
+    fn scroll_by_skips_spacer_rows_in_nowrap_mode() {
+        let mut app = fake_app(vec![
+            make_file(
+                "a.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                100,
+            ),
+            make_file(
+                "b.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
+                200,
+            ),
+        ]);
+        app.follow_mode = false;
+
+        let first_file_last_diff = app
+            .layout
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(idx, row)| {
+                matches!(row, RowKind::DiffLine { file_idx: 0, .. }).then_some(idx)
+            })
+            .expect("first file diff row");
+        app.scroll = first_file_last_diff;
+
+        // +1 would have landed on the inter-file spacer before the fix.
+        app.scroll_by(1);
+        assert!(
+            !matches!(app.layout.rows[app.scroll], RowKind::Spacer),
+            "scroll_by must skip cosmetic spacer rows"
+        );
+        assert_eq!(app.current_file_path(), Some(Path::new("b.rs")));
+    }
+
+    #[test]
     fn handle_key_f_restores_follow_mode_and_jumps_to_target() {
         let mut app = fake_app(vec![make_file(
             "a.rs",
@@ -3091,6 +3228,59 @@ mod tests {
     }
 
     #[test]
+    fn picker_cursor_tracks_same_file_across_recompute_reordering() {
+        let mut app = fake_app(vec![
+            make_file(
+                "newest.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                300,
+            ),
+            make_file(
+                "older.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
+                100,
+            ),
+        ]);
+
+        app.open_picker();
+        app.handle_key(key(KeyCode::Down));
+        let before = app
+            .picker_selected_path()
+            .expect("picker target before recompute");
+        assert_eq!(before, PathBuf::from("older.rs"));
+
+        // Recompute adds a brand-new newest file. The filtered results
+        // reorder newest-first, so a cursor tracked only by index would now
+        // point at a different file.
+        app.apply_computed_files(vec![
+            make_file(
+                "brand_new.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
+                400,
+            ),
+            make_file(
+                "newest.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                300,
+            ),
+            make_file(
+                "older.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
+                100,
+            ),
+        ]);
+
+        let after = app
+            .picker_selected_path()
+            .expect("picker target after recompute");
+        assert_eq!(
+            after,
+            PathBuf::from("older.rs"),
+            "picker cursor must stay on the same file even when results reorder"
+        );
+    }
+
+    #[test]
     fn refresh_anchor_keeps_us_on_the_same_hunk_after_recompute() {
         // First snapshot: 2 files, scroll parked on b.rs's hunk.
         let mut app = fake_app(vec![
@@ -3167,6 +3357,53 @@ mod tests {
             app.current_file_path(),
             Some(Path::new("older.rs")),
             "manual mode must stay on the same file when only hunk identity changes"
+        );
+    }
+
+    #[test]
+    fn refresh_anchor_prefers_nearest_hunk_within_same_file() {
+        let mut app = fake_app(vec![make_file(
+            "only.rs",
+            vec![
+                hunk(10, vec![diff_line(LineKind::Added, "first")]),
+                hunk(50, vec![diff_line(LineKind::Added, "second")]),
+            ],
+            100,
+        )]);
+
+        app.scroll_to(
+            app.layout
+                .rows
+                .iter()
+                .position(|row| {
+                    matches!(
+                        row,
+                        RowKind::HunkHeader {
+                            file_idx: 0,
+                            hunk_idx: 1
+                        }
+                    )
+                })
+                .expect("second hunk header"),
+        );
+        app.follow_mode = false;
+        app.update_anchor_from_scroll();
+
+        app.files[0] = make_file(
+            "only.rs",
+            vec![
+                hunk(10, vec![diff_line(LineKind::Added, "first")]),
+                hunk(60, vec![diff_line(LineKind::Added, "second shifted")]),
+            ],
+            100,
+        );
+        app.build_layout();
+        app.refresh_anchor();
+
+        let (_, hunk_idx) = app.current_hunk().expect("cursor on hunk");
+        assert_eq!(
+            hunk_idx, 1,
+            "manual fallback should stay near the previously viewed hunk, not jump to the file's first hunk"
         );
     }
 
