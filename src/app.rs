@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -41,6 +42,11 @@ pub struct App {
     /// Set whenever HEAD/refs move; the user must press `R` to re-baseline.
     pub head_dirty: bool,
     pub should_quit: bool,
+    /// Last viewport height (in rows) the renderer used. Updated through
+    /// interior mutability so the next `J`/`K` press can size its scroll
+    /// chunk relative to the current screen — bigger window, bigger jumps.
+    /// Defaults to 24 before the first render.
+    pub last_body_height: Cell<usize>,
 }
 
 /// Two ways the renderer can park the cursor inside the viewport.
@@ -90,17 +96,16 @@ pub struct ScrollLayout {
     /// `(start, end_exclusive)` row spans of every contiguous `+`/`-` block
     /// across the entire layout. `J` / `K` walk these spans in *both*
     /// directions: short runs collapse to a one-press jump, long runs are
-    /// walked in `J_STEP_CHUNK`-sized scroll chunks, and once the cursor
-    /// passes the end of a run the next press flows into the next run
-    /// even when that run lives in a different file.
+    /// walked in [`App::chunk_size`]-sized scroll chunks (= viewport
+    /// height / 3), and once the cursor passes the end of a run the next
+    /// press flows into the next run even when that run lives in a
+    /// different file.
     pub change_runs: Vec<(usize, usize)>,
 }
 
-/// How far each `J` / `K` press scrolls when the cursor is inside a
-/// long change run. Picked to be small enough that you can read each
-/// chunk on the way down and large enough that you don't need to mash
-/// the key for a 60-line block.
-const J_STEP_CHUNK: usize = 5;
+/// Default body height assumed before the first render has had a chance
+/// to update [`App::last_body_height`]. 24 is the classic VT100 height.
+const DEFAULT_BODY_HEIGHT: usize = 24;
 
 /// One displayable row in the scroll view. The renderer turns each variant
 /// into a styled `Line`; the App layer cares about `(file_idx, hunk_idx)`
@@ -162,9 +167,18 @@ impl App {
             last_error: None,
             head_dirty: false,
             should_quit: false,
+            last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
         };
         app.recompute_diff();
         Ok(app)
+    }
+
+    /// Half-page-ish chunk size used by `J`/`K` when scrolling within a
+    /// long change run. Scales with the actual viewport so a 12-row pane
+    /// gets 4-row chunks and a 36-row pane gets 12-row chunks. Always at
+    /// least 1 so the cursor still moves on tiny terminals.
+    pub fn chunk_size(&self) -> usize {
+        (self.last_body_height.get() / 3).max(1)
     }
 
     /// Toggle the cursor placement between centered and bottom-pinned.
@@ -438,8 +452,8 @@ impl App {
 
     /// `J` — fine-grained forward motion through change runs.
     ///
-    /// - Inside a long change run, scroll forward by `J_STEP_CHUNK` rows
-    ///   (clamped to the last row of the run).
+    /// - Inside a long change run, scroll forward by [`Self::chunk_size`]
+    ///   rows (clamped to the last row of the run).
     /// - Once the cursor reaches the end of the current run (or starts
     ///   outside any run), jump to the start of the next change run in
     ///   the layout — even when that run lives in a different hunk or
@@ -447,10 +461,11 @@ impl App {
     ///   scroll, ignoring hunk and file boundaries.
     pub fn next_change(&mut self) {
         let cursor = self.scroll;
+        let chunk = self.chunk_size();
         if let Some(&(_, end)) = self.run_containing(cursor) {
             let last_row = end.saturating_sub(1);
             if cursor < last_row {
-                let target = (cursor + J_STEP_CHUNK).min(last_row);
+                let target = (cursor + chunk).min(last_row);
                 self.scroll_to(target);
                 return;
             }
@@ -463,10 +478,11 @@ impl App {
     /// `K` — fine-grained backward motion. Mirror of [`Self::next_change`].
     pub fn prev_change(&mut self) {
         let cursor = self.scroll;
+        let chunk = self.chunk_size();
         if let Some(&(start, _)) = self.run_containing(cursor)
             && cursor > start
         {
-            let target = cursor.saturating_sub(J_STEP_CHUNK).max(start);
+            let target = cursor.saturating_sub(chunk).max(start);
             self.scroll_to(target);
             return;
         }
@@ -896,6 +912,7 @@ mod tests {
             last_error: None,
             head_dirty: false,
             should_quit: false,
+            last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
@@ -1119,24 +1136,31 @@ mod tests {
 
     #[test]
     fn capital_j_in_long_run_scrolls_within_run_by_chunk() {
-        // A single 12-row run. SHIFT-J inside it should scroll by
-        // J_STEP_CHUNK rows at a time and clamp at the last row.
-        let lines: Vec<DiffLine> = (0..12)
+        // Force a small body height so the chunk size is exactly 5 rows
+        // (15 / 3 = 5) — this way the test's expected scroll positions
+        // are fixed regardless of the DEFAULT_BODY_HEIGHT used outside
+        // of tests.
+        let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
         let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
-        assert_eq!(app.layout.change_runs.len(), 1);
+        app.last_body_height.set(15);
+        let chunk = app.chunk_size();
+        assert_eq!(chunk, 5);
         let (start, end) = app.layout.change_runs[0];
         let last = end - 1;
 
         app.scroll_to(start);
         app.handle_key(key(KeyCode::Char('J')));
-        assert_eq!(app.scroll, start + J_STEP_CHUNK);
+        assert_eq!(app.scroll, start + chunk);
 
         app.handle_key(key(KeyCode::Char('J')));
-        assert_eq!(app.scroll, start + 2 * J_STEP_CHUNK);
+        assert_eq!(app.scroll, start + 2 * chunk);
 
-        // Subsequent presses clamp at the last row of the run (still in it).
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.scroll, start + 3 * chunk);
+
+        // Subsequent presses clamp at the last row of the run.
         app.handle_key(key(KeyCode::Char('J')));
         assert_eq!(app.scroll, last);
     }
@@ -1172,18 +1196,21 @@ mod tests {
 
     #[test]
     fn capital_k_in_long_run_walks_back_by_chunk() {
-        let lines: Vec<DiffLine> = (0..12)
+        let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
         let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        app.last_body_height.set(15);
+        let chunk = app.chunk_size();
         let (start, end) = app.layout.change_runs[0];
         let last = end - 1;
 
         app.scroll_to(last);
         app.handle_key(key(KeyCode::Char('K')));
-        assert_eq!(app.scroll, last - J_STEP_CHUNK);
+        assert_eq!(app.scroll, last - chunk);
 
         // Continue back; should stay >= the run's first row, not before.
+        app.handle_key(key(KeyCode::Char('K')));
         app.handle_key(key(KeyCode::Char('K')));
         app.handle_key(key(KeyCode::Char('K')));
         assert!(app.scroll >= start);
@@ -1209,6 +1236,25 @@ mod tests {
         app.scroll_to(second_start);
         app.handle_key(key(KeyCode::Char('K')));
         assert_eq!(app.scroll, first_start);
+    }
+
+    #[test]
+    fn chunk_size_scales_with_last_body_height() {
+        let app = fake_app(vec![]);
+        // Default body height is 24 → chunk = 24/3 = 8.
+        assert_eq!(app.chunk_size(), 8);
+
+        // A taller pane should yield a bigger chunk.
+        app.last_body_height.set(36);
+        assert_eq!(app.chunk_size(), 12);
+
+        // A tiny pane should never go below 1 row.
+        app.last_body_height.set(2);
+        assert_eq!(app.chunk_size(), 1);
+
+        // Zero height (degenerate) still gives at least 1.
+        app.last_body_height.set(0);
+        assert_eq!(app.chunk_size(), 1);
     }
 
     #[test]

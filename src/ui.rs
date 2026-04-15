@@ -87,6 +87,9 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let viewport_height = content_area.height as usize;
+    // Tell the App layer how tall the body actually was so the next
+    // `J`/`K` press can size its scroll chunk relative to this height.
+    app.last_body_height.set(viewport_height);
     let viewport_top = app
         .cursor_placement
         .viewport_top(cursor_row, total_rows, viewport_height);
@@ -600,6 +603,7 @@ mod tests {
             last_error: None,
             head_dirty: false,
             should_quit: false,
+            last_body_height: std::cell::Cell::new(24),
         }
     }
 
