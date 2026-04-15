@@ -233,37 +233,118 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let mode_label = if app.picker.is_some() {
-        "[picker]"
-    } else if app.follow_mode {
-        "[follow]"
-    } else {
-        "[manual]"
-    };
+    // Pre-styled spans for the four "static" pieces of the status bar.
+    let dim = Style::default().fg(Color::DarkGray);
+    let bold = Modifier::BOLD;
+    let sep = || Span::styled(" │ ", dim);
 
-    let body = if app.picker.is_some() {
-        "type to filter / ↑↓ Ctrl-n/p to move / Enter to jump / Esc to cancel".to_string()
+    let (mode_text, mode_color) = if app.picker.is_some() {
+        ("[picker]", Color::Magenta)
+    } else if app.follow_mode {
+        ("[follow]", Color::Green)
     } else {
-        let current: String = app
+        ("[manual]", Color::Yellow)
+    };
+    let mode_span = Span::styled(
+        mode_text,
+        Style::default().fg(mode_color).add_modifier(bold),
+    );
+
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" "), mode_span, Span::raw(" ")];
+
+    if app.picker.is_some() {
+        // Picker hint stays muted; the modal popup is the loud surface.
+        spans.push(sep());
+        spans.push(Span::styled(
+            "type to filter",
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::styled(" / ", dim));
+        spans.push(Span::styled(
+            "↑↓ Ctrl-n/p",
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("move", dim));
+        spans.push(Span::styled(" / ", dim));
+        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("jump", dim));
+        spans.push(Span::styled(" / ", dim));
+        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("cancel", dim));
+    } else {
+        // Current file path uses the same status color the file header
+        // uses up in the scroll, so the eye can match them.
+        let current_path = app
             .current_file_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "--".to_string());
+        let path_color = app
+            .current_file_idx()
+            .and_then(|i| app.files.get(i))
+            .map(|f| match f.status {
+                FileStatus::Modified => Color::Cyan,
+                FileStatus::Added => Color::Green,
+                FileStatus::Deleted => Color::Red,
+                FileStatus::Untracked => Color::Yellow,
+            })
+            .unwrap_or(Color::Reset);
+
+        spans.push(sep());
+        spans.push(Span::styled(
+            current_path,
+            Style::default().fg(path_color).add_modifier(bold),
+        ));
+
         let session_added: usize = app.files.iter().map(|f| f.added).sum();
         let session_deleted: usize = app.files.iter().map(|f| f.deleted).sum();
-        let head_marker = if app.head_dirty { " head*" } else { "" };
-        format!(
-            "{current} | session: +{session_added}/-{session_deleted} {} files{head_marker} | <Space> picker",
-            app.files.len()
-        )
-    };
 
-    let mut spans = vec![Span::raw(mode_label), Span::raw(" "), Span::raw(body)];
-    if let Some(err) = &app.last_error {
+        spans.push(sep());
+        spans.push(Span::styled("session", dim));
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!("  × {err}"),
-            Style::default().fg(Color::Red),
+            format!("+{session_added}"),
+            Style::default().fg(Color::Green).add_modifier(bold),
         ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("-{session_deleted}"),
+            Style::default().fg(Color::Red).add_modifier(bold),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("{} files", app.files.len()),
+            Style::default().fg(Color::Cyan),
+        ));
+
+        if app.head_dirty {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                "HEAD*",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        spans.push(sep());
+        spans.push(Span::styled("⎵", Style::default().fg(Color::Magenta)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("picker", dim));
     }
+
+    if let Some(err) = &app.last_error {
+        spans.push(sep());
+        spans.push(Span::styled(
+            "×",
+            Style::default().fg(Color::Red).add_modifier(bold),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(err.clone(), Style::default().fg(Color::Red)));
+    }
+
     let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -581,7 +662,8 @@ mod tests {
         assert!(view.contains("Files 2/3"), "missing files counter:\n{view}");
         // Footer switches to picker hint copy
         assert!(view.contains("[picker]"));
-        assert!(view.contains("Esc to cancel"));
+        assert!(view.contains("type to filter"));
+        assert!(view.contains("Esc"));
     }
 
     #[test]
