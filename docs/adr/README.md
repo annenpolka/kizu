@@ -40,3 +40,4 @@ Michael Nygard 形式を採用する。ファイル名は `NNNN-kebab-case-title
 - [0003 — tokio を非同期ランタイムとして採用する](0003-tokio-async-runtime.md)
 - [0004 — e2e テストに tuistory + bun を採用する](0004-tuistory-e2e.md)
 - [0005 — watcher は coalescing で吸収し kizu 側に .gitignore フィルタを持たない](0005-watcher-coalescing-no-ignore-filter.md)
+- [0006 — 縦 2 ペイン UI を廃止し、フルスクリーン縦巻物 + popup picker に転換する](0006-scroll-with-popup-picker.md)
