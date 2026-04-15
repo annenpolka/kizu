@@ -1825,6 +1825,7 @@ async fn run_loop(
             }
             watch_event = watch.events.recv() => {
                 if let Some(first) = watch_event {
+                    startup_refresh_pending = false;
                     // Drain any events that piled up behind `first` and
                     // hand the whole burst to `handle_watch_burst` so the
                     // coalescing + health-transition rules stay testable
