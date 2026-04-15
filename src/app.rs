@@ -66,6 +66,10 @@ pub struct App {
     pub follow_mode: bool,
     /// Set when the most recent `compute_diff` failed. Cleared on success.
     pub last_error: Option<String>,
+    /// Terminal input health. Tracked separately from `last_error`
+    /// so a successful `git diff` recompute cannot silently erase the
+    /// fact that keyboard input has failed.
+    pub input_health: Option<String>,
     /// Set whenever HEAD/refs move; the user must press `R` to re-baseline.
     pub head_dirty: bool,
     pub should_quit: bool,
@@ -504,6 +508,7 @@ impl App {
             picker: None,
             follow_mode: true,
             last_error: None,
+            input_health: None,
             head_dirty: false,
             should_quit: false,
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
@@ -1810,15 +1815,18 @@ async fn run_loop(
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) => {
+                        app.input_health = None;
                         let effect = app.handle_key(key);
                         apply_key_effect(effect, app, watch);
                     }
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => {
+                        app.input_health = None;
+                    }
                     Some(Err(e)) => {
-                        app.last_error = Some(format!("input: {e}"));
+                        app.input_health = Some(format!("input: {e}"));
                     }
                     None => {
-                        app.last_error = Some("input: event stream ended".into());
+                        app.input_health = Some("input: event stream ended".into());
                         app.should_quit = true;
                     }
                 }
@@ -1961,6 +1969,7 @@ mod tests {
             picker: None,
             follow_mode: true,
             last_error: None,
+            input_health: None,
             head_dirty: false,
             should_quit: false,
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
@@ -3957,6 +3966,24 @@ mod tests {
             app.watcher_health
                 .has_failure(WatchSource::GitRefs, "kqueue overflow"),
             "a successful diff recompute must not imply watcher recovery"
+        );
+    }
+
+    #[test]
+    fn input_health_survives_successful_recompute_through_apply_computed_files() {
+        let mut app = fake_app(vec![]);
+        app.input_health = Some("input: stream hiccup".into());
+
+        app.apply_computed_files(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+
+        assert_eq!(
+            app.input_health.as_deref(),
+            Some("input: stream hiccup"),
+            "a successful diff recompute must not imply input recovery"
         );
     }
 

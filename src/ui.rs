@@ -697,6 +697,16 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled(msg, Style::default().fg(Color::Red)));
     }
 
+    if let Some(msg) = &app.input_health {
+        spans.push(sep());
+        spans.push(Span::styled(
+            "⚠ INPUT",
+            Style::default().fg(Color::Red).add_modifier(bold),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(msg.clone(), Style::default().fg(Color::Red)));
+    }
+
     if let Some(err) = &app.last_error {
         spans.push(sep());
         spans.push(Span::styled(
@@ -877,6 +887,7 @@ mod tests {
             picker: None,
             follow_mode: true,
             last_error: None,
+            input_health: None,
             head_dirty: false,
             should_quit: false,
             last_body_height: std::cell::Cell::new(24),
@@ -1182,6 +1193,23 @@ mod tests {
         assert!(
             view.contains("watcher [worktree]: worktree"),
             "missing worktree watcher message:\n{view}"
+        );
+    }
+
+    #[test]
+    fn render_footer_shows_input_health_warning() {
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        app.input_health = Some("input: stream hiccup".into());
+
+        let view = render_to_string(&app, 140, 6);
+        assert!(view.contains("⚠ INPUT"), "missing input warning:\n{view}");
+        assert!(
+            view.contains("input: stream hiccup"),
+            "missing input health message:\n{view}"
         );
     }
 
