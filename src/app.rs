@@ -203,20 +203,24 @@ impl App {
         }
 
         match key.code {
+            // Lowercase + arrows = the *common* case: hunk-by-hunk motion.
+            // hunk is kizu's primary unit of attention, so it gets the easy
+            // keys; row-level scroll is reserved for SHIFT-J / SHIFT-K when
+            // you genuinely need to walk a long hunk line by line.
             KeyCode::Char('j') | KeyCode::Down => {
-                self.scroll_by(1);
-                self.follow_mode = false;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.scroll_by(-1);
-                self.follow_mode = false;
-            }
-            KeyCode::Char('J') => {
                 self.next_hunk();
                 self.follow_mode = false;
             }
-            KeyCode::Char('K') => {
+            KeyCode::Char('k') | KeyCode::Up => {
                 self.prev_hunk();
+                self.follow_mode = false;
+            }
+            KeyCode::Char('J') => {
+                self.scroll_by(1);
+                self.follow_mode = false;
+            }
+            KeyCode::Char('K') => {
+                self.scroll_by(-1);
                 self.follow_mode = false;
             }
             KeyCode::Char('g') => {
@@ -916,7 +920,27 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_j_scrolls_one_row_and_disables_follow() {
+    fn handle_key_j_jumps_to_next_hunk_and_disables_follow() {
+        // After M4v.swap, lowercase `j` is hunk-forward.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "x")]),
+                hunk(20, vec![diff_line(LineKind::Added, "y")]),
+            ],
+            100,
+        )]);
+        app.scroll_to(0);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, app.layout.hunk_starts[0]);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, app.layout.hunk_starts[1]);
+        assert!(!app.follow_mode);
+    }
+
+    #[test]
+    fn handle_key_capital_j_scrolls_one_row() {
+        // After M4v.swap, SHIFT-J is the fine-grained row scroll.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(
@@ -929,26 +953,9 @@ mod tests {
             100,
         )]);
         let start = app.scroll;
-        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('J')));
         assert_eq!(app.scroll, start + 1);
         assert!(!app.follow_mode);
-    }
-
-    #[test]
-    fn handle_key_capital_j_jumps_to_next_hunk() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(20, vec![diff_line(LineKind::Added, "y")]),
-            ],
-            100,
-        )]);
-        app.scroll_to(0);
-        app.handle_key(key(KeyCode::Char('J')));
-        assert_eq!(app.scroll, app.layout.hunk_starts[0]);
-        app.handle_key(key(KeyCode::Char('J')));
-        assert_eq!(app.scroll, app.layout.hunk_starts[1]);
     }
 
     #[test]
