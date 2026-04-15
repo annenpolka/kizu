@@ -40,24 +40,59 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let viewport_height = area.height as usize;
+    // M4v: every row in the viewport renders with bright/dim styling
+    // depending on whether it belongs to `current_hunk()`.
+    // M4v.long: when the cursor sits inside a hunk whose header has
+    // scrolled off the top, pin the header row to viewport row 0
+    // (sticky scroll) so the function name stays visible while the
+    // user walks through a long edit.
     let total_rows = app.layout.rows.len();
+    let selected = app.current_hunk();
+    let cursor_row = app.scroll;
 
-    // Slice the layout to the viewport, applying scroll offset and the
-    // SCROLL_ROW_LIMIT safety cap.
-    let start = app.scroll;
+    // Sticky header: cursor is inside a hunk whose header is strictly
+    // above the scroll position.
+    let sticky = selected.and_then(|(file_idx, hunk_idx)| {
+        find_hunk_header_row(&app.layout.rows, file_idx, hunk_idx)
+            .filter(|&row| row < cursor_row)
+            .map(|_| (file_idx, hunk_idx))
+    });
+
+    let (header_area, content_area) = if sticky.is_some() && area.height > 1 {
+        let header = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
+        let body = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height - 1,
+        };
+        (Some(header), body)
+    } else {
+        (None, area)
+    };
+
+    let viewport_height = content_area.height as usize;
+    let start = cursor_row;
     let cap_end = start.saturating_add(SCROLL_ROW_LIMIT.min(viewport_height));
     let end = cap_end.min(total_rows);
-    let selected = app.current_hunk();
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(end.saturating_sub(start));
     for row_idx in start..end {
-        lines.push(render_row(&app.layout.rows[row_idx], &app.files, selected));
+        let is_cursor = row_idx == cursor_row;
+        lines.push(render_row(
+            &app.layout.rows[row_idx],
+            &app.files,
+            selected,
+            is_cursor,
+        ));
     }
 
     if total_rows > SCROLL_ROW_LIMIT && (start + viewport_height) < total_rows {
-        // We're not at the bottom yet but the view is capped at the row limit
-        // — surface that fact in the last visible row.
         let remaining = total_rows - end;
         if remaining > 0 {
             lines.push(Line::from(Span::styled(
@@ -67,19 +102,45 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
 
-    let p = Paragraph::new(lines);
-    frame.render_widget(p, area);
+    frame.render_widget(Paragraph::new(lines), content_area);
+
+    // Pin the header on top after the body, so the overlay always wins.
+    if let (Some(header_rect), Some((file_idx, hunk_idx))) = (header_area, sticky)
+        && let DiffContent::Text(hunks) = &app.files[file_idx].content
+    {
+        let line = render_hunk_header(&hunks[hunk_idx], true);
+        frame.render_widget(Paragraph::new(line), header_rect);
+    }
+}
+
+/// Walk `rows` to find the row index of the `HunkHeader` matching
+/// `(file_idx, hunk_idx)`. Returns `None` if the layout is empty or the
+/// cursor's hunk has no header row (binary, etc).
+fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> Option<usize> {
+    rows.iter().position(|r| {
+        matches!(
+            r,
+            RowKind::HunkHeader {
+                file_idx: f,
+                hunk_idx: h,
+            } if *f == file_idx && *h == hunk_idx
+        )
+    })
 }
 
 /// Build the styled `Line` for a single layout row. `selected_hunk`
 /// identifies the (file_idx, hunk_idx) the cursor is currently inside;
 /// rows belonging to that hunk render at full saturation, all other
 /// hunk rows render with `Modifier::DIM` so the cursor's hunk pops out
-/// of the surrounding diff without hiding it.
+/// of the surrounding diff without hiding it. `is_cursor` is `true` for
+/// the *single* row that `app.scroll` points at — that row gets a
+/// stronger left-margin marker so the user can find their position
+/// inside a long hunk.
 fn render_row(
     row: &RowKind,
     files: &[FileDiff],
     selected_hunk: Option<(usize, usize)>,
+    is_cursor: bool,
 ) -> Line<'static> {
     match row {
         RowKind::FileHeader { file_idx } => render_file_header(*file_idx, &files[*file_idx]),
@@ -100,7 +161,7 @@ fn render_row(
             };
             let is_selected = selected_hunk == Some((*file_idx, *hunk_idx));
             let line = &hunks[*hunk_idx].lines[*line_idx];
-            render_diff_line(line, is_selected)
+            render_diff_line(line, is_selected, is_cursor)
         }
         RowKind::BinaryNotice { .. } => Line::from(Span::styled(
             "       [binary file - diff suppressed]",
@@ -159,15 +220,27 @@ fn render_hunk_header(hunk: &Hunk, is_selected: bool) -> Line<'static> {
     Line::from(Span::styled(body, style))
 }
 
-fn render_diff_line(line: &crate::git::DiffLine, is_selected: bool) -> Line<'static> {
+fn render_diff_line(
+    line: &crate::git::DiffLine,
+    is_selected: bool,
+    is_cursor: bool,
+) -> Line<'static> {
     let (prefix_char, color) = match line.kind {
         LineKind::Added => ('+', Some(Color::Green)),
         LineKind::Deleted => ('-', Some(Color::Red)),
         LineKind::Context => (' ', None),
     };
-    // Left margin: 4 spaces for the cursor bar gap + 2 chars for the bar
-    // slot itself + the diff sign.
-    let bar = if is_selected {
+    // Left margin (5 cells). When this is the cursor's exact row, drop
+    // a `▶` arrow there so it stands out from the `▎` ribbon that the
+    // selected hunk shares across all of its rows.
+    let bar = if is_cursor {
+        Span::styled(
+            "  ▶  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if is_selected {
         Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
     } else {
         Span::raw("     ")
@@ -861,11 +934,23 @@ mod tests {
 
     #[test]
     fn selected_hunk_displays_yellow_left_bar() {
-        let app = populated_app(vec![make_file(
+        // Multi-line hunk so that *some* row exists that's selected but
+        // not the cursor — proving the `▎` ribbon still gets drawn for
+        // the rest of the hunk while only one row gets the `▶` arrow.
+        let mut app = populated_app(vec![make_file(
             "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "first"),
+                    diff_line(LineKind::Added, "second"),
+                ],
+            )],
             100,
         )]);
+        // Place the cursor on the hunk header so the `▎` (not `▶`) bar
+        // covers both diff line rows.
+        app.scroll_to(app.layout.hunk_starts[0]);
         let backend = TestBackend::new(80, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| render(f, &app)).expect("draw");
@@ -884,5 +969,105 @@ mod tests {
             had_yellow_bar,
             "expected a yellow '▎' on the selected hunk row"
         );
+    }
+
+    #[test]
+    fn cursor_row_displays_arrow_marker_distinct_from_hunk_bar() {
+        // Two-line hunk: park the cursor on the first diff line. That row
+        // should render `▶` in the left margin while the *other* diff row
+        // of the same hunk still uses the plain `▎` ribbon.
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "first"),
+                    diff_line(LineKind::Added, "second"),
+                ],
+            )],
+            100,
+        )]);
+        // Layout: FileHeader, HunkHeader, DiffLine(0), DiffLine(1), Spacer
+        // hunk_starts[0] = 1 (HunkHeader). First DiffLine is at row 2.
+        app.scroll_to(app.layout.hunk_starts[0] + 1);
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let mut had_arrow = false;
+        let mut had_plain_bar = false;
+        for y in 0..buffer.area().height {
+            for x in 0..buffer.area().width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow) {
+                    had_arrow = true;
+                }
+                if cell.symbol() == "▎" && cell.style().fg == Some(Color::Yellow) {
+                    had_plain_bar = true;
+                }
+            }
+        }
+        assert!(had_arrow, "expected a yellow '▶' arrow at the cursor row");
+        assert!(
+            had_plain_bar,
+            "expected a yellow '▎' ribbon on the other selected row"
+        );
+    }
+
+    #[test]
+    fn sticky_hunk_header_appears_when_cursor_is_below_it() {
+        // Build a single hunk tall enough that scrolling past the header
+        // pushes it off the top of a small viewport. The renderer should
+        // pin the header on viewport row 0.
+        let lines: Vec<DiffLine> = (0..40)
+            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+            .collect();
+        let mut app = populated_app(vec![make_file_with_context(
+            "src/foo.rs",
+            "fn long_function() {",
+            lines,
+            100,
+        )]);
+        // Skip past the hunk header so the renderer has to pin it.
+        let header_row = app.layout.hunk_starts[0];
+        app.scroll_to(header_row + 10);
+
+        // Tight viewport so the original header row really is off-screen.
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        // The very first row of the main area must contain the function
+        // name from the sticky header.
+        let mut row0 = String::new();
+        for x in 0..buffer.area().width {
+            row0.push_str(buffer[(x, 0)].symbol());
+        }
+        assert!(
+            row0.contains("long_function"),
+            "row 0 should be the pinned hunk header, got:\n{row0}"
+        );
+    }
+
+    fn make_file_with_context(name: &str, ctx: &str, lines: Vec<DiffLine>, secs: u64) -> FileDiff {
+        let added: usize = lines.iter().filter(|l| l.kind == LineKind::Added).count();
+        let deleted: usize = lines.iter().filter(|l| l.kind == LineKind::Deleted).count();
+        FileDiff {
+            path: PathBuf::from(name),
+            status: FileStatus::Modified,
+            added,
+            deleted,
+            content: DiffContent::Text(vec![Hunk {
+                old_start: 1,
+                old_count: deleted,
+                new_start: 1,
+                new_count: added,
+                lines,
+                context: Some(ctx.to_string()),
+            }]),
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+        }
     }
 }
