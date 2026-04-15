@@ -1728,9 +1728,24 @@ impl App {
 /// Async event loop. See ADR-0003 / ADR-0005.
 pub async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("reading current directory")?;
-    let mut app = App::bootstrap(cwd)?;
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
     let result = async {
+        // Show something immediately, even before the initial bootstrap
+        // `git diff` completes. On large repos this avoids a black screen
+        // during the synchronous bootstrap shell-outs.
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("Loading kizu...")
+                        .alignment(ratatui::layout::Alignment::Center),
+                    area,
+                );
+            })
+            .context("ratatui loading draw")?;
+
+        let mut app = App::bootstrap(cwd)?;
+
         // Draw one static frame before watcher startup. On macOS the
         // PollWatcher fallback may take noticeable time to arm because it
         // performs an initial scan; showing the bootstrap snapshot first
