@@ -462,7 +462,10 @@ fn render_hunk_header(hunk: &Hunk, is_selected: bool, is_cursor: bool) -> Line<'
         None => format!(
             "{}  @@ -{},{} +{},{} @@",
             if is_cursor { "  ▶  " } else { "     " },
-            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+            hunk.old_start,
+            hunk.old_count,
+            hunk.new_start,
+            hunk.new_count
         ),
     };
     let mut style = Style::default().fg(Color::Cyan);
