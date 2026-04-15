@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use notify::RecursiveMode;
@@ -38,8 +39,27 @@ pub enum WatchEvent {
 
 /// Owns the running notify debouncers and exposes a tokio receiver that the
 /// app loop drains. Dropping the handle stops every underlying watcher.
+///
+/// The `matcher` field is a shared, mutable view of the
+/// [`BaselineMatcherInner`] that every debouncer callback consults on
+/// each event. Holding it in an `Arc<RwLock<_>>` lets the app layer
+/// reconfigure the tracked branch at runtime (e.g. after `R` detects
+/// a `git checkout` to a different branch) without rebuilding the
+/// debouncers or losing the event queue. See [`Self::update_current_branch_ref`]
+/// and ADR-0008.
 pub struct WatchHandle {
     pub events: UnboundedReceiver<WatchEvent>,
+    /// Shared baseline path matcher. The debouncer closures hold a
+    /// clone of this `Arc`; writes through the handle are visible to
+    /// the next event without any restart.
+    matcher: SharedMatcher,
+    /// Per-worktree git dir, stashed so `update_current_branch_ref`
+    /// can rebuild `BaselineMatcherInner` without the caller having
+    /// to re-plumb it.
+    git_dir: PathBuf,
+    /// Common git dir (equal to `git_dir` for normal repos, different
+    /// for linked worktrees). Same rationale as `git_dir`.
+    common_git_dir: PathBuf,
     // The debouncers must outlive `events`; dropping them stops the watchers.
     _worktree: Debouncer<RecommendedWatcher, RecommendedCache>,
     _git_dir: Debouncer<RecommendedWatcher, RecommendedCache>,
@@ -49,6 +69,27 @@ pub struct WatchHandle {
     // matches `git_dir` (normal repos) we skip the second watcher to
     // avoid double-firing GitHead.
     _common_git_dir: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
+}
+
+impl WatchHandle {
+    /// Atomically reconfigure the set of baseline-affecting paths the
+    /// debouncers match against. Called by the app layer when `R`
+    /// discovers that the symbolic HEAD now points at a different
+    /// branch than the one captured at startup — without this the
+    /// matcher stays pinned to the old branch ref and subsequent
+    /// commits on the new branch would silently stop raising
+    /// `GitHead` (the core correctness break that ADR-0008 addresses).
+    ///
+    /// Passing the same branch that is already active is a cheap
+    /// no-op: the rebuilt `BaselineMatcherInner` holds identical
+    /// canonicalized paths.
+    pub fn update_current_branch_ref(&self, current_branch_ref: Option<&str>) {
+        let new_inner =
+            BaselineMatcherInner::new(&self.git_dir, &self.common_git_dir, current_branch_ref);
+        if let Ok(mut guard) = self.matcher.write() {
+            *guard = new_inner;
+        }
+    }
 }
 
 /// Start watching `root` (the worktree), the per-worktree `git_dir`
@@ -87,10 +128,15 @@ pub fn start(
     let worktree_root = root.to_path_buf();
     let git_dir_owned = git_dir.to_path_buf();
     let common_git_dir_owned = common_git_dir.to_path_buf();
-    let matcher = BaselineMatcher::new(&git_dir_owned, &common_git_dir_owned, current_branch_ref);
+    let matcher: SharedMatcher = Arc::new(RwLock::new(BaselineMatcherInner::new(
+        &git_dir_owned,
+        &common_git_dir_owned,
+        current_branch_ref,
+    )));
 
     let worktree = spawn_worktree_debouncer(&worktree_root, &git_dir_owned, tx.clone())?;
-    let git_dir_watcher = spawn_git_dir_debouncer(&git_dir_owned, matcher.clone(), tx.clone())?;
+    let git_dir_watcher =
+        spawn_git_dir_debouncer(&git_dir_owned, Arc::clone(&matcher), tx.clone())?;
 
     // Only spin up a second watcher when the common dir really differs
     // from the per-worktree dir; otherwise we'd double-fire GitHead on
@@ -99,24 +145,38 @@ pub fn start(
         if canonicalize_or_self(&common_git_dir_owned) == canonicalize_or_self(&git_dir_owned) {
             None
         } else {
-            Some(spawn_git_dir_debouncer(&common_git_dir_owned, matcher, tx)?)
+            Some(spawn_git_dir_debouncer(
+                &common_git_dir_owned,
+                Arc::clone(&matcher),
+                tx,
+            )?)
         };
 
     Ok(WatchHandle {
         events: rx,
+        matcher,
+        git_dir: git_dir_owned,
+        common_git_dir: common_git_dir_owned,
         _worktree: worktree,
         _git_dir: git_dir_watcher,
         _common_git_dir: common_git_dir_watcher,
     })
 }
 
+/// Shared, runtime-mutable handle to the baseline path set. Every
+/// debouncer callback holds a clone of this `Arc` and read-locks on
+/// each event; the app layer can hot-swap the inner value through
+/// [`WatchHandle::update_current_branch_ref`].
+pub(crate) type SharedMatcher = Arc<RwLock<BaselineMatcherInner>>;
+
 /// Set of git-dir paths that, when touched, genuinely indicate the
-/// session baseline SHA has drifted. Captured once at watcher startup
-/// from the initial HEAD state. Paths are canonicalized so
-/// byte-comparisons work across symlinked tempdirs (e.g. macOS
+/// session baseline SHA has drifted. Captured at watcher startup
+/// **and refreshed at runtime** whenever `R` discovers a new
+/// symbolic HEAD (ADR-0008). Paths are canonicalized so byte
+/// comparisons work across symlinked tempdirs (e.g. macOS
 /// `/var/folders` → `/private/var/folders`).
 #[derive(Debug, Clone)]
-pub(crate) struct BaselineMatcher {
+pub(crate) struct BaselineMatcherInner {
     /// `<per-worktree git_dir>/HEAD` — moves on `git checkout`, or
     /// on reseating HEAD to a different branch via `symbolic-ref`.
     head_file: PathBuf,
@@ -133,7 +193,7 @@ pub(crate) struct BaselineMatcher {
     packed_refs: PathBuf,
 }
 
-impl BaselineMatcher {
+impl BaselineMatcherInner {
     pub(crate) fn new(
         git_dir: &Path,
         common_git_dir: &Path,
@@ -209,7 +269,7 @@ fn spawn_worktree_debouncer(
 
 fn spawn_git_dir_debouncer(
     git_dir: &Path,
-    matcher: BaselineMatcher,
+    matcher: SharedMatcher,
     tx: UnboundedSender<WatchEvent>,
 ) -> Result<Debouncer<RecommendedWatcher, RecommendedCache>> {
     let mut debouncer = new_debouncer(HEAD_DEBOUNCE, None, move |result: DebounceEventResult| {
@@ -221,17 +281,33 @@ fn spawn_git_dir_debouncer(
                 return;
             }
         };
+        // Read-lock the shared matcher once per burst. `R` may have
+        // hot-swapped the inner value since the previous firing (the
+        // user checked out a different branch and re-baselined), so
+        // we always read through the Arc rather than capturing a
+        // snapshot in the closure.
+        //
         // Only treat baseline-affecting paths (the per-worktree HEAD,
-        // the common-dir branch ref the session baseline was captured
-        // from, packed-refs) as real head movement. Plain bookkeeping
-        // churn — `index`, `index.lock`, `logs/`, pack files, reflog
-        // writes — and unrelated refs (remotes, tags, other branches)
-        // must not raise the stale-baseline indicator, otherwise a
+        // the common-dir branch ref the session is currently tracking,
+        // packed-refs) as real head movement. Plain bookkeeping churn
+        // — `index`, `index.lock`, `logs/`, pack files, reflog writes
+        // — and unrelated refs (remotes, tags, other branches) must
+        // not raise the stale-baseline indicator, otherwise a
         // `git fetch` or a sibling linked worktree's commit would
         // wrongly flag our HEAD as drifted.
+        let Ok(guard) = matcher.read() else {
+            // Poisoned RwLock: refuse to swallow the burst silently —
+            // bubble a health-level error so the app layer forces a
+            // recompute and marks the watcher unhealthy.
+            let _ = tx.send(WatchEvent::Error(
+                "watcher [git_dir]: baseline matcher lock poisoned".to_string(),
+            ));
+            return;
+        };
         let baseline_touched = events
             .iter()
-            .any(|ev| ev.event.paths.iter().any(|p| matcher.matches(p)));
+            .any(|ev| ev.event.paths.iter().any(|p| guard.matches(p)));
+        drop(guard);
         if baseline_touched {
             let _ = tx.send(WatchEvent::GitHead);
         }
@@ -592,7 +668,7 @@ mod tests {
         // Anything else — unrelated refs, remotes, tags, bookkeeping
         // files — must be rejected.
         let git_dir = Path::new("/tmp/repo/.git");
-        let matcher = BaselineMatcher::new(git_dir, git_dir, Some("refs/heads/main"));
+        let matcher = BaselineMatcherInner::new(git_dir, git_dir, Some("refs/heads/main"));
 
         // Accepted: HEAD, the current branch ref, packed-refs.
         assert!(matcher.matches(&git_dir.join("HEAD")));
@@ -630,7 +706,7 @@ mod tests {
         // rejected, because in a detached session the baseline is a
         // raw SHA and no branch ref can move it.
         let git_dir = Path::new("/tmp/repo/.git");
-        let matcher = BaselineMatcher::new(git_dir, git_dir, None);
+        let matcher = BaselineMatcherInner::new(git_dir, git_dir, None);
 
         assert!(matcher.matches(&git_dir.join("HEAD")));
         assert!(matcher.matches(&git_dir.join("packed-refs")));
@@ -647,7 +723,7 @@ mod tests {
         // in the common dir simultaneously.
         let per = Path::new("/tmp/repo/.git/worktrees/wt1");
         let common = Path::new("/tmp/repo/.git");
-        let matcher = BaselineMatcher::new(per, common, Some("refs/heads/feature"));
+        let matcher = BaselineMatcherInner::new(per, common, Some("refs/heads/feature"));
 
         assert!(matcher.matches(&per.join("HEAD")));
         assert!(matcher.matches(&common.join("refs").join("heads").join("feature")));
@@ -658,5 +734,88 @@ mod tests {
         assert!(!matcher.matches(&common.join("HEAD")));
         // A sibling linked worktree's HEAD file is also unrelated.
         assert!(!matcher.matches(&common.join("worktrees").join("wt2").join("HEAD")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_current_branch_ref_reroutes_head_detection_without_restart() {
+        // Regression for Codex round-3 finding: previously the
+        // watcher captured the startup branch into an immutable
+        // struct, so `R`'ing after a `git checkout` to a different
+        // branch silently stopped raising `GitHead` for commits
+        // on the new branch. The new design wraps the matcher in
+        // an `Arc<RwLock<_>>` so the app layer can hot-swap the
+        // tracked branch through `WatchHandle::update_current_branch_ref`.
+        //
+        // Setup: start watching branch `main`, write to
+        // `refs/heads/sibling` (ignored by the matcher), confirm
+        // GitHead does NOT fire. Then update the matcher to track
+        // `sibling`, write to it again, confirm GitHead fires.
+        let repo = init_repo();
+        let root = crate::git::find_root(repo.path()).expect("find_root");
+        let git_dir = crate::git::git_dir(&root).expect("git_dir");
+        let common = crate::git::git_common_dir(&root).expect("common git_dir");
+
+        let mut handle =
+            start(&root, &git_dir, &common, Some("refs/heads/main")).expect("start watcher");
+
+        tokio::time::sleep(TokioDuration::from_millis(150)).await;
+
+        // Phase 1: write a sibling branch the matcher is NOT
+        // tracking — must be ignored.
+        let refs_heads = git_dir.join("refs").join("heads");
+        fs::create_dir_all(&refs_heads).expect("create refs/heads");
+        fs::write(
+            refs_heads.join("sibling"),
+            b"1111111111111111111111111111111111111111\n",
+        )
+        .expect("write sibling phase 1");
+
+        let mut saw_head_before_update = false;
+        let phase1_until = tokio::time::Instant::now() + TokioDuration::from_millis(600);
+        while tokio::time::Instant::now() < phase1_until {
+            match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
+                Ok(Some(WatchEvent::GitHead)) => {
+                    saw_head_before_update = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            !saw_head_before_update,
+            "writes to a branch the matcher is not tracking must not fire GitHead"
+        );
+
+        // Phase 2: hot-swap the matcher to point at `sibling`, write
+        // to it again, confirm GitHead fires this time. The handle
+        // is `&self` for the update call, so no mutable borrow
+        // conflict with the subsequent `events.recv()`.
+        handle.update_current_branch_ref(Some("refs/heads/sibling"));
+        tokio::time::sleep(TokioDuration::from_millis(150)).await;
+        fs::write(
+            refs_heads.join("sibling"),
+            b"2222222222222222222222222222222222222222\n",
+        )
+        .expect("write sibling phase 2");
+
+        let mut saw_head_after_update = false;
+        let phase2_until = tokio::time::Instant::now() + DRAIN_WAIT;
+        while tokio::time::Instant::now() < phase2_until {
+            match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
+                Ok(Some(WatchEvent::GitHead)) => {
+                    saw_head_after_update = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            saw_head_after_update,
+            "after update_current_branch_ref the matcher must see the newly tracked branch"
+        );
     }
 }

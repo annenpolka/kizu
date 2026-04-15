@@ -593,6 +593,22 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled("picker", dim));
     }
 
+    // Watcher health takes footer precedence over transient diff
+    // errors: a dead notify backend is a correctness-level problem
+    // (auto-refresh has stopped) and must stay visible even if the
+    // most recent one-off recompute happened to succeed. Drawn with
+    // a distinct `WATCHER` tag so it cannot be confused with an
+    // ordinary `git diff` failure. See ADR-0008.
+    if let crate::app::WatcherHealth::Failed(msg) = &app.watcher_health {
+        spans.push(sep());
+        spans.push(Span::styled(
+            "⚠ WATCHER",
+            Style::default().fg(Color::Red).add_modifier(bold),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(msg.clone(), Style::default().fg(Color::Red)));
+    }
+
     if let Some(err) = &app.last_error {
         spans.push(sep());
         spans.push(Span::styled(
@@ -778,6 +794,7 @@ mod tests {
             visual_top: std::cell::Cell::new(0.0),
             anim: None,
             wrap_lines: false,
+            watcher_health: crate::app::WatcherHealth::Healthy,
         }
     }
 

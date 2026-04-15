@@ -83,6 +83,52 @@ pub struct App {
     /// each logical line so real newlines can be distinguished from
     /// wrap boundaries. Toggled by the `w` key.
     pub wrap_lines: bool,
+    /// Watcher backend health, tracked **separately** from
+    /// `last_error` so that a successful one-off `git diff` recompute
+    /// does not silently clear a live filesystem-watcher failure
+    /// (ADR-0008). `Failed` persists until a subsequent non-Error
+    /// watcher event confirms recovery, or the watcher is restarted.
+    pub watcher_health: WatcherHealth,
+}
+
+/// Tracks whether the underlying notify debouncers are still pushing
+/// events into the channel. Decoupled from `App.last_error`: a failing
+/// `compute_diff` must not pretend the watcher has recovered, and a
+/// successful recompute must not pretend a dropped FSEvents queue has
+/// repaired itself. See ADR-0008.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WatcherHealth {
+    #[default]
+    Healthy,
+    /// The backend reported a failure. Stored verbatim from the
+    /// watcher layer so the footer can display the concrete error.
+    /// Cleared only when a non-Error watcher event lands after the
+    /// failure, which is evidence the debouncer is still producing
+    /// signals.
+    Failed(String),
+}
+
+/// Follow-up work the event loop must perform after dispatching a
+/// key. Keeps `App::handle_key` a pure state mutator while still
+/// letting specific keys request out-of-band side effects such as
+/// watcher reconfiguration (ADR-0008). New variants should be added
+/// here rather than threading side-effect channels through every
+/// handler method.
+///
+/// Not `#[must_use]`: the event loop is the one caller that
+/// genuinely needs to act on the effect, and tagging the enum
+/// would force every existing `handle_key` test to wrap results in
+/// `let _ = …` for zero actual benefit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyEffect {
+    /// No extra work. Most key handlers return this.
+    None,
+    /// The symbolic HEAD ref has changed — the event loop must
+    /// hot-swap the watcher's `BaselineMatcherInner` so subsequent
+    /// branch-ref writes raise `WatchEvent::GitHead`. Without this
+    /// the watcher would stay pinned to the session's startup
+    /// branch after `R`.
+    ReconfigureWatcher,
 }
 
 /// Two ways the renderer can park the cursor inside the viewport.
@@ -425,6 +471,7 @@ impl App {
             visual_top: Cell::new(0.0),
             anim: None,
             wrap_lines: false,
+            watcher_health: WatcherHealth::Healthy,
         };
         app.apply_computed_files(initial);
         Ok(app)
@@ -502,34 +549,73 @@ impl App {
     /// state is preserved so the user keeps looking at the same diff
     /// with the `HEAD*` warning still present, rather than a stale
     /// snapshot under a silently-advanced baseline.
-    pub fn reset_baseline(&mut self) {
+    ///
+    /// Also re-resolves the symbolic HEAD ref. If the user has
+    /// switched branches since startup (or toggled detached HEAD on
+    /// or off), `self.current_branch_ref` is updated and the caller
+    /// must reconfigure the watcher — that's what the return value
+    /// `KeyEffect::ReconfigureWatcher` signals. Without this, the
+    /// watcher would stay pinned to the old branch ref and stop
+    /// raising `GitHead` for commits on the new branch (ADR-0008).
+    pub fn reset_baseline(&mut self) -> KeyEffect {
         let new_sha = match git::head_sha(&self.root) {
             Ok(sha) => sha,
             Err(e) => {
                 self.last_error = Some(format!("R: {e:#}"));
-                return;
+                return KeyEffect::None;
+            }
+        };
+        // Re-resolve the symbolic HEAD ref *before* running the
+        // diff so we know whether a reconfigure will be needed once
+        // the transaction commits.
+        let new_branch = match git::current_branch_ref(&self.root) {
+            Ok(b) => b,
+            Err(e) => {
+                self.last_error = Some(format!("R: {e:#}"));
+                return KeyEffect::None;
             }
         };
         let diff = git::compute_diff(&self.root, &new_sha);
-        self.apply_reset(new_sha, diff);
+        self.apply_reset(new_sha, new_branch, diff)
     }
 
     /// Commit a freshly-resolved baseline + diff into the app. Split
     /// out from [`Self::reset_baseline`] so tests can inject a failing
     /// diff without touching the filesystem and verify that the old
     /// baseline, `head_dirty`, and `files` snapshot all survive.
-    pub(crate) fn apply_reset(&mut self, new_sha: String, diff: Result<Vec<FileDiff>>) {
+    ///
+    /// Returns [`KeyEffect::ReconfigureWatcher`] when the resolved
+    /// branch differs from the session's previous tracking, so the
+    /// event loop can hot-swap the watcher's `BaselineMatcherInner`
+    /// without rebuilding the debouncers.
+    pub(crate) fn apply_reset(
+        &mut self,
+        new_sha: String,
+        new_branch: Option<String>,
+        diff: Result<Vec<FileDiff>>,
+    ) -> KeyEffect {
         match diff {
             Ok(files) => {
+                let branch_changed = new_branch != self.current_branch_ref;
                 self.baseline_sha = new_sha;
+                self.current_branch_ref = new_branch;
                 self.head_dirty = false;
                 self.apply_computed_files(files);
+                if branch_changed {
+                    KeyEffect::ReconfigureWatcher
+                } else {
+                    KeyEffect::None
+                }
             }
             Err(e) => {
                 self.last_error = Some(format!("R: {e:#}"));
-                // baseline_sha / head_dirty / files intentionally
-                // untouched: the HEAD* warning stays visible and the
-                // user keeps seeing the same diff they had before R.
+                // baseline_sha / current_branch_ref / head_dirty /
+                // files intentionally untouched: the HEAD* warning
+                // stays visible and the user keeps seeing the same
+                // diff they had before R. Watcher also stays pinned
+                // to the old branch, which is the correct behavior
+                // for an aborted reset.
+                KeyEffect::None
             }
         }
     }
@@ -539,25 +625,82 @@ impl App {
         self.head_dirty = true;
     }
 
+    /// Fold a coalesced burst of watcher events into the app's
+    /// health / refresh state and return the follow-up the event
+    /// loop still needs to perform: `(needs_recompute, needs_head_dirty)`.
+    ///
+    /// Split out of [`run_loop`] so the state transitions can be
+    /// tested without a real debouncer. Every caller of `run_loop`
+    /// and every test that simulates a watcher burst must route
+    /// through this method so the health / recovery rules stay
+    /// consistent.
+    pub fn handle_watch_burst(
+        &mut self,
+        events: impl IntoIterator<Item = WatchEvent>,
+    ) -> (bool, bool) {
+        let mut worktree = false;
+        let mut head = false;
+        let mut error: Option<String> = None;
+        let mut non_error_seen = false;
+        for event in events {
+            match event {
+                WatchEvent::Worktree => {
+                    worktree = true;
+                    non_error_seen = true;
+                }
+                WatchEvent::GitHead => {
+                    head = true;
+                    non_error_seen = true;
+                }
+                WatchEvent::Error(msg) => error = Some(msg),
+            }
+        }
+        if let Some(msg) = error {
+            // Backend failure: record it in the dedicated
+            // `watcher_health` slot (NOT `last_error`) so a
+            // subsequent one-off successful recompute does not
+            // silently erase the fact that live monitoring is dead.
+            // Also force a recompute so the user at least sees the
+            // freshest snapshot the tool can produce in fallback
+            // mode.
+            self.watcher_health = WatcherHealth::Failed(msg);
+            worktree = true;
+        } else if non_error_seen && matches!(self.watcher_health, WatcherHealth::Failed(_)) {
+            // A non-Error event means the debouncer is still
+            // producing signals — treat that as recovery and drop
+            // the health warning. This is the counterpart to the
+            // persistent `Failed` state above and keeps the footer
+            // honest without manual intervention.
+            self.watcher_health = WatcherHealth::Healthy;
+        }
+        (worktree, head)
+    }
+
     /// Top-level key dispatch. Picker mode shadows the normal bindings.
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    /// Returns a [`KeyEffect`] describing any post-dispatch work that
+    /// the event loop must perform — currently only `R` can trigger
+    /// a watcher reconfigure, but the same channel scales to future
+    /// side-effects without threading explicit parameters through
+    /// every handler.
+    pub fn handle_key(&mut self, key: KeyEvent) -> KeyEffect {
         if self.picker.is_some() {
             self.handle_picker_key(key);
+            KeyEffect::None
         } else {
-            self.handle_normal_key(key);
+            self.handle_normal_key(key)
         }
     }
 
     // ---- normal-mode keys --------------------------------------------
 
-    fn handle_normal_key(&mut self, key: KeyEvent) {
+    fn handle_normal_key(&mut self, key: KeyEvent) -> KeyEffect {
         // Quit shortcuts.
         if matches!(key.code, KeyCode::Char('q'))
             || (matches!(key.code, KeyCode::Char('c'))
                 && key.modifiers.contains(KeyModifiers::CONTROL))
         {
             self.should_quit = true;
-            return;
+            return KeyEffect::None;
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -565,12 +708,12 @@ impl App {
                 KeyCode::Char('d') => {
                     self.scroll_by(HALF_PAGE as isize);
                     self.follow_mode = false;
-                    return;
+                    return KeyEffect::None;
                 }
                 KeyCode::Char('u') => {
                     self.scroll_by(-(HALF_PAGE as isize));
                     self.follow_mode = false;
-                    return;
+                    return KeyEffect::None;
                 }
                 _ => {}
             }
@@ -614,7 +757,7 @@ impl App {
                 self.open_picker();
             }
             KeyCode::Char('R') => {
-                self.reset_baseline();
+                return self.reset_baseline();
             }
             KeyCode::Char('z') => {
                 self.toggle_cursor_placement();
@@ -624,6 +767,7 @@ impl App {
             }
             _ => {}
         }
+        KeyEffect::None
     }
 
     // ---- picker-mode keys --------------------------------------------
@@ -1382,37 +1526,24 @@ async fn run_loop(
         tokio::select! {
             Some(Ok(event)) = events.next() => {
                 if let Event::Key(key) = event {
-                    app.handle_key(key);
+                    let effect = app.handle_key(key);
+                    apply_key_effect(effect, app, watch);
                 }
             }
             Some(first) = watch.events.recv() => {
-                let mut worktree = false;
-                let mut head = false;
-                let mut error: Option<String> = None;
-                let mut current = Some(first);
-                while let Some(event) = current {
-                    match event {
-                        WatchEvent::Worktree => worktree = true,
-                        WatchEvent::GitHead => head = true,
-                        WatchEvent::Error(msg) => error = Some(msg),
-                    }
-                    current = watch.events.try_recv().ok();
+                // Drain any events that piled up behind `first` and
+                // hand the whole burst to `handle_watch_burst` so the
+                // coalescing + health-transition rules stay testable
+                // in one place.
+                let mut burst: Vec<WatchEvent> = vec![first];
+                while let Ok(more) = watch.events.try_recv() {
+                    burst.push(more);
                 }
-                if let Some(msg) = error {
-                    // Backend failure: surface it in the footer and
-                    // force a diff recompute so the UI cannot silently
-                    // keep rendering the last good snapshot as if the
-                    // watcher were still healthy. `recompute_diff`
-                    // will clear `last_error` on success or overwrite
-                    // it with a fresher error on failure — either
-                    // outcome is visible to the user.
-                    app.last_error = Some(msg);
-                    worktree = true;
-                }
-                if worktree {
+                let (need_recompute, need_head_dirty) = app.handle_watch_burst(burst);
+                if need_recompute {
                     app.recompute_diff();
                 }
-                if head {
+                if need_head_dirty {
                     app.mark_head_dirty();
                 }
             }
@@ -1425,6 +1556,19 @@ async fn run_loop(
     }
 
     Ok(())
+}
+
+/// Dispatch post-key-handler side effects back onto the watcher.
+/// Factored out so `run_loop` stays focused on the event-loop
+/// plumbing and tests can reason about the effect contract without
+/// spinning up a real terminal.
+fn apply_key_effect(effect: KeyEffect, app: &App, watch: &watcher::WatchHandle) {
+    match effect {
+        KeyEffect::None => {}
+        KeyEffect::ReconfigureWatcher => {
+            watch.update_current_branch_ref(app.current_branch_ref.as_deref());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1519,6 +1663,7 @@ mod tests {
             visual_top: Cell::new(0.0),
             anim: None,
             wrap_lines: false,
+            watcher_health: WatcherHealth::Healthy,
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
@@ -2413,16 +2558,29 @@ mod tests {
         ]);
         let old_sha = app.baseline_sha.clone();
         let old_files = app.files.clone();
+        let old_branch = app.current_branch_ref.clone();
         app.head_dirty = true;
 
-        app.apply_reset(
+        let effect = app.apply_reset(
             "feedfacefeedfacefeedfacefeedfacefeedface".into(),
+            Some("refs/heads/feature".into()),
             Err(anyhow::anyhow!("simulated git diff failure")),
+        );
+        assert_eq!(
+            effect,
+            KeyEffect::None,
+            "a failed reset must not ask the loop to reconfigure the watcher — \
+             doing so would leave the watcher pointing at a branch the user \
+             never actually reached"
         );
 
         assert_eq!(
             app.baseline_sha, old_sha,
             "baseline_sha must not advance when the post-reset diff fails"
+        );
+        assert_eq!(
+            app.current_branch_ref, old_branch,
+            "current_branch_ref must not advance when the post-reset diff fails"
         );
         assert!(
             app.head_dirty,
@@ -2440,6 +2598,75 @@ mod tests {
             err.starts_with("R:"),
             "last_error must carry the `R:` prefix so the footer identifies the source: {err}"
         );
+    }
+
+    #[test]
+    fn apply_reset_reports_reconfigure_watcher_when_branch_changes() {
+        // ADR-0008 fix: if the user checked out a different branch
+        // after starting kizu, `R` must not only update the baseline
+        // SHA but also signal the event loop that the watcher's
+        // branch tracking needs to move with it. Otherwise the
+        // watcher stays pinned to the startup branch and silently
+        // stops firing `GitHead` for future commits.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        assert_eq!(
+            app.current_branch_ref.as_deref(),
+            Some("refs/heads/main"),
+            "fake_app defaults to main for determinism"
+        );
+
+        let effect = app.apply_reset(
+            "feedfacefeedfacefeedfacefeedfacefeedface".into(),
+            Some("refs/heads/feature".into()),
+            Ok(Vec::new()),
+        );
+        assert_eq!(
+            effect,
+            KeyEffect::ReconfigureWatcher,
+            "branch change must request a watcher reconfigure"
+        );
+        assert_eq!(
+            app.current_branch_ref.as_deref(),
+            Some("refs/heads/feature"),
+            "current_branch_ref must advance to the new branch once the reset commits"
+        );
+    }
+
+    #[test]
+    fn apply_reset_signals_reconfigure_on_attach_detach_transitions() {
+        // Transitioning from attached to detached HEAD (and back) is
+        // a branch-set change from the matcher's perspective —
+        // previously matched `refs/heads/main` now becomes `None`,
+        // and only the per-worktree HEAD file matters. The reset
+        // path must surface that so the watcher drops the stale
+        // branch ref.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+
+        // main → detached
+        let effect = app.apply_reset(
+            "feedfacefeedfacefeedfacefeedfacefeedface".into(),
+            None,
+            Ok(Vec::new()),
+        );
+        assert_eq!(effect, KeyEffect::ReconfigureWatcher);
+        assert!(app.current_branch_ref.is_none());
+
+        // detached → main
+        let effect = app.apply_reset(
+            "0123456701234567012345670123456701234567".into(),
+            Some("refs/heads/main".into()),
+            Ok(Vec::new()),
+        );
+        assert_eq!(effect, KeyEffect::ReconfigureWatcher);
+        assert_eq!(app.current_branch_ref.as_deref(), Some("refs/heads/main"));
     }
 
     #[test]
@@ -2464,7 +2691,15 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(500),
         };
         let new_sha = "feedfacefeedfacefeedfacefeedfacefeedface".to_string();
-        app.apply_reset(new_sha.clone(), Ok(vec![new_file]));
+        // Same branch as the existing fake_app default — a successful
+        // reset that does NOT switch branches should report
+        // `KeyEffect::None` (no reconfigure needed).
+        let effect = app.apply_reset(
+            new_sha.clone(),
+            Some("refs/heads/main".into()),
+            Ok(vec![new_file]),
+        );
+        assert_eq!(effect, KeyEffect::None);
 
         assert_eq!(app.baseline_sha, new_sha);
         assert!(!app.head_dirty, "successful reset must clear head_dirty");
@@ -3005,6 +3240,102 @@ mod tests {
         assert_eq!(
             app.scroll, 2,
             "scroll_by(3) in wrap mode should land on the diff row at visual y 3"
+        );
+    }
+
+    // ---- watcher health decoupling (ADR-0008) ------------------------
+
+    #[test]
+    fn handle_watch_burst_records_failure_in_watcher_health_not_last_error() {
+        // Regression for Codex round-3 finding: the previous design
+        // wrote watcher backend failures into `last_error`, so a
+        // subsequent successful `recompute_diff` would silently
+        // clear them via `apply_computed_files`. The new design
+        // parks backend failures in a dedicated `watcher_health`
+        // slot, which survives diff success and only clears when
+        // a non-Error event proves the backend is alive again.
+        let mut app = fake_app(vec![]);
+        assert_eq!(app.watcher_health, WatcherHealth::Healthy);
+
+        let (need_recompute, need_head_dirty) =
+            app.handle_watch_burst([WatchEvent::Error("fsevents dropped".into())]);
+        assert!(
+            need_recompute,
+            "backend failure must force a recompute so the UI falls back to fresh data"
+        );
+        assert!(!need_head_dirty);
+        assert_eq!(
+            app.watcher_health,
+            WatcherHealth::Failed("fsevents dropped".into()),
+            "error must land in watcher_health, not last_error"
+        );
+        assert!(
+            app.last_error.is_none(),
+            "last_error must stay untouched — it's the diff-level error slot"
+        );
+    }
+
+    #[test]
+    fn watcher_health_survives_successful_recompute_through_apply_computed_files() {
+        // The core decoupling: a diff computation succeeding must
+        // NOT imply the watcher recovered. This test pins the
+        // invariant that `apply_computed_files` leaves
+        // `watcher_health` alone.
+        let mut app = fake_app(vec![]);
+        app.watcher_health = WatcherHealth::Failed("kqueue overflow".into());
+
+        // Directly exercise apply_computed_files with a fresh
+        // successful payload. The pre-rework bug cleared
+        // watcher_health via the same code path that clears
+        // last_error.
+        app.apply_computed_files(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+
+        assert_eq!(
+            app.watcher_health,
+            WatcherHealth::Failed("kqueue overflow".into()),
+            "a successful diff recompute must not imply watcher recovery"
+        );
+    }
+
+    #[test]
+    fn handle_watch_burst_clears_failed_health_on_subsequent_live_event() {
+        // Recovery path: once a Worktree or GitHead event lands
+        // after a failure, the debouncer is clearly still producing
+        // signals, so the health warning must drop. Without this
+        // recovery signal the footer would stay red forever after
+        // any transient hiccup.
+        let mut app = fake_app(vec![]);
+        app.watcher_health = WatcherHealth::Failed("transient".into());
+
+        let (need_recompute, _) = app.handle_watch_burst([WatchEvent::Worktree]);
+        assert!(need_recompute, "Worktree event still triggers a recompute");
+        assert_eq!(
+            app.watcher_health,
+            WatcherHealth::Healthy,
+            "a live event after failure must flip health back to Healthy"
+        );
+    }
+
+    #[test]
+    fn handle_watch_burst_does_not_flip_healthy_on_mixed_bursts() {
+        // When a single coalesced burst contains BOTH a live event
+        // and an Error, the Error wins: the backend may have failed
+        // after emitting the earlier event and we can't prove
+        // recovery from a burst that ends in failure. Precedence
+        // goes to the pessimistic state.
+        let mut app = fake_app(vec![]);
+        app.handle_watch_burst([
+            WatchEvent::Worktree,
+            WatchEvent::Error("late failure".into()),
+        ]);
+        assert_eq!(
+            app.watcher_health,
+            WatcherHealth::Failed("late failure".into()),
+            "a burst that includes any Error must land in Failed"
         );
     }
 

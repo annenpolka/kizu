@@ -84,7 +84,15 @@ pub fn compute_diff(root: &Path, baseline_sha: &str) -> Result<Vec<FileDiff>> {
         return Err(anyhow!("`git diff` failed: {}", stderr.trim()));
     }
 
-    let raw = String::from_utf8(output.stdout).context("`git diff` produced non-UTF8 output")?;
+    // Use a lossy decode here: git can legitimately emit raw
+    // non-UTF-8 bytes inside tracked content (legacy-encoded text
+    // fixtures, e.g. Shift-JIS or Latin-1) and a strict decode would
+    // abort the **entire** refresh over one problematic file, freezing
+    // the UI on a stale snapshot. The untracked path already goes
+    // byte-oriented in `list_untracked` / `bytes_to_path`; the tracked
+    // payload now matches. Invalid bytes become U+FFFD in the display,
+    // which is a tolerable cost for preserving refresh liveness.
+    let raw = String::from_utf8_lossy(&output.stdout);
     let mut files = parse_unified_diff(&raw);
 
     for rel in list_untracked(root)? {
@@ -1173,6 +1181,53 @@ index 1111111..2222222 100644
             .expect("untracked file with space in name must be visible");
         assert_eq!(found.status, FileStatus::Untracked);
         assert_eq!(found.added, 2);
+    }
+
+    #[test]
+    fn compute_diff_tolerates_non_utf8_tracked_content_via_lossy_decode() {
+        // Regression for Codex round-3 finding: the old
+        // `compute_diff` decoded `git diff` stdout with a strict
+        // `String::from_utf8`, so a single tracked file containing
+        // legacy-encoded bytes (Shift-JIS, Latin-1, …) would make
+        // the entire refresh error out and leave the UI pinned to
+        // a stale snapshot. Untracked handling already preserved
+        // non-UTF-8 path bytes, so the tracked-diff strictness was
+        // a silent asymmetry.
+        //
+        // Setup: commit a file with pure-ASCII content, then
+        // rewrite it with a byte sequence that is not valid UTF-8
+        // (0xFF is never a valid lead byte). `compute_diff` must
+        // succeed and surface the file as Modified — lossy decode
+        // replaces the bad byte with U+FFFD in the display, but
+        // the refresh itself stays alive.
+        let repo = init_repo();
+        let path = "legacy.txt";
+        fs::write(repo.path().join(path), "hello\n").expect("write seed");
+        run_git(repo.path(), &["add", path]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "initial"]);
+        let baseline = head_sha(repo.path()).expect("head_sha");
+
+        // Add a byte sequence containing an invalid UTF-8 byte
+        // (0xFF is never a valid lead byte in any UTF-8 codepoint)
+        // to exercise the strict vs lossy decode boundary.
+        fs::write(
+            repo.path().join(path),
+            b"hello\nlegacy \xFF byte\n".as_slice(),
+        )
+        .expect("write legacy content");
+
+        let files = compute_diff(repo.path(), &baseline)
+            .expect("compute_diff must tolerate non-UTF-8 tracked content");
+        let legacy = files
+            .iter()
+            .find(|f| f.path == Path::new(path))
+            .expect("legacy file must still appear in the diff");
+        assert_eq!(legacy.status, FileStatus::Modified);
+        assert!(
+            legacy.added >= 1,
+            "the new legacy line must register as an addition, got {}",
+            legacy.added
+        );
     }
 
     #[test]
