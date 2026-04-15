@@ -17,6 +17,26 @@ const WORKTREE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// `<git_dir>` debounce window (SPEC.md). HEAD/refs move much less often than
 /// random worktree edits, so we keep the window short.
 const HEAD_DEBOUNCE: Duration = Duration::from_millis(100);
+/// Top-level worktree directories we intentionally do not recurse into.
+/// These are common dependency caches / build outputs whose initial poll scan
+/// is far more expensive than the value they provide to the v0.1 diff UI.
+const WORKTREE_EXCLUDED_DIR_NAMES: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".direnv",
+    ".venv",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".cache",
+    ".gradle",
+    ".mvn",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+];
 
 #[cfg(target_os = "macos")]
 type KizuWatcher = PollWatcher;
@@ -256,6 +276,7 @@ fn spawn_worktree_debouncer(
     tx: UnboundedSender<WatchEvent>,
 ) -> Result<KizuDebouncer> {
     let git_dir = git_dir.to_path_buf();
+    let callback_tx = tx.clone();
     let mut debouncer = new_kizu_debouncer(
         WORKTREE_DEBOUNCE,
         true,
@@ -268,7 +289,7 @@ fn spawn_worktree_debouncer(
                     // layer can flip the footer to red and force a
                     // recompute instead of silently drifting stale.
                     let message = format_notify_errors(WatchSource::Worktree, &errors);
-                    let _ = tx.send(WatchEvent::Error {
+                    let _ = callback_tx.send(WatchEvent::Error {
                         source: WatchSource::Worktree,
                         message,
                     });
@@ -282,16 +303,61 @@ fn spawn_worktree_debouncer(
                 .iter()
                 .any(|ev| ev.event.paths.iter().any(|p| !is_inside(p, &git_dir)));
             if touches_worktree {
-                let _ = tx.send(WatchEvent::Worktree);
+                let _ = callback_tx.send(WatchEvent::Worktree);
             }
         },
     )
     .context("failed to create worktree debouncer")?;
 
     debouncer
-        .watch(root, RecursiveMode::Recursive)
+        .watch(root, RecursiveMode::NonRecursive)
         .with_context(|| format!("failed to watch worktree at {}", root.display()))?;
+
+    let recursive_children = match recursive_worktree_children(root) {
+        Ok(children) => children,
+        Err(err) => {
+            let _ = tx.send(WatchEvent::Error {
+                source: WatchSource::Worktree,
+                message: format!("watcher [{}]: {err:#}", WatchSource::Worktree.label()),
+            });
+            return Ok(debouncer);
+        }
+    };
+
+    for child in recursive_children {
+        debouncer
+            .watch(&child, RecursiveMode::Recursive)
+            .with_context(|| format!("failed to watch worktree at {}", child.display()))?;
+    }
     Ok(debouncer)
+}
+
+fn recursive_worktree_children(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut children = Vec::new();
+    let entries = std::fs::read_dir(root)
+        .with_context(|| format!("failed to read worktree root {}", root.display()))?;
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("failed to enumerate worktree root {}", root.display()))?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_excluded_worktree_dir_name)
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.is_dir() {
+            children.push(path);
+        }
+    }
+    children.sort();
+    Ok(children)
+}
+
+fn is_excluded_worktree_dir_name(name: &str) -> bool {
+    WORKTREE_EXCLUDED_DIR_NAMES.contains(&name)
 }
 
 fn git_state_watch_roots(git_dir: &Path, common_git_dir: &Path) -> Vec<WatchRoot> {
@@ -511,6 +577,33 @@ mod tests {
     /// debounce is 300 ms — anything shorter is racy.
     const DRAIN_WAIT: TokioDuration = TokioDuration::from_millis(2_000);
 
+    async fn saw_matching_event<F>(
+        handle: &mut WatchHandle,
+        wait: TokioDuration,
+        mut matches: F,
+    ) -> bool
+    where
+        F: FnMut(&WatchEvent) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline {
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            let next_poll = if remaining > TokioDuration::from_millis(200) {
+                TokioDuration::from_millis(200)
+            } else {
+                remaining
+            };
+            match timeout(next_poll, handle.events.recv()).await {
+                Ok(Some(event)) if matches(&event) => return true,
+                Ok(Some(_)) => continue,
+                Ok(None) => return false,
+                Err(_) => continue,
+            }
+        }
+        false
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn worktree_event_is_received_for_a_new_file() {
         let repo = init_repo();
@@ -532,6 +625,73 @@ mod tests {
             .expect("worktree event arrived")
             .expect("channel still open");
         assert_eq!(event, WatchEvent::Worktree);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worktree_watcher_skips_target_directory() {
+        let repo = init_repo();
+        fs::create_dir_all(repo.path().join("target")).expect("create target");
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        fs::write(repo.path().join("target").join("foo.rs"), "fn build() {}\n")
+            .expect("write target file");
+        fs::write(repo.path().join("src").join("bar.rs"), "fn app() {}\n").expect("write src file");
+
+        let root = crate::git::find_root(repo.path()).expect("find_root");
+        let git_dir = crate::git::git_dir(&root).expect("git_dir");
+        let common = crate::git::git_common_dir(&root).expect("common git_dir");
+        let branch = crate::git::current_branch_ref(&root).expect("current branch");
+
+        let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
+
+        tokio::time::sleep(TokioDuration::from_millis(250)).await;
+        fs::write(root.join("target").join("foo.rs"), "fn build() { 1 }\n")
+            .expect("rewrite target file");
+
+        let saw_target_event =
+            saw_matching_event(&mut handle, TokioDuration::from_millis(1_000), |event| {
+                *event == WatchEvent::Worktree
+            })
+            .await;
+        assert!(
+            !saw_target_event,
+            "nested writes under excluded target/ must not emit Worktree"
+        );
+
+        fs::write(root.join("src").join("bar.rs"), "fn app() { 1 }\n").expect("rewrite src file");
+
+        let saw_src_event = saw_matching_event(&mut handle, DRAIN_WAIT, |event| {
+            *event == WatchEvent::Worktree
+        })
+        .await;
+        assert!(
+            saw_src_event,
+            "nested writes under non-excluded top-level directories must still emit Worktree"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worktree_watcher_still_sees_root_level_file_writes() {
+        let repo = init_repo();
+        fs::write(repo.path().join("README.md"), "before\n").expect("write root file");
+
+        let root = crate::git::find_root(repo.path()).expect("find_root");
+        let git_dir = crate::git::git_dir(&root).expect("git_dir");
+        let common = crate::git::git_common_dir(&root).expect("common git_dir");
+        let branch = crate::git::current_branch_ref(&root).expect("current branch");
+
+        let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
+
+        tokio::time::sleep(TokioDuration::from_millis(250)).await;
+        fs::write(root.join("README.md"), "after!\n").expect("rewrite root file");
+
+        let saw_root_event = saw_matching_event(&mut handle, DRAIN_WAIT, |event| {
+            *event == WatchEvent::Worktree
+        })
+        .await;
+        assert!(
+            saw_root_event,
+            "root-level file writes must still emit Worktree with a non-recursive root watch"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1732,8 +1732,23 @@ impl App {
 
 /// Async event loop. See ADR-0003 / ADR-0005.
 pub async fn run() -> Result<()> {
+    use std::io::Write;
+    let log_path = std::env::var("KIZU_STARTUP_TIMING_FILE").ok();
+    let stage = |label: &str, t: Instant| {
+        if let Some(path) = log_path.as_deref()
+            && let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        {
+            let _ = writeln!(f, "[kizu-startup] {label:<28} +{:?}", t.elapsed());
+        }
+    };
+    let t_total = Instant::now();
     let cwd = std::env::current_dir().context("reading current directory")?;
+    stage("current_dir", t_total);
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
+    stage("ratatui::try_init", t_total);
     let result = async {
         // Show something immediately, even before the initial bootstrap
         // `git diff` completes. On large repos this avoids a black screen
@@ -1748,8 +1763,11 @@ pub async fn run() -> Result<()> {
                 );
             })
             .context("ratatui loading draw")?;
+        stage("draw Loading...", t_total);
 
+        let t_bootstrap = Instant::now();
         let mut app = App::bootstrap(cwd)?;
+        stage("App::bootstrap", t_bootstrap);
 
         // Draw one static frame before watcher startup. On macOS the
         // PollWatcher fallback may take noticeable time to arm because it
@@ -1759,12 +1777,17 @@ pub async fn run() -> Result<()> {
         terminal
             .draw(|frame| crate::ui::render(frame, &app))
             .context("ratatui initial draw")?;
+        stage("draw bootstrap snapshot", t_total);
+
+        let t_watcher = Instant::now();
         let mut watch = watcher::start(
             &app.root,
             &app.git_dir,
             &app.common_git_dir,
             app.current_branch_ref.as_deref(),
         )?;
+        stage("watcher::start", t_watcher);
+        stage("total before loop", t_total);
         run_loop(&mut terminal, &mut app, &mut watch).await
     }
     .await;

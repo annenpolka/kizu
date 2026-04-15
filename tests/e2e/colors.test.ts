@@ -13,15 +13,19 @@ afterEach(() => {
 });
 
 /**
- * tuistory's `only: { foreground: ... }` filter matches exact hex
- * strings, but ratatui + crossterm emits plain ANSI 31/32 without
- * tagging them to a specific hex — so the style filter never fires
- * for the basic palette. Unit tests (`render_scroll_lines_carry_
- * added_and_deleted_colors`) already cover the actual colour
- * rendering. These e2e tests pin the **visible text layout** so a
- * break in the diff prefix contract shows up at the black-box level.
+ * ADR-0014: diff rows are painted with a delta-style background
+ * color (`BG_ADDED` / `BG_DELETED`) instead of a literal `+`/`-`
+ * prefix. tuistory's `only: { foreground: ... }` filter matches
+ * exact hex strings and ratatui + crossterm emits plain ANSI for
+ * the standard palette, so the coloured cells don't show up in the
+ * style filter — but we can pin the **text layout contract**:
+ * after the refactor, there MUST NOT be a `+` or `-` prefix right
+ * before the added / deleted body. Rust unit tests
+ * (`render_scroll_lines_use_background_color_for_added_and_deleted`,
+ * `render_scroll_lines_omit_plus_minus_prefix`) cover the actual
+ * Style.bg assertions.
  */
-test("added + and deleted - lines render next to their content", async () => {
+test("diff rows render content without +/- prefix markers", async () => {
   repo = createTempRepo();
   repo.write("src/app.rs", "old content line\n");
   repo.git("add", ".");
@@ -32,11 +36,14 @@ test("added + and deleted - lines render next to their content", async () => {
   await session.waitForText("new content line", { timeout: 10_000 });
 
   const view = await session.text({ trimEnd: true });
-  // Added prefix must sit immediately before the new content.
-  expect(view).toMatch(/\+new content line/);
-  // Deleted prefix must sit immediately before the removed content.
-  expect(view).toMatch(/-old content line/);
-  // Session counts should show 1 added, 1 deleted.
+  // Both lines should be visible as bare body text (no prefix column).
+  expect(view).toContain("new content line");
+  expect(view).toContain("old content line");
+  // And critically, neither must carry a `+`/`-` sign immediately
+  // adjacent to its content — the background colour does that job now.
+  expect(view).not.toMatch(/\+new content line/);
+  expect(view).not.toMatch(/-old content line/);
+  // Session counts in the footer still use `+N` / `-N` formatting.
   expect(view).toContain("+1");
   expect(view).toContain("-1");
 });
