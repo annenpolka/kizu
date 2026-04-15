@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::git::{self, DiffContent, FileDiff};
+use crate::git::{self, DiffContent, FileDiff, LineKind};
 use crate::watcher::{self, WatchEvent};
 
 /// Half-page scroll constant for `Ctrl-d` / `Ctrl-u`. M5+ may swap this for
@@ -46,7 +46,7 @@ pub struct App {
 pub struct ScrollLayout {
     /// Every visible row in order.
     pub rows: Vec<RowKind>,
-    /// `rows` indices that point at a `HunkHeader` — used by `J/K` to jump
+    /// `rows` indices that point at a `HunkHeader` — used by `j/k` to jump
     /// hunk-by-hunk regardless of how many context lines sit in between.
     pub hunk_starts: Vec<usize>,
     /// For each file in `App.files`, the row index of its first hunk header
@@ -56,6 +56,10 @@ pub struct ScrollLayout {
     /// `file_of_row[i]` is the index into `App.files` for whichever file row
     /// `i` belongs to. The footer reads this to display the current file.
     pub file_of_row: Vec<usize>,
+    /// Row indices where a contiguous `+`/`-` block (a "change run") begins.
+    /// `J` / `K` walk this list within the bounds of the current hunk so the
+    /// user can step over edit clusters without counting context lines.
+    pub change_runs: Vec<usize>,
 }
 
 /// One displayable row in the scroll view. The renderer turns each variant
@@ -205,8 +209,9 @@ impl App {
         match key.code {
             // Lowercase + arrows = the *common* case: hunk-by-hunk motion.
             // hunk is kizu's primary unit of attention, so it gets the easy
-            // keys; row-level scroll is reserved for SHIFT-J / SHIFT-K when
-            // you genuinely need to walk a long hunk line by line.
+            // keys. SHIFT-J / SHIFT-K stay inside the current hunk and walk
+            // change run by change run (each contiguous +/- block) so the
+            // user can step over edit clusters without counting context lines.
             KeyCode::Char('j') | KeyCode::Down => {
                 self.next_hunk();
                 self.follow_mode = false;
@@ -216,11 +221,11 @@ impl App {
                 self.follow_mode = false;
             }
             KeyCode::Char('J') => {
-                self.scroll_by(1);
+                self.next_change_in_hunk();
                 self.follow_mode = false;
             }
             KeyCode::Char('K') => {
-                self.scroll_by(-1);
+                self.prev_change_in_hunk();
                 self.follow_mode = false;
             }
             KeyCode::Char('g') => {
@@ -378,6 +383,51 @@ impl App {
         }
     }
 
+    /// `J` — jump to the next change run (`+`/`-` block) inside the current
+    /// hunk. Stays put when the cursor is past the last change of the hunk
+    /// or when scroll is parked on a non-hunk row.
+    pub fn next_change_in_hunk(&mut self) {
+        let Some((file_idx, hunk_idx)) = self.current_hunk() else {
+            return;
+        };
+        if let Some(&row) =
+            self.layout.change_runs.iter().find(|&&row| {
+                row > self.scroll && self.row_belongs_to_hunk(row, file_idx, hunk_idx)
+            })
+        {
+            self.scroll_to(row);
+        }
+    }
+
+    /// `K` — jump to the previous change run inside the current hunk.
+    pub fn prev_change_in_hunk(&mut self) {
+        let Some((file_idx, hunk_idx)) = self.current_hunk() else {
+            return;
+        };
+        if let Some(&row) =
+            self.layout.change_runs.iter().rev().find(|&&row| {
+                row < self.scroll && self.row_belongs_to_hunk(row, file_idx, hunk_idx)
+            })
+        {
+            self.scroll_to(row);
+        }
+    }
+
+    fn row_belongs_to_hunk(&self, row: usize, file_idx: usize, hunk_idx: usize) -> bool {
+        match self.layout.rows.get(row) {
+            Some(RowKind::HunkHeader {
+                file_idx: f,
+                hunk_idx: h,
+            }) => *f == file_idx && *h == hunk_idx,
+            Some(RowKind::DiffLine {
+                file_idx: f,
+                hunk_idx: h,
+                ..
+            }) => *f == file_idx && *h == hunk_idx,
+            _ => false,
+        }
+    }
+
     pub fn jump_to_file_first_hunk(&mut self, file_idx: usize) {
         if let Some(Some(row)) = self.layout.file_first_hunk.get(file_idx).copied() {
             self.scroll_to(row);
@@ -509,6 +559,31 @@ impl App {
                 Some(f)
             })
             .collect();
+
+        // Detect change-run starts: a "change run" is a maximal contiguous
+        // span of `+` / `-` DiffLine rows. The first row of each run gets
+        // pushed into `change_runs`, which `J` / `K` walk inside the
+        // current hunk.
+        let mut prev_was_change = false;
+        for (row_idx, row) in layout.rows.iter().enumerate() {
+            let is_change = match row {
+                RowKind::DiffLine {
+                    file_idx,
+                    hunk_idx,
+                    line_idx,
+                } => match &self.files[*file_idx].content {
+                    DiffContent::Text(hunks) => {
+                        hunks[*hunk_idx].lines[*line_idx].kind != LineKind::Context
+                    }
+                    DiffContent::Binary => false,
+                },
+                _ => false,
+            };
+            if is_change && !prev_was_change {
+                layout.change_runs.push(row_idx);
+            }
+            prev_was_change = is_change;
+        }
 
         self.layout = layout;
     }
@@ -939,23 +1014,119 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_capital_j_scrolls_one_row() {
-        // After M4v.swap, SHIFT-J is the fine-grained row scroll.
+    fn handle_key_capital_j_jumps_to_next_change_run_in_hunk() {
+        // Single hunk with two change runs separated by a context line:
+        //
+        //   context
+        //   +added a   ← first run (1 row)
+        //   context
+        //   +added b   ← second run (1 row)
+        //   context
+        //
+        // SHIFT-J from the hunk header should land on the first change
+        // run; pressing it again should advance to the second.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(
                 1,
                 vec![
-                    diff_line(LineKind::Added, "x"),
-                    diff_line(LineKind::Added, "y"),
+                    diff_line(LineKind::Context, " keep"),
+                    diff_line(LineKind::Added, "alpha"),
+                    diff_line(LineKind::Context, " keep"),
+                    diff_line(LineKind::Added, "beta"),
+                    diff_line(LineKind::Context, " keep"),
                 ],
             )],
             100,
         )]);
-        let start = app.scroll;
+        // Snap to the hunk header row.
+        app.scroll_to(app.layout.hunk_starts[0]);
+
+        assert_eq!(app.layout.change_runs.len(), 2);
+        let first_run = app.layout.change_runs[0];
+        let second_run = app.layout.change_runs[1];
+
         app.handle_key(key(KeyCode::Char('J')));
-        assert_eq!(app.scroll, start + 1);
+        assert_eq!(app.scroll, first_run);
         assert!(!app.follow_mode);
+
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.scroll, second_run);
+
+        // Past the last change run → stay put within the hunk.
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.scroll, second_run);
+    }
+
+    #[test]
+    fn handle_key_capital_k_walks_back_through_change_runs_in_hunk() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Context, " keep"),
+                    diff_line(LineKind::Added, "alpha"),
+                    diff_line(LineKind::Context, " keep"),
+                    diff_line(LineKind::Added, "beta"),
+                    diff_line(LineKind::Context, " keep"),
+                ],
+            )],
+            100,
+        )]);
+        let first_run = app.layout.change_runs[0];
+        let second_run = app.layout.change_runs[1];
+
+        app.scroll_to(second_run);
+        app.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(app.scroll, first_run);
+        // Already at the first change run → stay.
+        app.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(app.scroll, first_run);
+    }
+
+    #[test]
+    fn capital_j_does_not_cross_hunk_boundaries() {
+        // Two hunks, each with one change run. SHIFT-J from inside the
+        // first hunk's run must NOT jump into the second hunk.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "first hunk change")]),
+                hunk(20, vec![diff_line(LineKind::Added, "second hunk change")]),
+            ],
+            100,
+        )]);
+        // hunk 0's only change run.
+        let first = app.layout.change_runs[0];
+        app.scroll_to(first);
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(
+            app.scroll, first,
+            "SHIFT-J must not leak into the next hunk"
+        );
+    }
+
+    #[test]
+    fn change_runs_collapse_consecutive_same_kind_lines_into_one_entry() {
+        // Three contiguous +/- lines should be a single change run, not three.
+        let app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "a"),
+                    diff_line(LineKind::Added, "b"),
+                    diff_line(LineKind::Deleted, "c"),
+                ],
+            )],
+            100,
+        )]);
+        assert_eq!(
+            app.layout.change_runs.len(),
+            1,
+            "expected one change run for an all-contiguous +/- block"
+        );
     }
 
     #[test]
