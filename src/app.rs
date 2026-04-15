@@ -1807,10 +1807,20 @@ async fn run_loop(
         app.tick_anim(Instant::now());
 
         tokio::select! {
-            Some(Ok(event)) = events.next() => {
-                if let Event::Key(key) = event {
-                    let effect = app.handle_key(key);
-                    apply_key_effect(effect, app, watch);
+            event = events.next() => {
+                match event {
+                    Some(Ok(Event::Key(key))) => {
+                        let effect = app.handle_key(key);
+                        apply_key_effect(effect, app, watch);
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        app.last_error = Some(format!("input: {e}"));
+                    }
+                    None => {
+                        app.last_error = Some("input: event stream ended".into());
+                        app.should_quit = true;
+                    }
                 }
             }
             Some(first) = watch.events.recv() => {
