@@ -43,6 +43,17 @@ pub struct App {
     /// The cursor's row index inside `layout.rows`. The renderer derives
     /// the actual viewport top from this + [`Self::cursor_placement`].
     pub scroll: usize,
+    /// Intra-row visual offset of the cursor. **Always 0 in nowrap
+    /// mode.** In wrap mode this is how many visual lines into the
+    /// logical row at `scroll` the cursor has walked via Ctrl-d /
+    /// Ctrl-u / J / K. The cursor's visual y is
+    /// `VisualIndex::visual_y(scroll) + cursor_sub_row`; the
+    /// placement target and the render-time arrow both respect it,
+    /// so Ctrl-d inside a 200-char minified JSON edit is no longer a
+    /// no-op (ADR-0009 fix). Resets to 0 on any hunk jump
+    /// (`scroll_to`, `next_hunk`, `prev_hunk`, `g`, `G`, follow),
+    /// wrap toggle, or layout rebuild.
+    pub cursor_sub_row: usize,
     /// Where the cursor sits visually inside the viewport. Toggled by `z`.
     pub cursor_placement: CursorPlacement,
     /// Path-tracked anchor: which `(path, hunk_old_start)` the user is
@@ -459,6 +470,7 @@ impl App {
             files: Vec::new(),
             layout: ScrollLayout::default(),
             scroll: 0,
+            cursor_sub_row: 0,
             cursor_placement: CursorPlacement::Centered,
             anchor: None,
             picker: None,
@@ -508,6 +520,11 @@ impl App {
     pub fn toggle_wrap_lines(&mut self) {
         self.wrap_lines = !self.wrap_lines;
         self.anim = None;
+        // `cursor_sub_row` is only meaningful under wrap mode; when
+        // we flip the flag, drop any intra-row offset so the cursor
+        // lands cleanly on the row's first visual line under the
+        // new coordinate system.
+        self.cursor_sub_row = 0;
     }
 
     /// Re-run `git diff`, populate per-file mtimes, sort files by mtime
@@ -537,6 +554,11 @@ impl App {
         self.last_error = None;
         self.files = files;
         self.build_layout();
+        // Layout rebuild may shift row counts and wrap geometry, so
+        // any previously-stored intra-row offset is no longer valid.
+        // `refresh_anchor` then repositions the cursor on the same
+        // hunk if possible; the sub-row offset starts fresh there.
+        self.cursor_sub_row = 0;
         self.refresh_anchor();
     }
 
@@ -871,32 +893,77 @@ impl App {
         let last = self.last_row_index();
         let body_width = self.last_body_width.get();
         if body_width.is_none() {
-            // Nowrap fast path: one logical row == one visual row.
+            // Nowrap fast path: one logical row == one visual row,
+            // sub-row is always 0. Delegate to `scroll_to` which
+            // resets `cursor_sub_row` unconditionally.
             let next = (self.scroll as isize + delta).clamp(0, last as isize) as usize;
             self.scroll_to(next);
             return;
         }
-        // Wrap mode: `delta` is interpreted as visual rows so that
-        // Ctrl-d/Ctrl-u (half-page) and any other callers move the
-        // cursor a screenful's worth of *visible* lines instead of
-        // logical rows, which under wrap could otherwise teleport
-        // the cursor across a whole wrapped block per keystroke.
+        // Wrap mode: `delta` is interpreted as **visual rows** and
+        // the cursor's position is the sum of its logical-row visual
+        // y and its intra-row `cursor_sub_row`. ADR-0009 fix: the
+        // previous implementation discarded the intra-row offset
+        // returned by `VisualIndex::logical_at`, so Ctrl-d inside a
+        // single long wrapped line stayed pinned to the same logical
+        // row — `scroll_to(row)` treated the move as a no-op and
+        // the user could never walk through a minified JSON edit.
+        //
+        // The fix routes wrap-mode navigation through `scroll_to_visual`
+        // which preserves the sub-row offset so the visual cursor
+        // genuinely advances.
         let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-        let cur_y = vi.visual_y(self.scroll);
+        let cur_y = vi.visual_y(self.scroll) + self.cursor_sub_row;
         let new_y = (cur_y as isize + delta).max(0) as usize;
         let clamped = new_y.min(vi.total_visual().saturating_sub(1));
-        let (target_row, _) = vi.logical_at(clamped);
-        self.scroll_to(target_row.min(last));
+        let (target_row, target_sub) = vi.logical_at(clamped);
+        self.scroll_to_visual(target_row.min(last), target_sub, &vi);
+    }
+
+    /// Wrap-aware cursor move that preserves an intra-row visual
+    /// offset. Nowrap callers must keep going through [`Self::scroll_to`]
+    /// because they have no `VisualIndex` to clamp against and would
+    /// just set `cursor_sub_row` to 0 anyway.
+    ///
+    /// Behaves like [`Self::scroll_to`] for the row side: starts a
+    /// fresh animation when either the logical row or the sub-row
+    /// actually changes, and updates the anchor. `sub_row` is
+    /// clamped to the target row's visual height so callers can
+    /// pass a speculative value without risking an out-of-range
+    /// cursor.
+    pub(crate) fn scroll_to_visual(&mut self, row: usize, sub_row: usize, vi: &VisualIndex) {
+        let last = self.last_row_index();
+        let target_row = row.min(last);
+        let row_height = vi.visual_height(target_row).max(1);
+        let clamped_sub = sub_row.min(row_height - 1);
+        if (target_row, clamped_sub) != (self.scroll, self.cursor_sub_row) {
+            self.anim = Some(ScrollAnim {
+                from: self.visual_top.get(),
+                start: Instant::now(),
+                dur: SCROLL_ANIM_DURATION,
+            });
+        }
+        self.scroll = target_row;
+        self.cursor_sub_row = clamped_sub;
+        self.update_anchor_from_scroll();
     }
 
     /// Animated scroll: move the cursor row to `row` and kick off a
     /// viewport-top tween from the currently drawn visual position.
     /// No animation is started when `row` is already the cursor row
     /// (a no-op), which keeps idle frames free of needless ticks.
+    ///
+    /// Also resets `cursor_sub_row` to 0 — every caller of
+    /// `scroll_to` is a "jump to a specific row" operation (next
+    /// hunk, previous hunk, g, G, follow restore, picker jump,
+    /// anchor restore) and those should all land on the first
+    /// visual line of the destination logical row. Wrap-mode
+    /// **intra-row** walks go through [`Self::scroll_to_visual`]
+    /// instead.
     pub fn scroll_to(&mut self, row: usize) {
         let last = self.last_row_index();
         let target = row.min(last);
-        if target != self.scroll {
+        if target != self.scroll || self.cursor_sub_row != 0 {
             self.anim = Some(ScrollAnim {
                 from: self.visual_top.get(),
                 start: Instant::now(),
@@ -904,6 +971,7 @@ impl App {
             });
         }
         self.scroll = target;
+        self.cursor_sub_row = 0;
         self.update_anchor_from_scroll();
     }
 
@@ -1011,16 +1079,20 @@ impl App {
             }
         }
 
-        // Long-hunk / non-hunk fallback: place the cursor row itself
-        // at the placement target, measured in visual y.
-        let cursor_y = vi.visual_y(self.scroll);
-        let cursor_h = vi.visual_height(self.scroll);
+        // Long-hunk / non-hunk fallback: place the cursor at the
+        // placement target, measured in visual y. ADR-0009 fix:
+        // include `cursor_sub_row` so intra-row walks through a
+        // wrapped diff line actually move the viewport instead of
+        // parking it at the logical row's first visual line.
+        let cursor_y = vi.visual_y(self.scroll) + self.cursor_sub_row;
         let desired = match self.cursor_placement {
             CursorPlacement::Centered => {
-                // Keep the cursor's first visual row at mid-viewport;
-                // subtract the cursor's own visual height to avoid
-                // clipping tall wrapped lines below the viewport.
-                cursor_y.saturating_sub(viewport_height.saturating_sub(cursor_h) / 2)
+                // Keep the cursor's current visual row at mid-viewport.
+                // `cursor_sub_row` is already the intra-row offset, so
+                // the 1-row cursor height is the right subtraction
+                // here — wrap-continuation lines below the cursor
+                // are drawn by the renderer.
+                cursor_y.saturating_sub(viewport_height.saturating_sub(1) / 2)
             }
             CursorPlacement::Top => cursor_y,
         };
@@ -1087,16 +1159,32 @@ impl App {
             // check.
             let vi = VisualIndex::build(&self.layout, &self.files, body_width);
             let hunk_visual = vi.visual_y(hunk_end).saturating_sub(vi.visual_y(hunk_top));
-            if hunk_visual > viewport && cursor < last_row {
-                // Advance by a visual chunk, then convert back to a
-                // logical row. Clamp to the hunk's last logical row
-                // so the cursor never escapes the current hunk on
-                // what is supposed to be an intra-hunk step.
-                let cur_y = vi.visual_y(cursor);
-                let target_y = cur_y + self.chunk_size();
-                let max_y = vi.visual_y(last_row);
-                let (target_row, _) = vi.logical_at(target_y.min(max_y));
-                self.scroll_to(target_row.min(last_row));
+            // Visual position inside the hunk: logical row y plus
+            // intra-row offset. The cursor can now walk through a
+            // single wrapped diff line (ADR-0009 fix), so we must
+            // compare against the hunk's visual *last line*, not
+            // its last logical row.
+            let cur_y = vi.visual_y(cursor) + self.cursor_sub_row;
+            let hunk_last_y = vi
+                .visual_y(hunk_end)
+                .saturating_sub(1)
+                .max(vi.visual_y(hunk_top));
+            let at_hunk_end = cur_y >= hunk_last_y;
+            if hunk_visual > viewport && !at_hunk_end {
+                // Advance by a visual chunk, clamp to the hunk's
+                // last visual line so the cursor never escapes the
+                // current hunk on an intra-hunk step. `scroll_to_visual`
+                // preserves the resolved sub-row so a walk inside a
+                // long wrapped line actually moves the visible
+                // cursor.
+                let target_y = (cur_y + self.chunk_size()).min(hunk_last_y);
+                let (target_row, target_sub) = vi.logical_at(target_y);
+                let clamped_row = target_row.min(last_row);
+                if body_width.is_some() {
+                    self.scroll_to_visual(clamped_row, target_sub, &vi);
+                } else {
+                    self.scroll_to(clamped_row);
+                }
                 return;
             }
         }
@@ -1111,12 +1199,18 @@ impl App {
         if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
             let vi = VisualIndex::build(&self.layout, &self.files, body_width);
             let hunk_visual = vi.visual_y(hunk_end).saturating_sub(vi.visual_y(hunk_top));
-            if hunk_visual > viewport && cursor > hunk_top {
-                let cur_y = vi.visual_y(cursor);
-                let target_y = cur_y.saturating_sub(self.chunk_size());
-                let min_y = vi.visual_y(hunk_top);
-                let (target_row, _) = vi.logical_at(target_y.max(min_y));
-                self.scroll_to(target_row.max(hunk_top));
+            let cur_y = vi.visual_y(cursor) + self.cursor_sub_row;
+            let hunk_top_y = vi.visual_y(hunk_top);
+            let at_hunk_top = cur_y <= hunk_top_y;
+            if hunk_visual > viewport && !at_hunk_top {
+                let target_y = cur_y.saturating_sub(self.chunk_size()).max(hunk_top_y);
+                let (target_row, target_sub) = vi.logical_at(target_y);
+                let clamped_row = target_row.max(hunk_top);
+                if body_width.is_some() {
+                    self.scroll_to_visual(clamped_row, target_sub, &vi);
+                } else {
+                    self.scroll_to(clamped_row);
+                }
                 return;
             }
         }
@@ -1136,23 +1230,44 @@ impl App {
         }
     }
 
-    /// Row that "follow mode" parks the scroll cursor on: the *last* hunk of
-    /// the *last* file. Files are sorted mtime-ascending, so the last file
-    /// is the most recently touched one and its last hunk is the very
-    /// bottom of the scroll view. Falls back to the absolute last row if
-    /// there is no hunk anywhere.
+    /// Row that "follow mode" parks the scroll cursor on: the **last
+    /// visible content row** of the newest file (files are sorted
+    /// mtime-ascending, so the last file is the most recently touched
+    /// one). Walks `layout.rows` from the end and returns the first
+    /// non-Spacer row whose `file_of_row` matches the newest file.
+    /// This lands on the actual last diff line of the last hunk, the
+    /// place a `tail -f`-style monitor expects to see.
+    ///
+    /// ADR-0009 fix: the previous implementation returned the newest
+    /// hunk's **header** row (`layout.hunk_starts.last()`), which for
+    /// any hunk taller than the viewport pinned follow mode to the
+    /// top of the hunk and hid the newest added / deleted lines. That
+    /// broke the core monitoring contract exactly when large edits
+    /// were landing.
     fn follow_target_row(&self) -> Option<usize> {
         if self.files.is_empty() {
             return None;
         }
-        let file_idx = self.files.len() - 1;
+        let newest = self.files.len() - 1;
+        // Walk from the end of the layout to find the last content
+        // row belonging to the newest file. `file_of_row[i]` carries
+        // the owning file for every row type; Spacer rows are
+        // excluded because they are cosmetic inter-file padding and
+        // do not belong to any file's change set.
+        for (i, &file_idx) in self.layout.file_of_row.iter().enumerate().rev() {
+            if file_idx == newest && !matches!(self.layout.rows.get(i), Some(RowKind::Spacer)) {
+                return Some(i);
+            }
+        }
+        // Fallbacks mirror the legacy behaviour: if the walk above
+        // turns up nothing (file has no diffable content — binary,
+        // empty, …), try the file's first-hunk entry, then the
+        // absolute last row. Either is preferable to returning None.
         self.layout
-            .hunk_starts
-            .iter()
-            .rev()
+            .file_first_hunk
+            .last()
             .copied()
-            .find(|&row| self.layout.file_of_row.get(row).copied() == Some(file_idx))
-            .or_else(|| self.layout.file_first_hunk.last().copied().flatten())
+            .flatten()
             .or_else(|| self.layout.rows.len().checked_sub(1))
     }
 
@@ -1651,6 +1766,7 @@ mod tests {
             files: Vec::new(),
             layout: ScrollLayout::default(),
             scroll: 0,
+            cursor_sub_row: 0,
             cursor_placement: CursorPlacement::Centered,
             anchor: None,
             picker: None,
@@ -1784,11 +1900,17 @@ mod tests {
     }
 
     #[test]
-    fn follow_target_row_is_last_hunk_of_last_file() {
-        // newest.rs has the largest mtime → ends up at the *bottom* of
-        // the ascending-sort layout. Its second hunk is the very last
-        // hunk_starts entry, and the bootstrap follow refresh should
-        // park scroll on it.
+    fn follow_target_row_is_last_diff_row_of_newest_file() {
+        // ADR-0009 fix: follow must park on the **last content row**
+        // of the newest file, not on the newest hunk's header. With
+        // the old behaviour a tall last hunk would pin the viewport
+        // to the top of the hunk and hide the newest added/deleted
+        // lines — the opposite of what `tail -f`-style monitoring
+        // should do.
+        //
+        // newest.rs has the largest mtime → ends up at the bottom of
+        // the mtime-ascending layout. Its second hunk's DiffLine is
+        // the very last row; follow should land there.
         let app = fake_app(vec![
             make_file(
                 "older.rs",
@@ -1804,8 +1926,47 @@ mod tests {
                 300,
             ),
         ]);
-        let last_hunk_row = *app.layout.hunk_starts.last().unwrap();
-        assert_eq!(app.scroll, last_hunk_row);
+        assert!(
+            matches!(app.layout.rows[app.scroll], RowKind::DiffLine { .. }),
+            "follow target must be an actual DiffLine row, got {:?}",
+            app.layout.rows[app.scroll]
+        );
+        // The last DiffLine of the newest file is the target. Trailing
+        // Spacer rows are cosmetic padding and must be skipped by
+        // `follow_target_row`.
+        let newest_idx = app.files.len() - 1;
+        let last_diff_in_newest = app
+            .layout
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, r)| match r {
+                RowKind::DiffLine { file_idx, .. } if *file_idx == newest_idx => Some(i),
+                _ => None,
+            })
+            .expect("newest file must contain at least one DiffLine");
+        assert_eq!(app.scroll, last_diff_in_newest);
+    }
+
+    #[test]
+    fn follow_target_row_reveals_tail_of_tall_last_hunk() {
+        // Regression for Codex round-4 finding: under the old design
+        // a tall final hunk would pin follow to its header row, so
+        // the newest ~hunk_size - viewport lines of the edit were
+        // always off-screen. A 20-line hunk is the minimal reproducer:
+        // follow must park on the 20th DiffLine, not the hunk header.
+        let huge_hunk = hunk(
+            1,
+            (0..20)
+                .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+                .collect(),
+        );
+        let app = fake_app(vec![make_file("big.rs", vec![huge_hunk], 500)]);
+        assert!(matches!(
+            app.layout.rows[app.scroll],
+            RowKind::DiffLine { line_idx: 19, .. }
+        ));
     }
 
     #[test]
@@ -2382,8 +2543,26 @@ mod tests {
         assert!(!app.follow_mode);
         app.handle_key(key(KeyCode::Char('f')));
         assert!(app.follow_mode);
-        // Follow target = last hunk of newest file.
-        assert_eq!(app.scroll, app.layout.hunk_starts[1]);
+        // ADR-0009 fix: follow target = last **DiffLine** of the
+        // newest file's last hunk, not the hunk header. This is the
+        // row that actually shows the newest edit.
+        assert!(matches!(
+            app.layout.rows[app.scroll],
+            RowKind::DiffLine { .. }
+        ));
+        let newest = app.files.len() - 1;
+        let last_diff = app
+            .layout
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, r)| match r {
+                RowKind::DiffLine { file_idx, .. } if *file_idx == newest => Some(i),
+                _ => None,
+            })
+            .expect("newest file has a DiffLine");
+        assert_eq!(app.scroll, last_diff);
     }
 
     #[test]
@@ -3235,12 +3414,89 @@ mod tests {
         // Advance by 3 visual rows. Layout: [FileHeader, HunkHeader,
         // DiffLine(6 visual rows), …]. Visual ys: 0, 1, 2, 3, 4, 5,
         // 6, 7. Visual y = 3 falls inside the DiffLine at logical
-        // row 2, with skip=1. `scroll_by` lands on logical row 2.
+        // row 2, with skip=1. `scroll_by` lands on logical row 2
+        // with `cursor_sub_row = 1` (ADR-0009 fix).
         app.scroll_by(3);
         assert_eq!(
             app.scroll, 2,
             "scroll_by(3) in wrap mode should land on the diff row at visual y 3"
         );
+        assert_eq!(
+            app.cursor_sub_row, 1,
+            "cursor_sub_row must capture the intra-row visual offset"
+        );
+    }
+
+    #[test]
+    fn scroll_by_in_wrap_mode_walks_inside_a_single_long_wrapped_line() {
+        // Regression for Codex round-4 finding #1: on a single
+        // long wrapped diff line (minified JSON / 1-line edit) the
+        // old wrap-mode `scroll_by` discarded the intra-row offset
+        // returned by `VisualIndex::logical_at`, so any target y
+        // landing inside the SAME wrapped logical row resolved to
+        // the same logical row and `scroll_to` became a no-op.
+        // The user could never walk through the wrapped content.
+        //
+        // Setup: one diff line that wraps to 10 visual rows (100
+        // chars at body width 10). Park the cursor on row 2 (the
+        // DiffLine) with cursor_sub_row = 0 and call scroll_by(3).
+        // The logical row must stay 2 but cursor_sub_row must
+        // advance to 3 — visible evidence that the cursor actually
+        // moved.
+        let mut app = wrap_regression_app(10, 10);
+        app.last_body_width.set(Some(10));
+        app.last_body_height.set(6);
+        app.follow_mode = false;
+
+        // Find the diff row and park on its first visual line.
+        let diff_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::DiffLine { .. }))
+            .expect("layout has a DiffLine");
+        app.scroll = diff_row;
+        app.cursor_sub_row = 0;
+
+        // Walk 3 visual rows forward inside the same wrapped line.
+        app.scroll_by(3);
+        assert_eq!(
+            app.scroll, diff_row,
+            "visual walk inside a long wrapped line must stay on the same logical row"
+        );
+        assert_eq!(
+            app.cursor_sub_row, 3,
+            "cursor_sub_row must advance to 3 so the cursor is genuinely moving"
+        );
+
+        // One more walk of 4 → sub_row = 7, still same logical row.
+        app.scroll_by(4);
+        assert_eq!(app.scroll, diff_row);
+        assert_eq!(app.cursor_sub_row, 7);
+    }
+
+    #[test]
+    fn scroll_to_always_resets_cursor_sub_row() {
+        // Every jump-to-row operation (next_hunk, prev_hunk, g, G,
+        // follow) funnels through `scroll_to`, which must land on
+        // the destination row's first visual line. The sub-row
+        // offset only makes sense for in-place wrap walks.
+        let mut app = wrap_regression_app(10, 10);
+        app.last_body_width.set(Some(10));
+        app.cursor_sub_row = 5;
+        app.scroll_to(0);
+        assert_eq!(app.cursor_sub_row, 0);
+    }
+
+    #[test]
+    fn toggle_wrap_lines_resets_cursor_sub_row() {
+        // Wrap toggle changes the coordinate system entirely — any
+        // intra-row offset captured under the old mode has no
+        // meaning under the new one. Drop it to land cleanly.
+        let mut app = wrap_regression_app(10, 10);
+        app.cursor_sub_row = 4;
+        app.toggle_wrap_lines();
+        assert_eq!(app.cursor_sub_row, 0);
     }
 
     // ---- watcher health decoupling (ADR-0008) ------------------------

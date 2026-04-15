@@ -69,22 +69,69 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         None
     };
 
-    // Provisional body height (before sticky decision). We re-compute
-    // placement with the *real* body height further down so the sticky
-    // overlay never makes the cursor jitter.
+    // Sticky header decision (ADR-0009 fix):
+    //
+    // The previous implementation computed a `provisional_top` with
+    // the *full* area height, decided stickiness from it, and only
+    // then shrank the body by one row if sticky was on. The
+    // recomputed placement against the smaller body could produce a
+    // different `top` than the provisional one — especially in
+    // long-hunk / wrap cases where the target y is viewport-height
+    // dependent — so the sticky decision was occasionally based on
+    // a viewport the renderer was not actually going to draw. The
+    // result was a disappearing hunk header at a boundary.
+    //
+    // The new algorithm pessimistically peeks at what the sticky
+    // case would look like (body = raw - 1). If the enclosing
+    // hunk's header row is above that reduced-body top, sticky is
+    // warranted and we render with body = raw - 1. Otherwise sticky
+    // is off and we render with the full body. Either branch ends
+    // with exactly one "final" `viewport_placement` call whose
+    // side-effect (setting `visual_top` for the animation state) is
+    // authoritative. Peek calls that happen during the decision are
+    // harmless because the final call overwrites `visual_top`.
     let raw_body_height = area.height as usize;
-    let (provisional_top, _provisional_skip) =
-        app.viewport_placement(raw_body_height, wrap_body_width, now);
-
-    // Sticky header: cursor is inside a hunk whose header sits above
-    // the visible viewport top.
-    let sticky = selected.and_then(|(file_idx, hunk_idx)| {
+    let candidate_header = selected.and_then(|(file_idx, hunk_idx)| {
         find_hunk_header_row(&app.layout.rows, file_idx, hunk_idx)
-            .filter(|&row| row < provisional_top)
-            .map(|_| (file_idx, hunk_idx))
+            .map(|row| (row, file_idx, hunk_idx))
     });
 
-    let (header_area, content_area) = if sticky.is_some() && area.height > 1 {
+    let (sticky, body_height, viewport_top, skip_visual) = match candidate_header {
+        Some((header_row, file_idx, hunk_idx)) if raw_body_height > 1 => {
+            // Peek: what would the viewport look like with one row
+            // reserved for the sticky banner? If the header would
+            // still sit above this peeked top, sticky wins and
+            // we commit to the reduced body.
+            let reduced = raw_body_height - 1;
+            let (top_reduced, skip_reduced) = app.viewport_placement(reduced, wrap_body_width, now);
+            if header_row < top_reduced {
+                (
+                    Some((file_idx, hunk_idx)),
+                    reduced,
+                    top_reduced,
+                    skip_reduced,
+                )
+            } else {
+                // Not worth stealing a row: the header fits in the
+                // full-body viewport. Commit to the full body via a
+                // fresh placement call so `visual_top` reflects the
+                // version we actually render.
+                let (top_full, skip_full) =
+                    app.viewport_placement(raw_body_height, wrap_body_width, now);
+                (None, raw_body_height, top_full, skip_full)
+            }
+        }
+        _ => {
+            // Either no enclosing hunk to sticky-pin, or the
+            // viewport is too small to spare a row for a banner —
+            // render with the full body.
+            let (top_full, skip_full) =
+                app.viewport_placement(raw_body_height, wrap_body_width, now);
+            (None, raw_body_height, top_full, skip_full)
+        }
+    };
+
+    let (header_area, content_area) = if sticky.is_some() {
         let header = Rect {
             x: area.x,
             y: area.y,
@@ -102,13 +149,12 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         (None, area)
     };
 
-    let viewport_height = content_area.height as usize;
+    let viewport_height = body_height;
     // Tell the App layer how tall/wide the body actually was so the
     // next `J`/`K` / Ctrl-d press can size its scroll chunk relative
     // to the current screen dimensions.
     app.last_body_height.set(viewport_height);
     app.last_body_width.set(wrap_body_width);
-    let (viewport_top, skip_visual) = app.viewport_placement(viewport_height, wrap_body_width, now);
 
     // Walk logical rows from `viewport_top` and accumulate visual
     // lines until we've filled the viewport or run out of rows.
@@ -119,12 +165,19 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut row_idx = viewport_top;
     let mut skip_remaining = skip_visual;
     while row_idx < total_rows && lines.len() < viewport_height {
-        let is_cursor = row_idx == cursor_row;
+        // The cursor row gets `Some(sub)` so wrap-mode rendering
+        // can position the arrow on the correct visual sub-row;
+        // every other row gets `None` which is "no arrow here".
+        let cursor_sub = if row_idx == cursor_row {
+            Some(app.cursor_sub_row)
+        } else {
+            None
+        };
         let row_lines = render_row(
             &app.layout.rows[row_idx],
             &app.files,
             selected,
-            is_cursor,
+            cursor_sub,
             wrap_body_width,
         );
         let mut take = row_lines.into_iter();
@@ -190,15 +243,17 @@ fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> O
 /// `selected_hunk` identifies the (file_idx, hunk_idx) the cursor is
 /// currently inside; rows belonging to that hunk render at full
 /// saturation, all other hunk rows render with `Modifier::DIM`.
-/// `is_cursor` is `true` for the logical row that `app.scroll` points
-/// at — in wrap mode the cursor arrow appears on the first visual
-/// row of that logical row, the rest keep the normal selected
-/// ribbon.
+/// `cursor_sub` is `Some(n)` for the logical row the cursor is on:
+/// `n` is the visual sub-row index (0 for the first visual row of a
+/// wrapped block, larger values when the user has walked into the
+/// middle of a long wrapped line via Ctrl-d / J). The arrow marker
+/// lands on that visual sub-row instead of always on the first
+/// (ADR-0009 fix). `None` for non-cursor rows.
 fn render_row(
     row: &RowKind,
     files: &[FileDiff],
     selected_hunk: Option<(usize, usize)>,
-    is_cursor: bool,
+    cursor_sub: Option<usize>,
     wrap_body_width: Option<usize>,
 ) -> Vec<Line<'static>> {
     match row {
@@ -222,8 +277,9 @@ fn render_row(
             };
             let is_selected = selected_hunk == Some((*file_idx, *hunk_idx));
             let line = &hunks[*hunk_idx].lines[*line_idx];
+            let is_cursor = cursor_sub.is_some();
             match wrap_body_width {
-                Some(width) => render_diff_line_wrapped(line, is_selected, is_cursor, width),
+                Some(width) => render_diff_line_wrapped(line, is_selected, cursor_sub, width),
                 None => vec![render_diff_line(line, is_selected, is_cursor)],
             }
         }
@@ -272,7 +328,7 @@ fn wrap_at_chars(content: &str, width: usize) -> Vec<&str> {
 fn render_diff_line_wrapped(
     line: &crate::git::DiffLine,
     is_selected: bool,
-    is_cursor: bool,
+    cursor_sub: Option<usize>,
     body_width: usize,
 ) -> Vec<Line<'static>> {
     let (prefix_char, color) = match line.kind {
@@ -307,7 +363,14 @@ fn render_diff_line_wrapped(
         .map(|(i, chunk)| {
             let is_first = i == 0;
             let is_last = i == last_idx;
-            let bar = if is_cursor && is_first {
+            // ADR-0009: the cursor arrow lands on the visual sub-row
+            // the user has actually walked to via Ctrl-d / J inside
+            // a long wrapped line, not always on the first visual
+            // row. If `cursor_sub` is larger than the available
+            // visual rows (e.g. after a clamped move), fall back to
+            // the last visual row so the marker never disappears.
+            let cursor_line = cursor_sub.map(|s| s.min(last_idx));
+            let bar = if cursor_line == Some(i) {
                 Span::styled(
                     "  ▶  ",
                     Style::default()
@@ -782,6 +845,7 @@ mod tests {
             files: Vec::new(),
             layout: ScrollLayout::default(),
             scroll: 0,
+            cursor_sub_row: 0,
             cursor_placement: crate::app::CursorPlacement::Centered,
             anchor: None,
             picker: None,
@@ -1367,6 +1431,63 @@ mod tests {
         // the first body row, which is y=1 (right below the sticky
         // header).
         assert_eq!(y, 1, "expected cursor at viewport ceiling, was at row {y}");
+    }
+
+    #[test]
+    fn sticky_header_decision_agrees_with_final_body_height() {
+        // Regression for Codex round-4 finding #3: the previous
+        // decision flow computed a provisional top with the full
+        // area height, decided stickiness from it, and only then
+        // shrank the body for the sticky banner. At the boundary
+        // where `header_row == provisional_top`, a placement
+        // recomputed against the (unused) reduced body would have
+        // moved the top down by one row, but the sticky decision
+        // had already been made with the stale top → the header
+        // disappeared.
+        //
+        // The new flow pessimistically peeks at the reduced body
+        // FIRST. If the header would fall off that peeked top,
+        // sticky kicks in and the render uses the same reduced
+        // body. Otherwise render uses the full body. The two are
+        // now self-consistent.
+        //
+        // We exercise the boundary by positioning the cursor so
+        // that the full-body placement puts the header JUST at the
+        // top (not sticky-worthy) but any reduction would push it
+        // off. A 20-line hunk with a tight viewport hits this.
+        let lines: Vec<DiffLine> = (0..20)
+            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+            .collect();
+        let mut app = populated_app(vec![make_file_with_context(
+            "src/foo.rs",
+            "fn boundary() {",
+            lines,
+            100,
+        )]);
+        // Jump into the middle of the hunk so any sticky reservation
+        // would definitely push the header off-screen.
+        let header_row = app.layout.hunk_starts[0];
+        app.scroll_to(header_row + 5);
+        app.anim = None;
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        // Pin: whichever branch the new decision flow picks, row 0
+        // must either be the sticky header (contains `boundary`) OR
+        // be the actual hunk header / a row on or after header_row
+        // but never a row from later in the hunk with the header
+        // silently dropped.
+        let mut row0 = String::new();
+        for x in 0..buffer.area().width {
+            row0.push_str(buffer[(x, 0)].symbol());
+        }
+        assert!(
+            row0.contains("boundary") || row0.contains("@@"),
+            "row 0 must show the hunk header (sticky or inline), got:\n{row0}"
+        );
     }
 
     #[test]
