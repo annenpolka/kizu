@@ -173,6 +173,127 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// Extract the post-image pathname from the remainder of a
+/// `diff --git <rest>` header line.
+///
+/// `rest` has one of two shapes, both of which must be handled:
+///   - unquoted: `a/<path> b/<path>`
+///   - quoted:   `"a/<c-escaped-path>" "b/<c-escaped-path>"`
+///
+/// Since kizu passes `--no-renames` to every `git diff`, the pre- and
+/// post-image paths are guaranteed to be byte-identical. The unquoted
+/// branch leans on that invariant to split `rest` at its exact midpoint
+/// instead of searching for ` b/`, which is ambiguous for a filename
+/// whose bytes contain the literal sequence ` b/` (e.g. `foo b/bar`).
+/// Returns `None` if neither shape parses cleanly — the caller then
+/// falls back to `PathBuf::default()` and the subsequent file gets
+/// empty-path'd, which is the pre-fix behavior for unrecognized
+/// headers and is still visible as a bug but no longer the only
+/// outcome for legal git output.
+fn parse_diff_git_header(rest: &str) -> Option<PathBuf> {
+    let bytes = rest.as_bytes();
+
+    if bytes.starts_with(b"\"a/") {
+        // Quoted form: parse both tokens through C-unescape. Under
+        // `--no-renames` both halves decode to the same bytes, but we
+        // still walk both so a malformed header (unclosed quote,
+        // unknown escape, missing space) fails safely.
+        let (_a_decoded, after_a) = parse_quoted_token(bytes)?;
+        let after_space = after_a.strip_prefix(b" ")?;
+        let (b_decoded, _tail) = parse_quoted_token(after_space)?;
+        if !b_decoded.starts_with(b"b/") {
+            return None;
+        }
+        return Some(bytes_to_path(&b_decoded[2..]));
+    }
+
+    // Unquoted form. Exploit the `--no-renames` symmetry:
+    //   rest = "a/" ++ path ++ " b/" ++ path
+    //        = 2 + p + 3 + p bytes, so p = (len - 5) / 2.
+    let len = bytes.len();
+    if len < 5 + 2 {
+        return None;
+    }
+    let inner = len.checked_sub(5)?;
+    if !inner.is_multiple_of(2) {
+        return None;
+    }
+    let p = inner / 2;
+    if !bytes.starts_with(b"a/") {
+        return None;
+    }
+    let a_side = &bytes[2..2 + p];
+    // `b_prefix_start` is where the " b/" separator begins.
+    let b_prefix_start = 2 + p;
+    if bytes.get(b_prefix_start..b_prefix_start + 3) != Some(b" b/") {
+        return None;
+    }
+    let b_side = &bytes[b_prefix_start + 3..];
+    if a_side != b_side {
+        return None;
+    }
+    Some(bytes_to_path(a_side))
+}
+
+/// Parse a git C-style quoted token starting at the first byte of
+/// `bytes`, returning the decoded payload and the tail after the
+/// closing quote. Git's quoting rules (see `quote.c::quote_c_style`)
+/// cover the usual `\a \b \t \n \v \f \r \\ \"` single-char escapes
+/// plus 3-digit octal escapes `\NNN` for any other non-printable or
+/// non-ASCII byte. An unknown escape or missing closing quote yields
+/// `None` so the parent parser can fall back cleanly instead of
+/// silently dropping the filename.
+fn parse_quoted_token(bytes: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 1;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' {
+            return Some((out, &bytes[i + 1..]));
+        }
+        if c == b'\\' {
+            let n = *bytes.get(i + 1)?;
+            match n {
+                b'a' => out.push(0x07),
+                b'b' => out.push(0x08),
+                b't' => out.push(b'\t'),
+                b'n' => out.push(b'\n'),
+                b'v' => out.push(0x0b),
+                b'f' => out.push(0x0c),
+                b'r' => out.push(b'\r'),
+                b'"' => out.push(b'"'),
+                b'\\' => out.push(b'\\'),
+                d if (b'0'..=b'7').contains(&d) => {
+                    // 3-digit octal. Git always emits exactly three
+                    // digits for the fallback form so we require it
+                    // here rather than trying to be lenient.
+                    let end = i + 4;
+                    if end > bytes.len() {
+                        return None;
+                    }
+                    let octal = std::str::from_utf8(&bytes[i + 1..end]).ok()?;
+                    if octal.len() != 3 || !octal.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+                        return None;
+                    }
+                    let byte = u8::from_str_radix(octal, 8).ok()?;
+                    out.push(byte);
+                    i += 4;
+                    continue;
+                }
+                _ => return None,
+            }
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    None
+}
+
 /// Build a synthetic [`FileDiff`] for an untracked file, treating every line
 /// as an added line. Reads at most [`UNTRACKED_READ_CAP`] bytes; binary files
 /// (NUL byte detected in the read window) are returned as
@@ -229,8 +350,22 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
     })
 }
 
-/// Capture the current HEAD sha. Falls back to `EMPTY_TREE_SHA` in a fresh repo
-/// (i.e. one with no commits yet). See ADR notes / Decision Log for rationale.
+/// Capture the current HEAD sha. Falls back to `EMPTY_TREE_SHA` **only**
+/// when the repository has no commits at all (`git rev-list --all`
+/// reaches nothing). Any other `git rev-parse HEAD` failure —
+/// corrupted refs, HEAD pointing to a missing branch, permission
+/// problems, a deleted `.git` directory — is surfaced as an error
+/// instead of being silently rendered as "everything is newly added".
+///
+/// Why the secondary check: `rev-parse HEAD` returns the same exit
+/// code for both "unborn repo" and "HEAD points at a non-existent
+/// ref", and the previous implementation lumped them together. A
+/// corrupt repository would appear as an empty-tree baseline, hiding
+/// the real failure from the user and encouraging them to trust a
+/// bogus "all added" diff. Calling `rev-list --all --max-count=1`
+/// disambiguates: unborn repos still succeed but emit zero SHAs,
+/// while broken repos either still have commits reachable from some
+/// ref (non-empty output) or fail outright.
 pub fn head_sha(root: &Path) -> Result<String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -238,16 +373,37 @@ pub fn head_sha(root: &Path) -> Result<String> {
         .output()
         .context("failed to spawn `git rev-parse HEAD`")?;
 
-    if !output.status.success() {
-        // Most common reason: the repository has no commits yet.
-        // Fall back to the canonical empty-tree SHA so downstream code can
-        // treat every worktree file as an addition without special-casing.
-        return Ok(EMPTY_TREE_SHA.to_string());
+    if output.status.success() {
+        let sha = String::from_utf8(output.stdout)
+            .context("`git rev-parse HEAD` produced non-UTF8 output")?;
+        return Ok(sha.trim().to_string());
     }
 
-    let sha = String::from_utf8(output.stdout)
-        .context("`git rev-parse HEAD` produced non-UTF8 output")?;
-    Ok(sha.trim().to_string())
+    if repo_has_any_commit(root)? {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("`git rev-parse HEAD` failed: {}", stderr.trim()));
+    }
+
+    Ok(EMPTY_TREE_SHA.to_string())
+}
+
+/// Return `true` if any ref in the repository resolves to at least
+/// one commit. Used by [`head_sha`] to tell a genuinely unborn repo
+/// apart from a broken one. If the probe itself fails (e.g. a deeper
+/// git failure), we conservatively report "has commits" so the caller
+/// surfaces the original `rev-parse HEAD` error instead of falling
+/// back to the empty-tree SHA.
+fn repo_has_any_commit(root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["rev-list", "--all", "--max-count=1"])
+        .current_dir(root)
+        .output()
+        .context("failed to spawn `git rev-list --all`")?;
+    if !output.status.success() {
+        return Ok(true);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(!stdout.trim().is_empty())
 }
 
 /// Resolve the absolute git directory (works for normal and linked worktrees).
@@ -362,11 +518,18 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             // New file — flush the previous one first.
             finish_file(&mut files, &mut current_hunks, &mut current_hunk);
 
-            // `rest` looks like `a/foo.rs b/foo.rs`; pull the b-side path.
-            let path = rest
-                .split_once(" b/")
-                .map(|(_, b)| PathBuf::from(b))
-                .unwrap_or_default();
+            // `rest` has one of two shapes:
+            //   - unquoted: `a/<path> b/<path>`
+            //   - quoted:   `"a/<escaped-path>" "b/<escaped-path>"`
+            //     (git emits this when the path contains a quote,
+            //     backslash, control character, or — with default
+            //     core.quotePath — any non-ASCII byte.)
+            // Splitting on ` b/` falls over in the quoted form *and*
+            // in the edge case where the filename itself contains
+            // ` b/`; use a format-aware helper that leans on the
+            // `--no-renames` invariant that both sides name the same
+            // file. See ADR-0001.
+            let path = parse_diff_git_header(rest).unwrap_or_default();
             files.push(FileDiff {
                 path,
                 status: FileStatus::Modified,
@@ -710,6 +873,78 @@ index 1111111..0000000
     }
 
     #[test]
+    fn parse_unified_diff_decodes_c_quoted_tracked_pathname() {
+        // Regression for the adversarial finding: the old path
+        // extraction used `split_once(" b/")` with a
+        // `PathBuf::default()` fallback, so a quoted header like
+        // `"a/\t.txt" "b/\t.txt"` collapsed to an empty path. Every
+        // quoted file then merged under the same empty path, breaking
+        // file grouping and follow mode in the diff view.
+        //
+        // The new parser must C-unescape the quoted token and yield
+        // the real filename (here: a single TAB byte followed by
+        // `.txt`).
+        let raw = "\
+diff --git \"a/\\t.txt\" \"b/\\t.txt\"
+index 1111111..2222222 100644
+--- \"a/\\t.txt\"
++++ \"b/\\t.txt\"
+@@ -1,1 +1,2 @@
+ line
++added
+";
+        let files = parse_unified_diff(raw);
+        assert_eq!(files.len(), 1, "expected one file, got {files:?}");
+        assert_eq!(files[0].path, PathBuf::from("\t.txt"));
+        assert_eq!(files[0].added, 1);
+    }
+
+    #[test]
+    fn parse_unified_diff_decodes_c_quoted_octal_escape_in_path() {
+        // Git's fallback for non-ASCII / non-printable bytes is a
+        // 3-digit octal escape like `\303\244` (UTF-8 for `ä`). The
+        // parser must accept the octal form and reconstruct the
+        // original bytes — otherwise core.quotePath=true repos
+        // (the default) silently lose non-ASCII filenames.
+        let raw = "\
+diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"
+index 1111111..2222222 100644
+--- \"a/caf\\303\\251.txt\"
++++ \"b/caf\\303\\251.txt\"
+@@ -1,1 +1,2 @@
+ one
++two
+";
+        let files = parse_unified_diff(raw);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("café.txt"));
+        assert_eq!(files[0].added, 1);
+    }
+
+    #[test]
+    fn parse_unified_diff_handles_unquoted_path_containing_literal_b_slash() {
+        // Adversarial edge case: a filename whose bytes contain the
+        // literal sequence ` b/` (space + b + slash). A naive
+        // `split_once(" b/")` would split the header at the first
+        // occurrence inside the filename, returning a truncated path.
+        // The length-based parser exploits the `--no-renames`
+        // symmetry (`a/<P> b/<P>`) to slice at the true midpoint.
+        let raw = "\
+diff --git a/foo b/bar b/foo b/bar
+index 1111111..2222222 100644
+--- a/foo b/bar
++++ b/foo b/bar
+@@ -1,1 +1,2 @@
+ x
++y
+";
+        let files = parse_unified_diff(raw);
+        assert_eq!(files.len(), 1, "expected one file, got {files:?}");
+        assert_eq!(files[0].path, PathBuf::from("foo b/bar"));
+        assert_eq!(files[0].added, 1);
+    }
+
+    #[test]
     fn find_root_returns_worktree_root() {
         let repo = init_repo();
         let root = find_root(repo.path()).expect("find_root");
@@ -730,6 +965,43 @@ index 1111111..0000000
         // No commits yet — should fall back to the empty tree SHA.
         let sha = head_sha(repo.path()).expect("head_sha");
         assert_eq!(sha, EMPTY_TREE_SHA);
+    }
+
+    #[test]
+    fn head_sha_surfaces_broken_head_when_repo_has_commits() {
+        // Regression for the adversarial finding: the old head_sha
+        // returned EMPTY_TREE_SHA for every `git rev-parse HEAD`
+        // failure, so a repository whose HEAD pointed at a
+        // non-existent ref would render as "everything added" and
+        // hide the real breakage from the user. The narrowed
+        // fallback must only fire when the repo is genuinely unborn.
+        //
+        // Setup: commit one file so `refs/heads/main` exists, then
+        // reseat HEAD to a symbolic ref that has never been written.
+        // `rev-parse HEAD` will fail (unknown ref) but `rev-list
+        // --all` still finds the real commit via `refs/heads/main`,
+        // so this is NOT an unborn repo.
+        let repo = init_repo();
+        fs::write(repo.path().join("seed.txt"), "seed").expect("write seed");
+        run_git(repo.path(), &["add", "seed.txt"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "initial"]);
+        run_git(
+            repo.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/never-existed"],
+        );
+
+        let result = head_sha(repo.path());
+        let err = match result {
+            Ok(sha) => {
+                panic!("broken HEAD must surface an error; got empty-tree fallback sha {sha}")
+            }
+            Err(e) => e,
+        };
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("git rev-parse HEAD"),
+            "error chain should identify the failing command, got: {chain}"
+        );
     }
 
     #[test]

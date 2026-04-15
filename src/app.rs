@@ -328,15 +328,42 @@ impl App {
     }
 
     /// Re-capture HEAD as the new baseline (R key).
+    ///
+    /// The reset is transactional: the new `baseline_sha` and the
+    /// cleared `head_dirty` flag are only committed **after** the
+    /// fresh `git diff` against that new baseline succeeds. If either
+    /// `head_sha` or `compute_diff` fails, every piece of visible
+    /// state is preserved so the user keeps looking at the same diff
+    /// with the `HEAD*` warning still present, rather than a stale
+    /// snapshot under a silently-advanced baseline.
     pub fn reset_baseline(&mut self) {
-        match git::head_sha(&self.root) {
-            Ok(sha) => {
-                self.baseline_sha = sha;
+        let new_sha = match git::head_sha(&self.root) {
+            Ok(sha) => sha,
+            Err(e) => {
+                self.last_error = Some(format!("R: {e:#}"));
+                return;
+            }
+        };
+        let diff = git::compute_diff(&self.root, &new_sha);
+        self.apply_reset(new_sha, diff);
+    }
+
+    /// Commit a freshly-resolved baseline + diff into the app. Split
+    /// out from [`Self::reset_baseline`] so tests can inject a failing
+    /// diff without touching the filesystem and verify that the old
+    /// baseline, `head_dirty`, and `files` snapshot all survive.
+    pub(crate) fn apply_reset(&mut self, new_sha: String, diff: Result<Vec<FileDiff>>) {
+        match diff {
+            Ok(files) => {
+                self.baseline_sha = new_sha;
                 self.head_dirty = false;
-                self.recompute_diff();
+                self.apply_computed_files(files);
             }
             Err(e) => {
                 self.last_error = Some(format!("R: {e:#}"));
+                // baseline_sha / head_dirty / files intentionally
+                // untouched: the HEAD* warning stays visible and the
+                // user keeps seeing the same diff they had before R.
             }
         }
     }
@@ -2044,6 +2071,101 @@ mod tests {
             app.current_file_path(),
             Some(Path::new("gone.rs")),
             "follow mode must keep the deletion on screen"
+        );
+    }
+
+    #[test]
+    fn apply_reset_preserves_old_state_when_diff_fails() {
+        // Regression for the adversarial finding on `reset_baseline`:
+        // the old implementation assigned `baseline_sha` and cleared
+        // `head_dirty` BEFORE running `git diff`, so a transient diff
+        // failure left the user staring at a stale `files` snapshot
+        // under a silently-advanced baseline with no `HEAD*` warning
+        // to signal that the reset never actually landed.
+        //
+        // `apply_reset` now takes the diff `Result` directly so we
+        // can exercise the failure path without touching the
+        // filesystem. Every piece of baseline-adjacent state must
+        // survive a failed reset unchanged.
+        let mut app = fake_app(vec![
+            make_file(
+                "older.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "keep me")])],
+                100,
+            ),
+            make_file(
+                "newer.rs",
+                vec![hunk(2, vec![diff_line(LineKind::Added, "also keep")])],
+                200,
+            ),
+        ]);
+        let old_sha = app.baseline_sha.clone();
+        let old_files = app.files.clone();
+        app.head_dirty = true;
+
+        app.apply_reset(
+            "feedfacefeedfacefeedfacefeedfacefeedface".into(),
+            Err(anyhow::anyhow!("simulated git diff failure")),
+        );
+
+        assert_eq!(
+            app.baseline_sha, old_sha,
+            "baseline_sha must not advance when the post-reset diff fails"
+        );
+        assert!(
+            app.head_dirty,
+            "head_dirty must survive a failed reset so the HEAD* warning stays visible"
+        );
+        assert_eq!(
+            app.files, old_files,
+            "files snapshot must be preserved when the post-reset diff fails"
+        );
+        let err = app
+            .last_error
+            .as_deref()
+            .expect("failed reset must record last_error");
+        assert!(
+            err.starts_with("R:"),
+            "last_error must carry the `R:` prefix so the footer identifies the source: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_reset_commits_new_baseline_when_diff_succeeds() {
+        // Dual of the above: the happy path must still swap the
+        // baseline, clear head_dirty, and install the new file set so
+        // a successful reset is visibly a reset and not a no-op.
+        let mut app = fake_app(vec![make_file(
+            "old.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "stale")])],
+            100,
+        )]);
+        app.head_dirty = true;
+        app.last_error = Some("stale error".into());
+
+        let new_file = FileDiff {
+            path: PathBuf::from("fresh.rs"),
+            status: FileStatus::Modified,
+            added: 1,
+            deleted: 0,
+            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "fresh")])]),
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(500),
+        };
+        let new_sha = "feedfacefeedfacefeedfacefeedfacefeedface".to_string();
+        app.apply_reset(new_sha.clone(), Ok(vec![new_file]));
+
+        assert_eq!(app.baseline_sha, new_sha);
+        assert!(!app.head_dirty, "successful reset must clear head_dirty");
+        assert!(
+            app.last_error.is_none(),
+            "successful reset must clear prior last_error"
+        );
+        assert_eq!(
+            app.files
+                .iter()
+                .map(|f| f.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("fresh.rs")]
         );
     }
 
