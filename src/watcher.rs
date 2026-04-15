@@ -24,11 +24,31 @@ type KizuWatcher = PollWatcher;
 type KizuWatcher = RecommendedWatcher;
 type KizuDebouncer = Debouncer<KizuWatcher, RecommendedCache>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WatchSource {
+    Worktree,
+    GitPerWorktreeHead,
+    GitRefs,
+    GitCommonRoot,
+}
+
+impl WatchSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            WatchSource::Worktree => "worktree",
+            WatchSource::GitPerWorktreeHead => "git.head",
+            WatchSource::GitRefs => "git.refs",
+            WatchSource::GitCommonRoot => "git.root",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WatchRoot {
     path: PathBuf,
     recursive_mode: RecursiveMode,
     compare_contents: bool,
+    source: WatchSource,
 }
 
 /// A coarse classification of file system activity that the app loop cares
@@ -46,11 +66,14 @@ struct WatchRoot {
 pub enum WatchEvent {
     /// Something inside the worktree (excluding `<git_dir>`) changed.
     Worktree,
-    /// Something inside `<git_dir>` changed (HEAD, refs, packed refs, …).
-    GitHead,
+    /// Something baseline-affecting inside `<git_dir>` changed.
+    GitHead(WatchSource),
     /// The underlying notify backend reported an error. The app
     /// treats this as a forced recompute plus a visible error string.
-    Error(String),
+    Error {
+        source: WatchSource,
+        message: String,
+    },
 }
 
 /// Owns the running notify debouncers and exposes a tokio receiver that the
@@ -244,8 +267,11 @@ fn spawn_worktree_debouncer(
                     // watch target, kqueue overflow, …) so the app
                     // layer can flip the footer to red and force a
                     // recompute instead of silently drifting stale.
-                    let msg = format_notify_errors("worktree", &errors);
-                    let _ = tx.send(WatchEvent::Error(msg));
+                    let message = format_notify_errors(WatchSource::Worktree, &errors);
+                    let _ = tx.send(WatchEvent::Error {
+                        source: WatchSource::Worktree,
+                        message,
+                    });
                     return;
                 }
             };
@@ -274,6 +300,7 @@ fn git_state_watch_roots(git_dir: &Path, common_git_dir: &Path) -> Vec<WatchRoot
             path: git_dir.join("HEAD"),
             recursive_mode: RecursiveMode::NonRecursive,
             compare_contents: true,
+            source: WatchSource::GitPerWorktreeHead,
         },
         // Branch refs live under the shared `refs/` tree. Watching only
         // this subtree keeps the poll fallback off `.git/objects/**`
@@ -282,6 +309,7 @@ fn git_state_watch_roots(git_dir: &Path, common_git_dir: &Path) -> Vec<WatchRoot
             path: common_git_dir.join("refs"),
             recursive_mode: RecursiveMode::Recursive,
             compare_contents: true,
+            source: WatchSource::GitRefs,
         },
         // Watch the common git-dir root non-recursively so `packed-refs`
         // is covered whether it exists at startup or is created later.
@@ -291,6 +319,7 @@ fn git_state_watch_roots(git_dir: &Path, common_git_dir: &Path) -> Vec<WatchRoot
             path: common_git_dir.to_path_buf(),
             recursive_mode: RecursiveMode::NonRecursive,
             compare_contents: true,
+            source: WatchSource::GitCommonRoot,
         },
     ]
 }
@@ -300,15 +329,17 @@ fn spawn_git_state_debouncer(
     matcher: SharedMatcher,
     tx: UnboundedSender<WatchEvent>,
 ) -> Result<KizuDebouncer> {
+    let source = watch_root.source;
+    let compare_contents = watch_root.compare_contents;
     let mut debouncer = new_kizu_debouncer(
         HEAD_DEBOUNCE,
-        watch_root.compare_contents,
+        compare_contents,
         move |result: DebounceEventResult| {
             let events = match result {
                 Ok(events) => events,
                 Err(errors) => {
-                    let msg = format_notify_errors("git_dir", &errors);
-                    let _ = tx.send(WatchEvent::Error(msg));
+                    let message = format_notify_errors(source, &errors);
+                    let _ = tx.send(WatchEvent::Error { source, message });
                     return;
                 }
             };
@@ -330,9 +361,13 @@ fn spawn_git_state_debouncer(
                 // Poisoned RwLock: refuse to swallow the burst silently —
                 // bubble a health-level error so the app layer forces a
                 // recompute and marks the watcher unhealthy.
-                let _ = tx.send(WatchEvent::Error(
-                    "watcher [git_dir]: baseline matcher lock poisoned".to_string(),
-                ));
+                let _ = tx.send(WatchEvent::Error {
+                    source,
+                    message: format!(
+                        "watcher [{}]: baseline matcher lock poisoned",
+                        source.label()
+                    ),
+                });
                 return;
             };
             let baseline_touched = events
@@ -340,7 +375,7 @@ fn spawn_git_state_debouncer(
                 .any(|ev| ev.event.paths.iter().any(|p| guard.matches(p)));
             drop(guard);
             if baseline_touched {
-                let _ = tx.send(WatchEvent::GitHead);
+                let _ = tx.send(WatchEvent::GitHead(source));
             }
         },
     )
@@ -391,16 +426,16 @@ where
 /// string the app surfaces in `last_error`. Prefixed with the
 /// watcher layer so users can tell `worktree` failures apart from
 /// `git_dir` failures when triaging.
-fn format_notify_errors(layer: &str, errors: &[notify::Error]) -> String {
+fn format_notify_errors(source: WatchSource, errors: &[notify::Error]) -> String {
     let joined = errors
         .iter()
         .map(|e| e.to_string())
         .collect::<Vec<_>>()
         .join("; ");
     if joined.is_empty() {
-        format!("watcher [{layer}]: unknown backend failure")
+        format!("watcher [{}]: unknown backend failure", source.label())
     } else {
-        format!("watcher [{layer}]: {joined}")
+        format!("watcher [{}]: {joined}", source.label())
     }
 }
 
@@ -528,11 +563,11 @@ mod tests {
                     saw_worktree = true;
                     break;
                 }
-                Ok(Some(WatchEvent::GitHead)) => {
+                Ok(Some(WatchEvent::GitHead(_))) => {
                     saw_head = true;
                     break;
                 }
-                Ok(Some(WatchEvent::Error(_))) => continue,
+                Ok(Some(WatchEvent::Error { .. })) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
@@ -584,12 +619,12 @@ mod tests {
         let drain_until = tokio::time::Instant::now() + DRAIN_WAIT;
         while tokio::time::Instant::now() < drain_until {
             match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
-                Ok(Some(WatchEvent::GitHead)) => {
+                Ok(Some(WatchEvent::GitHead(_))) => {
                     saw_head = true;
                     break;
                 }
                 Ok(Some(WatchEvent::Worktree)) => continue,
-                Ok(Some(WatchEvent::Error(_))) => continue,
+                Ok(Some(WatchEvent::Error { .. })) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
@@ -645,12 +680,12 @@ mod tests {
         let drain_until = tokio::time::Instant::now() + DRAIN_WAIT;
         while tokio::time::Instant::now() < drain_until {
             match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
-                Ok(Some(WatchEvent::GitHead)) => {
+                Ok(Some(WatchEvent::GitHead(_))) => {
                     saw_head = true;
                     break;
                 }
                 Ok(Some(WatchEvent::Worktree)) => continue,
-                Ok(Some(WatchEvent::Error(_))) => continue,
+                Ok(Some(WatchEvent::Error { .. })) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
@@ -735,12 +770,12 @@ mod tests {
         let drain_until = tokio::time::Instant::now() + DRAIN_WAIT;
         while tokio::time::Instant::now() < drain_until {
             match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
-                Ok(Some(WatchEvent::GitHead)) => {
+                Ok(Some(WatchEvent::GitHead(_))) => {
                     saw_head = true;
                     break;
                 }
                 Ok(Some(WatchEvent::Worktree)) => continue,
-                Ok(Some(WatchEvent::Error(_))) => continue,
+                Ok(Some(WatchEvent::Error { .. })) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
@@ -858,16 +893,19 @@ mod tests {
                     path: git_dir.join("HEAD"),
                     recursive_mode: RecursiveMode::NonRecursive,
                     compare_contents: true,
+                    source: WatchSource::GitPerWorktreeHead,
                 },
                 WatchRoot {
                     path: git_dir.join("refs"),
                     recursive_mode: RecursiveMode::Recursive,
                     compare_contents: true,
+                    source: WatchSource::GitRefs,
                 },
                 WatchRoot {
                     path: git_dir.clone(),
                     recursive_mode: RecursiveMode::NonRecursive,
                     compare_contents: true,
+                    source: WatchSource::GitCommonRoot,
                 },
             ]
         );
@@ -949,7 +987,7 @@ mod tests {
         let phase1_until = tokio::time::Instant::now() + TokioDuration::from_millis(600);
         while tokio::time::Instant::now() < phase1_until {
             match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
-                Ok(Some(WatchEvent::GitHead)) => {
+                Ok(Some(WatchEvent::GitHead(_))) => {
                     saw_head_before_update = true;
                     break;
                 }
@@ -979,7 +1017,7 @@ mod tests {
         let phase2_until = tokio::time::Instant::now() + DRAIN_WAIT;
         while tokio::time::Instant::now() < phase2_until {
             match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
-                Ok(Some(WatchEvent::GitHead)) => {
+                Ok(Some(WatchEvent::GitHead(_))) => {
                     saw_head_after_update = true;
                     break;
                 }
@@ -1023,7 +1061,7 @@ mod tests {
         let phase1_until = tokio::time::Instant::now() + DRAIN_WAIT;
         while tokio::time::Instant::now() < phase1_until {
             match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
-                Ok(Some(WatchEvent::GitHead)) => {
+                Ok(Some(WatchEvent::GitHead(_))) => {
                     saw_birth = true;
                     break;
                 }
@@ -1047,7 +1085,7 @@ mod tests {
         let phase2_until = tokio::time::Instant::now() + DRAIN_WAIT;
         while tokio::time::Instant::now() < phase2_until {
             match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
-                Ok(Some(WatchEvent::GitHead)) => {
+                Ok(Some(WatchEvent::GitHead(_))) => {
                     saw_rewrite = true;
                     break;
                 }

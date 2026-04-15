@@ -47,3 +47,4 @@ Michael Nygard 形式を採用する。ファイル名は `NNNN-kebab-case-title
 - [0010 — macOS watcher は poll fallback を使い、git state watch root を HEAD / refs / packed-refs に絞る](0010-macos-poll-fallback-and-targeted-git-watch-roots.md)
 - [0011 — common git-dir root watch を常設し late packed-refs rewrite を拾う](0011-common-git-root-watch-for-late-packed-refs.md)
 - [0012 — macOS PollWatcher の worktree 監視は compare_contents を有効にする](0012-worktree-content-compare-on-macos-poll.md)
+- [0013 — watcher health は source-aware に追跡する](0013-source-aware-watcher-health.md)

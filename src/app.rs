@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -10,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 const SCROLL_ANIM_DURATION: Duration = Duration::from_millis(150);
 
 use crate::git::{self, DiffContent, FileDiff, FileStatus, LineKind};
-use crate::watcher::{self, WatchEvent};
+use crate::watcher::{self, WatchEvent, WatchSource};
 
 /// Half-page scroll constant for `Ctrl-d` / `Ctrl-u`. M5+ may swap this for
 /// the real viewport height once we plumb it through; until then a fixed
@@ -108,15 +109,42 @@ pub struct App {
 /// successful recompute must not pretend a dropped FSEvents queue has
 /// repaired itself. See ADR-0008.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum WatcherHealth {
-    #[default]
-    Healthy,
-    /// The backend reported a failure. Stored verbatim from the
-    /// watcher layer so the footer can display the concrete error.
-    /// Cleared only when a non-Error watcher event lands after the
-    /// failure, which is evidence the debouncer is still producing
-    /// signals.
-    Failed(String),
+pub struct WatcherHealth {
+    /// Source-scoped watcher failures. Multiple debouncers back the
+    /// watcher layer (worktree + several git-state roots), so one live
+    /// event must not erase the failure of a different source.
+    failures: BTreeMap<WatchSource, String>,
+}
+
+impl WatcherHealth {
+    pub fn record_failure(&mut self, source: WatchSource, message: String) {
+        self.failures.insert(source, message);
+    }
+
+    pub fn clear_source(&mut self, source: WatchSource) {
+        self.failures.remove(&source);
+    }
+
+    #[cfg(test)]
+    pub fn is_healthy(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn summary(&self) -> Option<String> {
+        if self.failures.is_empty() {
+            return None;
+        }
+        let mut parts = self.failures.values().cloned().collect::<Vec<_>>();
+        parts.sort();
+        Some(parts.join("; "))
+    }
+
+    #[cfg(test)]
+    fn has_failure(&self, source: WatchSource, needle: &str) -> bool {
+        self.failures
+            .get(&source)
+            .is_some_and(|msg| msg.contains(needle))
+    }
 }
 
 /// Follow-up work the event loop must perform after dispatching a
@@ -483,7 +511,7 @@ impl App {
             visual_top: Cell::new(0.0),
             anim: None,
             wrap_lines: false,
-            watcher_health: WatcherHealth::Healthy,
+            watcher_health: WatcherHealth::default(),
         };
         app.apply_computed_files(initial);
         Ok(app)
@@ -662,38 +690,38 @@ impl App {
     ) -> (bool, bool) {
         let mut worktree = false;
         let mut head = false;
-        let mut error: Option<String> = None;
-        let mut non_error_seen = false;
+        let mut recovered_sources = Vec::new();
+        let mut failed_sources: BTreeMap<WatchSource, String> = BTreeMap::new();
         for event in events {
             match event {
                 WatchEvent::Worktree => {
                     worktree = true;
-                    non_error_seen = true;
+                    recovered_sources.push(WatchSource::Worktree);
                 }
-                WatchEvent::GitHead => {
+                WatchEvent::GitHead(source) => {
                     head = true;
-                    non_error_seen = true;
+                    recovered_sources.push(source);
                 }
-                WatchEvent::Error(msg) => error = Some(msg),
+                WatchEvent::Error { source, message } => {
+                    failed_sources.insert(source, message);
+                }
             }
         }
-        if let Some(msg) = error {
+        for source in recovered_sources {
+            if !failed_sources.contains_key(&source) {
+                self.watcher_health.clear_source(source);
+            }
+        }
+        if !failed_sources.is_empty() {
             // Backend failure: record it in the dedicated
             // `watcher_health` slot (NOT `last_error`) so a
-            // subsequent one-off successful recompute does not
-            // silently erase the fact that live monitoring is dead.
-            // Also force a recompute so the user at least sees the
-            // freshest snapshot the tool can produce in fallback
-            // mode.
-            self.watcher_health = WatcherHealth::Failed(msg);
+            // subsequent successful recompute from some *other*
+            // watcher source does not silently erase the fact that
+            // live monitoring is partially dead.
             worktree = true;
-        } else if non_error_seen && matches!(self.watcher_health, WatcherHealth::Failed(_)) {
-            // A non-Error event means the debouncer is still
-            // producing signals — treat that as recovery and drop
-            // the health warning. This is the counterpart to the
-            // persistent `Failed` state above and keeps the footer
-            // honest without manual intervention.
-            self.watcher_health = WatcherHealth::Healthy;
+            for (source, message) in failed_sources {
+                self.watcher_health.record_failure(source, message);
+            }
         }
         (worktree, head)
     }
@@ -1505,11 +1533,24 @@ impl App {
             return;
         }
 
-        if !self.follow_mode
-            && let Some(anchor) = self.anchor.clone()
-            && let Some(row) = self.find_anchor_row(&anchor)
-        {
-            self.scroll = row;
+        if !self.follow_mode {
+            if let Some(anchor) = self.anchor.clone() {
+                if let Some(row) = self.find_anchor_row(&anchor) {
+                    self.scroll = row;
+                    return;
+                }
+                if let Some(row) = self.find_anchor_file_row(&anchor.path) {
+                    self.scroll = row;
+                    self.update_anchor_from_scroll();
+                    return;
+                }
+            }
+            // Manual mode should preserve the user's approximate viewport
+            // position even when the anchored file disappeared entirely.
+            // Falling back to follow mode here would silently violate the
+            // "manual" contract and snap to the newest file.
+            self.scroll = self.scroll.min(self.last_row_index());
+            self.update_anchor_from_scroll();
             return;
         }
 
@@ -1542,6 +1583,23 @@ impl App {
             }
             DiffContent::Binary => self.layout.file_first_hunk.get(file_idx).copied().flatten(),
         }
+    }
+
+    fn find_anchor_file_row(&self, path: &Path) -> Option<usize> {
+        let file_idx = self.files.iter().position(|f| f.path == path)?;
+        self.layout
+            .file_first_hunk
+            .get(file_idx)
+            .copied()
+            .flatten()
+            .or_else(|| {
+                self.layout.rows.iter().position(|row| {
+                    matches!(
+                        row,
+                        RowKind::FileHeader { file_idx: f } if *f == file_idx
+                    )
+                })
+            })
     }
 
     fn update_anchor_from_scroll(&mut self) {
@@ -1792,7 +1850,7 @@ mod tests {
             visual_top: Cell::new(0.0),
             anim: None,
             wrap_lines: false,
-            watcher_health: WatcherHealth::Healthy,
+            watcher_health: WatcherHealth::default(),
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
@@ -3063,6 +3121,46 @@ mod tests {
         assert_eq!(app.current_file_path(), Some(Path::new("b.rs")));
     }
 
+    #[test]
+    fn refresh_anchor_keeps_manual_mode_on_same_file_when_hunk_identity_changes() {
+        let mut app = fake_app(vec![
+            make_file(
+                "newest.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                300,
+            ),
+            make_file(
+                "older.rs",
+                vec![hunk(50, vec![diff_line(LineKind::Added, "y")])],
+                100,
+            ),
+        ]);
+
+        let older = file_idx(&app, "older.rs");
+        app.jump_to_file_first_hunk(older);
+        app.follow_mode = false;
+        app.update_anchor_from_scroll();
+        assert_eq!(app.current_file_path(), Some(Path::new("older.rs")));
+
+        // Same file survives, but the old hunk identity no longer does
+        // (e.g. git merged/split hunks after a nearby edit). Manual mode
+        // should stay on the same file instead of snapping to the newest
+        // file's follow target.
+        app.files[older] = make_file(
+            "older.rs",
+            vec![hunk(99, vec![diff_line(LineKind::Added, "y2")])],
+            100,
+        );
+        app.build_layout();
+        app.refresh_anchor();
+
+        assert_eq!(
+            app.current_file_path(),
+            Some(Path::new("older.rs")),
+            "manual mode must stay on the same file when only hunk identity changes"
+        );
+    }
+
     // ---- scroll animation --------------------------------------------
 
     #[test]
@@ -3524,18 +3622,20 @@ mod tests {
         // slot, which survives diff success and only clears when
         // a non-Error event proves the backend is alive again.
         let mut app = fake_app(vec![]);
-        assert_eq!(app.watcher_health, WatcherHealth::Healthy);
+        assert!(app.watcher_health.is_healthy());
 
-        let (need_recompute, need_head_dirty) =
-            app.handle_watch_burst([WatchEvent::Error("fsevents dropped".into())]);
+        let (need_recompute, need_head_dirty) = app.handle_watch_burst([WatchEvent::Error {
+            source: WatchSource::Worktree,
+            message: "watcher [worktree]: fsevents dropped".into(),
+        }]);
         assert!(
             need_recompute,
             "backend failure must force a recompute so the UI falls back to fresh data"
         );
         assert!(!need_head_dirty);
-        assert_eq!(
-            app.watcher_health,
-            WatcherHealth::Failed("fsevents dropped".into()),
+        assert!(
+            app.watcher_health
+                .has_failure(WatchSource::Worktree, "fsevents dropped"),
             "error must land in watcher_health, not last_error"
         );
         assert!(
@@ -3551,7 +3651,10 @@ mod tests {
         // invariant that `apply_computed_files` leaves
         // `watcher_health` alone.
         let mut app = fake_app(vec![]);
-        app.watcher_health = WatcherHealth::Failed("kqueue overflow".into());
+        app.watcher_health.record_failure(
+            WatchSource::GitRefs,
+            "watcher [git.refs]: kqueue overflow".into(),
+        );
 
         // Directly exercise apply_computed_files with a fresh
         // successful payload. The pre-rework bug cleared
@@ -3563,29 +3666,26 @@ mod tests {
             100,
         )]);
 
-        assert_eq!(
-            app.watcher_health,
-            WatcherHealth::Failed("kqueue overflow".into()),
+        assert!(
+            app.watcher_health
+                .has_failure(WatchSource::GitRefs, "kqueue overflow"),
             "a successful diff recompute must not imply watcher recovery"
         );
     }
 
     #[test]
-    fn handle_watch_burst_clears_failed_health_on_subsequent_live_event() {
-        // Recovery path: once a Worktree or GitHead event lands
-        // after a failure, the debouncer is clearly still producing
-        // signals, so the health warning must drop. Without this
-        // recovery signal the footer would stay red forever after
-        // any transient hiccup.
+    fn handle_watch_burst_clears_failed_health_for_the_same_source_only() {
         let mut app = fake_app(vec![]);
-        app.watcher_health = WatcherHealth::Failed("transient".into());
+        app.watcher_health.record_failure(
+            WatchSource::Worktree,
+            "watcher [worktree]: transient".into(),
+        );
 
         let (need_recompute, _) = app.handle_watch_burst([WatchEvent::Worktree]);
         assert!(need_recompute, "Worktree event still triggers a recompute");
-        assert_eq!(
-            app.watcher_health,
-            WatcherHealth::Healthy,
-            "a live event after failure must flip health back to Healthy"
+        assert!(
+            app.watcher_health.is_healthy(),
+            "a live event from the same source must clear that source's failure"
         );
     }
 
@@ -3599,12 +3699,51 @@ mod tests {
         let mut app = fake_app(vec![]);
         app.handle_watch_burst([
             WatchEvent::Worktree,
-            WatchEvent::Error("late failure".into()),
+            WatchEvent::Error {
+                source: WatchSource::Worktree,
+                message: "watcher [worktree]: late failure".into(),
+            },
         ]);
-        assert_eq!(
-            app.watcher_health,
-            WatcherHealth::Failed("late failure".into()),
-            "a burst that includes any Error must land in Failed"
+        assert!(
+            app.watcher_health
+                .has_failure(WatchSource::Worktree, "late failure"),
+            "a burst that includes an Error for a source must keep that source failed"
+        );
+    }
+
+    #[test]
+    fn handle_watch_burst_does_not_clear_git_failure_when_worktree_recovers() {
+        let mut app = fake_app(vec![]);
+        app.watcher_health.record_failure(
+            WatchSource::GitRefs,
+            "watcher [git.refs]: still dead".into(),
+        );
+
+        let (need_recompute, need_head_dirty) = app.handle_watch_burst([WatchEvent::Worktree]);
+        assert!(need_recompute);
+        assert!(!need_head_dirty);
+        assert!(
+            app.watcher_health
+                .has_failure(WatchSource::GitRefs, "still dead"),
+            "worktree recovery must not clear an unrelated git watcher failure"
+        );
+    }
+
+    #[test]
+    fn handle_watch_burst_does_not_clear_other_git_source_failure() {
+        let mut app = fake_app(vec![]);
+        app.watcher_health.record_failure(
+            WatchSource::GitCommonRoot,
+            "watcher [git.root]: still dead".into(),
+        );
+
+        let (_, need_head_dirty) =
+            app.handle_watch_burst([WatchEvent::GitHead(WatchSource::GitRefs)]);
+        assert!(need_head_dirty);
+        assert!(
+            app.watcher_health
+                .has_failure(WatchSource::GitCommonRoot, "still dead"),
+            "a GitHead from one git source must not clear a different git source failure"
         );
     }
 

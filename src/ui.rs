@@ -662,14 +662,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // most recent one-off recompute happened to succeed. Drawn with
     // a distinct `WATCHER` tag so it cannot be confused with an
     // ordinary `git diff` failure. See ADR-0008.
-    if let crate::app::WatcherHealth::Failed(msg) = &app.watcher_health {
+    if let Some(msg) = app.watcher_health.summary() {
         spans.push(sep());
         spans.push(Span::styled(
             "⚠ WATCHER",
             Style::default().fg(Color::Red).add_modifier(bold),
         ));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(msg.clone(), Style::default().fg(Color::Red)));
+        spans.push(Span::styled(msg, Style::default().fg(Color::Red)));
     }
 
     if let Some(err) = &app.last_error {
@@ -858,7 +858,7 @@ mod tests {
             visual_top: std::cell::Cell::new(0.0),
             anim: None,
             wrap_lines: false,
-            watcher_health: crate::app::WatcherHealth::Healthy,
+            watcher_health: crate::app::WatcherHealth::default(),
         }
     }
 
