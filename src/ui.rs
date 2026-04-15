@@ -1107,6 +1107,37 @@ mod tests {
     }
 
     #[test]
+    fn render_footer_shows_source_aware_watcher_failures() {
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        app.watcher_health.record_failure(
+            crate::watcher::WatchSource::GitRefs,
+            "watcher [git.refs]: refs watcher dead".into(),
+        );
+        app.watcher_health.record_failure(
+            crate::watcher::WatchSource::Worktree,
+            "watcher [worktree]: worktree watcher dead".into(),
+        );
+
+        let view = render_to_string(&app, 160, 6);
+        assert!(
+            view.contains("⚠ WATCHER"),
+            "missing watcher warning:\n{view}"
+        );
+        assert!(
+            view.contains("watcher [git.refs]: refs watcher dead"),
+            "missing git watcher message:\n{view}"
+        );
+        assert!(
+            view.contains("watcher [worktree]: worktree"),
+            "missing worktree watcher message:\n{view}"
+        );
+    }
+
+    #[test]
     fn render_footer_switches_to_manual_when_follow_mode_off() {
         let mut app = populated_app(vec![make_file(
             "src/foo.rs",

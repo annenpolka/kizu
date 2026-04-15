@@ -1128,7 +1128,11 @@ impl App {
     }
 
     fn last_row_index(&self) -> usize {
-        self.layout.rows.len().saturating_sub(1)
+        self.layout
+            .rows
+            .iter()
+            .rposition(|row| !matches!(row, RowKind::Spacer))
+            .unwrap_or(0)
     }
 
     pub fn next_hunk(&mut self) {
@@ -2595,7 +2599,11 @@ mod tests {
             100,
         )]);
         app.handle_key(key(KeyCode::Char('G')));
-        assert_eq!(app.scroll, app.layout.rows.len() - 1);
+        assert_eq!(app.scroll, app.layout.rows.len() - 2);
+        assert!(
+            !matches!(app.layout.rows[app.scroll], RowKind::Spacer),
+            "G must land on the last content row, not the trailing spacer"
+        );
         app.handle_key(key(KeyCode::Char('g')));
         assert_eq!(app.scroll, 0);
     }
