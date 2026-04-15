@@ -40,21 +40,31 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // M4v: every row in the viewport renders with bright/dim styling
-    // depending on whether it belongs to `current_hunk()`.
-    // M4v.long: when the cursor sits inside a hunk whose header has
-    // scrolled off the top, pin the header row to viewport row 0
-    // (sticky scroll) so the function name stays visible while the
-    // user walks through a long edit.
+    // M4v + cursor placement:
+    //   - The cursor row inside `app.layout.rows` is `app.scroll`.
+    //   - The viewport's *top* row is derived from the cursor + the
+    //     current `CursorPlacement` (centered by default, bottom when
+    //     the user has pressed `z`).
+    //   - When the cursor sits inside a hunk whose header has scrolled
+    //     off the top, the header is pinned to viewport row 0 (sticky
+    //     scroll), shrinking the body area by one row.
     let total_rows = app.layout.rows.len();
     let selected = app.current_hunk();
     let cursor_row = app.scroll;
 
-    // Sticky header: cursor is inside a hunk whose header is strictly
-    // above the scroll position.
+    // Provisional body height (before sticky decision). We re-compute
+    // viewport_top with the *real* body height further down so the
+    // sticky overlay never makes the cursor jitter.
+    let raw_body_height = area.height as usize;
+    let provisional_top =
+        app.cursor_placement
+            .viewport_top(cursor_row, total_rows, raw_body_height);
+
+    // Sticky header: cursor is inside a hunk whose header sits above
+    // the visible viewport top.
     let sticky = selected.and_then(|(file_idx, hunk_idx)| {
         find_hunk_header_row(&app.layout.rows, file_idx, hunk_idx)
-            .filter(|&row| row < cursor_row)
+            .filter(|&row| row < provisional_top)
             .map(|_| (file_idx, hunk_idx))
     });
 
@@ -77,7 +87,11 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let viewport_height = content_area.height as usize;
-    let start = cursor_row;
+    let viewport_top = app
+        .cursor_placement
+        .viewport_top(cursor_row, total_rows, viewport_height);
+
+    let start = viewport_top;
     let cap_end = start.saturating_add(SCROLL_ROW_LIMIT.min(viewport_height));
     let end = cap_end.min(total_rows);
 
@@ -579,6 +593,7 @@ mod tests {
             files: Vec::new(),
             layout: ScrollLayout::default(),
             scroll: 0,
+            cursor_placement: crate::app::CursorPlacement::Centered,
             anchor: None,
             picker: None,
             follow_mode: true,
@@ -1012,6 +1027,92 @@ mod tests {
         assert!(
             had_plain_bar,
             "expected a yellow '▎' ribbon on the other selected row"
+        );
+    }
+
+    #[test]
+    fn centered_cursor_renders_arrow_near_viewport_middle() {
+        // 40-row hunk, 12-row viewport, cursor parked deep inside the
+        // hunk. In centered mode the cursor row should land at roughly
+        // viewport_height / 2.
+        let lines: Vec<DiffLine> = (0..40)
+            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+            .collect();
+        let mut app = populated_app(vec![make_file_with_context(
+            "src/foo.rs",
+            "fn long_function() {",
+            lines,
+            100,
+        )]);
+        let header = app.layout.hunk_starts[0];
+        // Park the cursor 20 rows past the hunk header (well inside the
+        // hunk).
+        app.scroll_to(header + 20);
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        // Find the row that holds the yellow `▶` marker.
+        let mut cursor_y: Option<u16> = None;
+        for y in 0..buffer.area().height {
+            for x in 0..buffer.area().width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow) {
+                    cursor_y = Some(y);
+                }
+            }
+        }
+        let y = cursor_y.expect("expected the cursor `▶` to be drawn");
+        // Sticky takes row 0, so the body height is 11. We expect the
+        // cursor near the middle of the body — between rows 4 and 8 of
+        // the full buffer, well within tolerance.
+        assert!(
+            (4..=8).contains(&y),
+            "expected cursor near viewport middle, was at row {y}"
+        );
+    }
+
+    #[test]
+    fn bottom_cursor_renders_arrow_near_viewport_bottom() {
+        // Same fixture, toggled to Bottom placement. The arrow should
+        // sit near the very last visible row.
+        let lines: Vec<DiffLine> = (0..40)
+            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+            .collect();
+        let mut app = populated_app(vec![make_file_with_context(
+            "src/foo.rs",
+            "fn long_function() {",
+            lines,
+            100,
+        )]);
+        let header = app.layout.hunk_starts[0];
+        app.scroll_to(header + 20);
+        app.cursor_placement = crate::app::CursorPlacement::Bottom;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let mut cursor_y: Option<u16> = None;
+        for y in 0..buffer.area().height {
+            for x in 0..buffer.area().width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow) {
+                    cursor_y = Some(y);
+                }
+            }
+        }
+        let y = cursor_y.expect("expected the cursor `▶` to be drawn");
+        // Bottom mode + sticky header (row 0) + footer (last row): the
+        // cursor should be on the last body row, which is two rows up
+        // from the absolute bottom of the buffer.
+        assert_eq!(
+            y,
+            buffer.area().height - 2,
+            "expected cursor at viewport floor, was at row {y}"
         );
     }
 

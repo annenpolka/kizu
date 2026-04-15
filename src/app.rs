@@ -24,8 +24,11 @@ pub struct App {
     /// Derived flat row plan for the scroll view. Rebuilt whenever `files`
     /// changes via `build_layout`.
     pub layout: ScrollLayout,
-    /// Current top-of-viewport row index inside `layout.rows`.
+    /// The cursor's row index inside `layout.rows`. The renderer derives
+    /// the actual viewport top from this + [`Self::cursor_placement`].
     pub scroll: usize,
+    /// Where the cursor sits visually inside the viewport. Toggled by `z`.
+    pub cursor_placement: CursorPlacement,
     /// Path-tracked anchor: which `(path, hunk_old_start)` the user is
     /// looking at. Lets `recompute_diff` slide `scroll` to the same hunk
     /// even when the row count has shifted.
@@ -38,6 +41,34 @@ pub struct App {
     /// Set whenever HEAD/refs move; the user must press `R` to re-baseline.
     pub head_dirty: bool,
     pub should_quit: bool,
+}
+
+/// Two ways the renderer can park the cursor inside the viewport.
+/// Defaults to [`CursorPlacement::Centered`]; `z` toggles to
+/// [`CursorPlacement::Bottom`] (a `tail -f`-flavoured layout where new
+/// hunks scroll up from the floor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorPlacement {
+    Centered,
+    Bottom,
+}
+
+impl CursorPlacement {
+    /// Compute the viewport's top-row index given the cursor's logical
+    /// row, the total layout size, and the viewport height. The result
+    /// is clamped to `[0, total - height]` so we never reveal phantom
+    /// rows past either end of the layout.
+    pub fn viewport_top(self, cursor: usize, total: usize, height: usize) -> usize {
+        if total <= height {
+            return 0;
+        }
+        let max_top = total - height;
+        let raw = match self {
+            CursorPlacement::Centered => cursor.saturating_sub(height / 2),
+            CursorPlacement::Bottom => cursor.saturating_sub(height.saturating_sub(1)),
+        };
+        raw.min(max_top)
+    }
 }
 
 /// Pre-computed layout for the scroll view. Built once per `recompute_diff`,
@@ -124,6 +155,7 @@ impl App {
             files: Vec::new(),
             layout: ScrollLayout::default(),
             scroll: 0,
+            cursor_placement: CursorPlacement::Centered,
             anchor: None,
             picker: None,
             follow_mode: true,
@@ -133,6 +165,15 @@ impl App {
         };
         app.recompute_diff();
         Ok(app)
+    }
+
+    /// Toggle the cursor placement between centered and bottom-pinned.
+    /// `z` calls this — same vibe as `vim`'s `zz` (centre on cursor).
+    pub fn toggle_cursor_placement(&mut self) {
+        self.cursor_placement = match self.cursor_placement {
+            CursorPlacement::Centered => CursorPlacement::Bottom,
+            CursorPlacement::Bottom => CursorPlacement::Centered,
+        };
     }
 
     /// Re-run `git diff`, populate per-file mtimes, sort files by mtime
@@ -253,6 +294,9 @@ impl App {
             }
             KeyCode::Char('R') => {
                 self.reset_baseline();
+            }
+            KeyCode::Char('z') => {
+                self.toggle_cursor_placement();
             }
             _ => {}
         }
@@ -845,6 +889,7 @@ mod tests {
             files: Vec::new(),
             layout: ScrollLayout::default(),
             scroll: 0,
+            cursor_placement: CursorPlacement::Centered,
             anchor: None,
             picker: None,
             follow_mode: true,
@@ -1164,6 +1209,48 @@ mod tests {
         app.scroll_to(second_start);
         app.handle_key(key(KeyCode::Char('K')));
         assert_eq!(app.scroll, first_start);
+    }
+
+    #[test]
+    fn cursor_placement_centered_keeps_cursor_in_the_middle() {
+        // 100 row layout, viewport 20 rows, cursor at row 50.
+        // Centered → viewport_top = 50 - 10 = 40, cursor visually at row 10.
+        let placement = CursorPlacement::Centered;
+        assert_eq!(placement.viewport_top(50, 100, 20), 40);
+    }
+
+    #[test]
+    fn cursor_placement_centered_clamps_at_top_and_bottom() {
+        let placement = CursorPlacement::Centered;
+        // Cursor near the start: viewport_top can't go below 0.
+        assert_eq!(placement.viewport_top(2, 100, 20), 0);
+        // Cursor near the end: viewport_top clamped at total - height.
+        assert_eq!(placement.viewport_top(99, 100, 20), 80);
+    }
+
+    #[test]
+    fn cursor_placement_bottom_pins_cursor_to_the_floor() {
+        // Cursor at row 50, viewport 20: cursor visually at row 19 (last
+        // row of viewport), viewport_top = 50 - 19 = 31.
+        let placement = CursorPlacement::Bottom;
+        assert_eq!(placement.viewport_top(50, 100, 20), 31);
+    }
+
+    #[test]
+    fn cursor_placement_returns_zero_when_layout_fits_in_viewport() {
+        // 5 rows, viewport 20 → no scrolling possible regardless of mode.
+        assert_eq!(CursorPlacement::Centered.viewport_top(3, 5, 20), 0);
+        assert_eq!(CursorPlacement::Bottom.viewport_top(3, 5, 20), 0);
+    }
+
+    #[test]
+    fn z_key_toggles_cursor_placement() {
+        let mut app = fake_app(vec![]);
+        assert_eq!(app.cursor_placement, CursorPlacement::Centered);
+        app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(app.cursor_placement, CursorPlacement::Bottom);
+        app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(app.cursor_placement, CursorPlacement::Centered);
     }
 
     #[test]
