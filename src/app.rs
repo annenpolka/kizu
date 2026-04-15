@@ -1823,21 +1823,26 @@ async fn run_loop(
                     }
                 }
             }
-            Some(first) = watch.events.recv() => {
-                // Drain any events that piled up behind `first` and
-                // hand the whole burst to `handle_watch_burst` so the
-                // coalescing + health-transition rules stay testable
-                // in one place.
-                let mut burst: Vec<WatchEvent> = vec![first];
-                while let Ok(more) = watch.events.try_recv() {
-                    burst.push(more);
-                }
-                let (need_recompute, need_head_dirty) = app.handle_watch_burst(burst);
-                if need_recompute {
-                    app.recompute_diff();
-                }
-                if need_head_dirty {
-                    app.mark_head_dirty();
+            watch_event = watch.events.recv() => {
+                if let Some(first) = watch_event {
+                    // Drain any events that piled up behind `first` and
+                    // hand the whole burst to `handle_watch_burst` so the
+                    // coalescing + health-transition rules stay testable
+                    // in one place.
+                    let mut burst: Vec<WatchEvent> = vec![first];
+                    while let Ok(more) = watch.events.try_recv() {
+                        burst.push(more);
+                    }
+                    let (need_recompute, need_head_dirty) = app.handle_watch_burst(burst);
+                    if need_recompute {
+                        app.recompute_diff();
+                    }
+                    if need_head_dirty {
+                        app.mark_head_dirty();
+                    }
+                } else {
+                    app.last_error = Some("watcher: event channel closed".into());
+                    app.should_quit = true;
                 }
             }
             _ = &mut startup_refresh, if startup_refresh_pending => {
