@@ -51,12 +51,13 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let total_rows = app.layout.rows.len();
     let selected = app.current_hunk();
     let cursor_row = app.scroll;
+    let now = std::time::Instant::now();
 
     // Provisional body height (before sticky decision). We re-compute
     // viewport_top with the *real* body height further down so the
     // sticky overlay never makes the cursor jitter.
     let raw_body_height = area.height as usize;
-    let provisional_top = app.viewport_top(raw_body_height);
+    let provisional_top = app.visual_viewport_top(raw_body_height, now);
 
     // Sticky header: cursor is inside a hunk whose header sits above
     // the visible viewport top.
@@ -88,7 +89,7 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Tell the App layer how tall the body actually was so the next
     // `J`/`K` press can size its scroll chunk relative to this height.
     app.last_body_height.set(viewport_height);
-    let viewport_top = app.viewport_top(viewport_height);
+    let viewport_top = app.visual_viewport_top(viewport_height, now);
 
     let start = viewport_top;
     let cap_end = start.saturating_add(SCROLL_ROW_LIMIT.min(viewport_height));
@@ -600,6 +601,8 @@ mod tests {
             head_dirty: false,
             should_quit: false,
             last_body_height: std::cell::Cell::new(24),
+            visual_top: std::cell::Cell::new(0.0),
+            anim: None,
         }
     }
 
@@ -1046,8 +1049,10 @@ mod tests {
         )]);
         let header = app.layout.hunk_starts[0];
         // Park the cursor 20 rows past the hunk header (well inside the
-        // hunk).
+        // hunk). Settle the scroll animation so this test asserts on
+        // the final viewport, not a mid-tween sample.
         app.scroll_to(header + 20);
+        app.anim = None;
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1089,6 +1094,7 @@ mod tests {
         )]);
         let header = app.layout.hunk_starts[0];
         app.scroll_to(header + 20);
+        app.anim = None;
         app.cursor_placement = crate::app::CursorPlacement::Bottom;
 
         let backend = TestBackend::new(80, 12);
@@ -1133,6 +1139,7 @@ mod tests {
         // Skip past the hunk header so the renderer has to pin it.
         let header_row = app.layout.hunk_starts[0];
         app.scroll_to(header_row + 10);
+        app.anim = None;
 
         // Tight viewport so the original header row really is off-screen.
         let backend = TestBackend::new(80, 8);

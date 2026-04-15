@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// Duration of a single hunk-to-hunk scroll animation. 150 ms lands in
+/// the "noticeable but not slow" band and matches the research doc.
+const SCROLL_ANIM_DURATION: Duration = Duration::from_millis(150);
 
 use crate::git::{self, DiffContent, FileDiff, LineKind};
 use crate::watcher::{self, WatchEvent};
@@ -47,6 +51,16 @@ pub struct App {
     /// chunk relative to the current screen — bigger window, bigger jumps.
     /// Defaults to 24 before the first render.
     pub last_body_height: Cell<usize>,
+    /// The row position the renderer actually drew the viewport at on
+    /// the last frame. Matches the logical [`Self::viewport_top`] when
+    /// idle; lags behind during a [`ScrollAnim`]. Used as the `from`
+    /// value when a new animation kicks off (so key mashes don't
+    /// snap — the next tween picks up from wherever the current one
+    /// happened to be).
+    pub visual_top: Cell<f32>,
+    /// Active viewport-top tween. `None` when the renderer should
+    /// draw at the logical target.
+    pub anim: Option<ScrollAnim>,
 }
 
 /// Two ways the renderer can park the cursor inside the viewport.
@@ -145,6 +159,37 @@ pub struct PickerState {
     pub cursor: usize,
 }
 
+/// Single-shot easing state for the viewport's top-row tween.
+///
+/// The tween sources its start point from `from` (captured at the moment
+/// the animation began, in row-units) and its endpoint from the *current*
+/// logical [`App::viewport_top`] — recomputed every frame so `git diff`
+/// fires that shuffle the layout mid-animation still land on the right
+/// row. Easing is ease-out cubic: fast at the start, settling softly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollAnim {
+    pub from: f32,
+    pub start: Instant,
+    pub dur: Duration,
+}
+
+impl ScrollAnim {
+    /// Sample the tween at `now` against a (possibly moving) `target`.
+    /// Returns `(visual, done)` where `visual` is the row position the
+    /// renderer should use and `done` flips to `true` once the animation
+    /// has finished (`now >= start + dur`).
+    pub fn sample(&self, target: f32, now: Instant) -> (f32, bool) {
+        let elapsed = now.saturating_duration_since(self.start).as_secs_f32();
+        let dur_secs = self.dur.as_secs_f32().max(1e-6);
+        let t = (elapsed / dur_secs).clamp(0.0, 1.0);
+        // ease-out cubic: 1 - (1 - t)^3
+        let inv = 1.0 - t;
+        let e = 1.0 - inv * inv * inv;
+        let v = self.from + (target - self.from) * e;
+        (v, t >= 1.0)
+    }
+}
+
 impl App {
     /// Construct an `App` for `root`. Resolves git layout, loads the initial
     /// diff, and parks the scroll cursor on the most-recently-modified hunk.
@@ -168,6 +213,8 @@ impl App {
             head_dirty: false,
             should_quit: false,
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
+            visual_top: Cell::new(0.0),
+            anim: None,
         };
         app.recompute_diff();
         Ok(app)
@@ -413,10 +460,54 @@ impl App {
         self.scroll_to(next);
     }
 
+    /// Animated scroll: move the cursor row to `row` and kick off a
+    /// viewport-top tween from the currently drawn visual position.
+    /// No animation is started when `row` is already the cursor row
+    /// (a no-op), which keeps idle frames free of needless ticks.
     pub fn scroll_to(&mut self, row: usize) {
         let last = self.last_row_index();
-        self.scroll = row.min(last);
+        let target = row.min(last);
+        if target != self.scroll {
+            self.anim = Some(ScrollAnim {
+                from: self.visual_top.get(),
+                start: Instant::now(),
+                dur: SCROLL_ANIM_DURATION,
+            });
+        }
+        self.scroll = target;
         self.update_anchor_from_scroll();
+    }
+
+    /// Mark the active animation as finished if enough time has passed.
+    /// Returns `true` while an animation is still running, `false` once
+    /// the run loop can stop scheduling frame ticks. Pure (`&mut self`
+    /// only for the clear side-effect) so tests can inject `now`.
+    pub fn tick_anim(&mut self, now: Instant) -> bool {
+        let Some(anim) = self.anim else {
+            return false;
+        };
+        let done = now.saturating_duration_since(anim.start) >= anim.dur;
+        if done {
+            self.anim = None;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Animated variant of [`Self::viewport_top`]: feeds the logical
+    /// target through the active [`ScrollAnim`], sampling at `now`.
+    /// Stores the result in [`Self::visual_top`] so the next animation
+    /// kick-off starts from the exact row the last frame drew. `ui`
+    /// calls this instead of [`Self::viewport_top`] directly.
+    pub fn visual_viewport_top(&self, viewport_height: usize, now: Instant) -> usize {
+        let target = self.viewport_top(viewport_height) as f32;
+        let visual = match self.anim.as_ref() {
+            Some(anim) => anim.sample(target, now).0,
+            None => target,
+        };
+        self.visual_top.set(visual);
+        visual.round().max(0.0) as usize
     }
 
     fn last_row_index(&self) -> usize {
@@ -853,8 +944,16 @@ async fn run_loop(
 ) -> Result<()> {
     use crossterm::event::{Event, EventStream};
     use futures_util::StreamExt;
+    use tokio::time::{MissedTickBehavior, interval};
 
     let mut events = EventStream::new();
+
+    // ~60 fps frame tick. Only polled inside `select!` when an animation
+    // is live — idle frames never pay the cost. `Skip` means a long
+    // idle gap doesn't turn into a burst of catch-up ticks once the
+    // user kicks off a new animation.
+    let mut frame = interval(Duration::from_millis(16));
+    frame.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     while !app.should_quit {
         // Draw at the top of the loop so the bootstrap state is visible
@@ -862,6 +961,11 @@ async fn run_loop(
         terminal
             .draw(|frame| crate::ui::render(frame, app))
             .context("ratatui draw")?;
+
+        // Retire finished animations after the frame that showed their
+        // final position — the next frame will then draw the static
+        // target without another tween sample.
+        app.tick_anim(Instant::now());
 
         tokio::select! {
             Some(Ok(event)) = events.next() => {
@@ -884,6 +988,11 @@ async fn run_loop(
                 if head {
                     app.mark_head_dirty();
                 }
+            }
+            _ = frame.tick(), if app.anim.is_some() => {
+                // The tick itself carries no payload — falling through
+                // the bottom of the select! loops back to the `draw`
+                // call at the top, which is the whole point.
             }
         }
     }
@@ -977,6 +1086,8 @@ mod tests {
             head_dirty: false,
             should_quit: false,
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
+            visual_top: Cell::new(0.0),
+            anim: None,
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
@@ -1661,5 +1772,228 @@ mod tests {
         app.refresh_anchor();
 
         assert_eq!(app.current_file_path(), Some(Path::new("b.rs")));
+    }
+
+    // ---- scroll animation --------------------------------------------
+
+    #[test]
+    fn scroll_anim_sample_at_start_returns_from_not_done() {
+        let start = Instant::now();
+        let anim = ScrollAnim {
+            from: 10.0,
+            start,
+            dur: Duration::from_millis(150),
+        };
+        let (v, done) = anim.sample(20.0, start);
+        assert!((v - 10.0).abs() < 1e-4, "expected 10.0, got {v}");
+        assert!(!done);
+    }
+
+    #[test]
+    fn scroll_anim_sample_at_duration_returns_target_done() {
+        let start = Instant::now();
+        let anim = ScrollAnim {
+            from: 10.0,
+            start,
+            dur: Duration::from_millis(150),
+        };
+        let (v, done) = anim.sample(20.0, start + Duration::from_millis(150));
+        assert!((v - 20.0).abs() < 1e-4, "expected 20.0, got {v}");
+        assert!(done);
+    }
+
+    #[test]
+    fn scroll_anim_sample_past_halfway_is_biased_toward_target() {
+        // ease-out cubic: e(0.5) = 1 - 0.5^3 = 0.875
+        let start = Instant::now();
+        let anim = ScrollAnim {
+            from: 0.0,
+            start,
+            dur: Duration::from_millis(100),
+        };
+        let (v, done) = anim.sample(10.0, start + Duration::from_millis(50));
+        assert!((v - 8.75).abs() < 1e-3, "expected ~8.75 at t=0.5, got {v}");
+        assert!(!done);
+    }
+
+    #[test]
+    fn scroll_anim_sample_handles_moving_target_mid_tween() {
+        let start = Instant::now();
+        let anim = ScrollAnim {
+            from: 0.0,
+            start,
+            dur: Duration::from_millis(100),
+        };
+        // Target moved from 10 to 20 mid-animation.
+        let (v, _) = anim.sample(20.0, start + Duration::from_millis(50));
+        // e(0.5) = 0.875, so v = 0 + (20 - 0) * 0.875 = 17.5
+        assert!((v - 17.5).abs() < 1e-3, "expected ~17.5, got {v}");
+    }
+
+    #[test]
+    fn scroll_to_starts_animation_when_row_changes() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "x")]),
+                hunk(
+                    10,
+                    vec![
+                        diff_line(LineKind::Added, "y1"),
+                        diff_line(LineKind::Added, "y2"),
+                    ],
+                ),
+            ],
+            100,
+        )]);
+        app.anim = None;
+        app.scroll = 0;
+        app.scroll_to(3);
+        assert!(app.anim.is_some(), "anim should be set after scroll_to");
+    }
+
+    #[test]
+    fn scroll_to_does_not_start_animation_on_noop() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        app.anim = None;
+        let current = app.scroll;
+        app.scroll_to(current);
+        assert!(app.anim.is_none(), "no-op scroll must not start anim");
+    }
+
+    #[test]
+    fn scroll_to_carries_current_visual_into_animation_from() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "x")]),
+                hunk(
+                    20,
+                    vec![
+                        diff_line(LineKind::Added, "y1"),
+                        diff_line(LineKind::Added, "y2"),
+                    ],
+                ),
+            ],
+            100,
+        )]);
+        app.scroll = 0;
+        app.anim = None;
+        app.visual_top.set(7.25);
+        app.scroll_to(3);
+        let from = app.anim.as_ref().expect("anim set").from;
+        assert!((from - 7.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn tick_anim_clears_anim_once_duration_elapsed() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        let start = Instant::now() - Duration::from_millis(500);
+        app.anim = Some(ScrollAnim {
+            from: 0.0,
+            start,
+            dur: Duration::from_millis(150),
+        });
+        let still_running = app.tick_anim(Instant::now());
+        assert!(!still_running);
+        assert!(app.anim.is_none());
+    }
+
+    #[test]
+    fn tick_anim_keeps_anim_while_still_running() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        let start = Instant::now();
+        app.anim = Some(ScrollAnim {
+            from: 0.0,
+            start,
+            dur: Duration::from_millis(150),
+        });
+        let still_running = app.tick_anim(start + Duration::from_millis(50));
+        assert!(still_running);
+        assert!(app.anim.is_some());
+    }
+
+    #[test]
+    fn visual_viewport_top_matches_target_when_idle() {
+        // Build a multi-file layout so the viewport has something to center.
+        let app = fake_app(vec![
+            make_file(
+                "a.rs",
+                vec![hunk(
+                    1,
+                    (0..8)
+                        .map(|i| diff_line(LineKind::Added, &format!("a{i}")))
+                        .collect(),
+                )],
+                100,
+            ),
+            make_file(
+                "b.rs",
+                vec![hunk(
+                    1,
+                    (0..8)
+                        .map(|i| diff_line(LineKind::Added, &format!("b{i}")))
+                        .collect(),
+                )],
+                200,
+            ),
+        ]);
+        // Idle: no anim. visual_viewport_top should equal viewport_top.
+        let target = app.viewport_top(9);
+        let visual = app.visual_viewport_top(9, Instant::now());
+        assert_eq!(visual, target);
+    }
+
+    #[test]
+    fn visual_viewport_top_tweens_between_from_and_target() {
+        let mut app = fake_app(vec![
+            make_file(
+                "a.rs",
+                vec![hunk(
+                    1,
+                    (0..8)
+                        .map(|i| diff_line(LineKind::Added, &format!("a{i}")))
+                        .collect(),
+                )],
+                100,
+            ),
+            make_file(
+                "b.rs",
+                vec![hunk(
+                    1,
+                    (0..8)
+                        .map(|i| diff_line(LineKind::Added, &format!("b{i}")))
+                        .collect(),
+                )],
+                200,
+            ),
+        ]);
+        // Park scroll at a later row so target != 0.
+        app.scroll = app.layout.rows.len() - 1;
+        let target = app.viewport_top(9) as f32;
+        assert!(target > 0.0);
+
+        let start = Instant::now();
+        app.anim = Some(ScrollAnim {
+            from: 0.0,
+            start,
+            dur: Duration::from_millis(100),
+        });
+        // Sample at t=0.5: e(0.5) = 0.875, so visual ≈ 0.875 * target
+        let v = app.visual_viewport_top(9, start + Duration::from_millis(50));
+        let expected = (target * 0.875).round() as usize;
+        assert_eq!(v, expected);
     }
 }
