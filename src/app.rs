@@ -1729,15 +1729,25 @@ impl App {
 pub async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let mut app = App::bootstrap(cwd)?;
-    let mut watch = watcher::start(
-        &app.root,
-        &app.git_dir,
-        &app.common_git_dir,
-        app.current_branch_ref.as_deref(),
-    )?;
-
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
-    let result = run_loop(&mut terminal, &mut app, &mut watch).await;
+    let result = async {
+        // Draw one static frame before watcher startup. On macOS the
+        // PollWatcher fallback may take noticeable time to arm because it
+        // performs an initial scan; showing the bootstrap snapshot first
+        // keeps startup feeling immediate instead of blank-screening until
+        // watcher init finishes.
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .context("ratatui initial draw")?;
+        let mut watch = watcher::start(
+            &app.root,
+            &app.git_dir,
+            &app.common_git_dir,
+            app.current_branch_ref.as_deref(),
+        )?;
+        run_loop(&mut terminal, &mut app, &mut watch).await
+    }
+    .await;
     let _ = ratatui::try_restore();
     result
 }
