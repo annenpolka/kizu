@@ -1,3 +1,7 @@
+// v0.1 skeleton: most module items are stubs awaiting implementation.
+// Lifted once concrete code lands in app/git/watcher/ui modules.
+#![allow(dead_code)]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -7,7 +11,11 @@ mod ui;
 mod watcher;
 
 #[derive(Parser, Debug)]
-#[command(name = "kizu", version, about = "Realtime diff monitor + inline scar review TUI for AI coding agents")]
+#[command(
+    name = "kizu",
+    version,
+    about = "Realtime diff monitor + inline scar review TUI for AI coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
