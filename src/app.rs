@@ -1779,6 +1779,7 @@ mod tests {
         DiffLine {
             kind,
             content: content.to_string(),
+            has_trailing_newline: true,
         }
     }
 
