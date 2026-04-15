@@ -45,3 +45,4 @@ Michael Nygard 形式を採用する。ファイル名は `NNNN-kebab-case-title
 - [0008 — Dynamic watcher reconfiguration + health decoupled from diff errors](0008-dynamic-watcher-and-health-split.md)
 - [0009 — Visual cursor sub-row, self-consistent sticky header, content-row follow target](0009-visual-cursor-position.md)
 - [0010 — macOS watcher は poll fallback を使い、git state watch root を HEAD / refs / packed-refs に絞る](0010-macos-poll-fallback-and-targeted-git-watch-roots.md)
+- [0011 — common git-dir root watch を常設し late packed-refs rewrite を拾う](0011-common-git-root-watch-for-late-packed-refs.md)

@@ -269,24 +269,6 @@ fn spawn_worktree_debouncer(
 }
 
 fn git_state_watch_roots(git_dir: &Path, common_git_dir: &Path) -> Vec<WatchRoot> {
-    let packed_refs = common_git_dir.join("packed-refs");
-    let packed_root = if packed_refs.exists() {
-        WatchRoot {
-            path: packed_refs,
-            recursive_mode: RecursiveMode::NonRecursive,
-            compare_contents: true,
-        }
-    } else {
-        // `packed-refs` is optional; watch the common git-dir root just
-        // deeply enough to notice when the file is born. Keep this
-        // non-recursive so we never scan object packs or logs.
-        WatchRoot {
-            path: common_git_dir.to_path_buf(),
-            recursive_mode: RecursiveMode::NonRecursive,
-            compare_contents: false,
-        }
-    };
-
     vec![
         WatchRoot {
             path: git_dir.join("HEAD"),
@@ -301,7 +283,15 @@ fn git_state_watch_roots(git_dir: &Path, common_git_dir: &Path) -> Vec<WatchRoot
             recursive_mode: RecursiveMode::Recursive,
             compare_contents: true,
         },
-        packed_root,
+        // Watch the common git-dir root non-recursively so `packed-refs`
+        // is covered whether it exists at startup or is created later.
+        // Keeping this non-recursive avoids polling `objects/**` while
+        // still tracking root-level files like `packed-refs`.
+        WatchRoot {
+            path: common_git_dir.to_path_buf(),
+            recursive_mode: RecursiveMode::NonRecursive,
+            compare_contents: true,
+        },
     ]
 }
 
@@ -855,14 +845,14 @@ mod tests {
     }
 
     #[test]
-    fn git_state_watch_roots_focus_on_head_refs_and_packed_refs() {
+    fn git_state_watch_roots_focus_on_head_refs_and_common_root() {
         let temp = tempfile::tempdir().expect("tempdir");
         let git_dir = temp.path().join(".git");
         fs::create_dir_all(git_dir.join("refs").join("heads")).expect("create refs/heads");
 
-        let roots_without_packed = git_state_watch_roots(&git_dir, &git_dir);
+        let roots = git_state_watch_roots(&git_dir, &git_dir);
         assert_eq!(
-            roots_without_packed,
+            roots,
             vec![
                 WatchRoot {
                     path: git_dir.join("HEAD"),
@@ -877,20 +867,9 @@ mod tests {
                 WatchRoot {
                     path: git_dir.clone(),
                     recursive_mode: RecursiveMode::NonRecursive,
-                    compare_contents: false,
+                    compare_contents: true,
                 },
             ]
-        );
-
-        fs::write(git_dir.join("packed-refs"), "ref: demo\n").expect("write packed-refs");
-        let roots_with_packed = git_state_watch_roots(&git_dir, &git_dir);
-        assert_eq!(
-            roots_with_packed[2],
-            WatchRoot {
-                path: git_dir.join("packed-refs"),
-                recursive_mode: RecursiveMode::NonRecursive,
-                compare_contents: true,
-            }
         );
     }
 
@@ -1012,6 +991,74 @@ mod tests {
         assert!(
             saw_head_after_update,
             "after update_current_branch_ref the matcher must see the newly tracked branch"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn packed_refs_rewrites_after_birth_still_emit_head_event() {
+        let repo = init_repo();
+        fs::write(repo.path().join("seed.txt"), "seed\n").expect("write seed");
+        run_git(repo.path(), &["add", "seed.txt"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "init"]);
+
+        let root = crate::git::find_root(repo.path()).expect("find_root");
+        let git_dir = crate::git::git_dir(&root).expect("git_dir");
+        let common = crate::git::git_common_dir(&root).expect("common git_dir");
+        let branch = crate::git::current_branch_ref(&root).expect("current branch");
+        let packed_refs = common.join("packed-refs");
+
+        let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
+
+        tokio::time::sleep(TokioDuration::from_millis(150)).await;
+
+        // Phase 1: create packed-refs after startup. This simulates a repo
+        // that was born with loose refs only and later ran pack-refs.
+        fs::write(
+            &packed_refs,
+            "0000000000000000000000000000000000000000 refs/heads/main\n",
+        )
+        .expect("create packed-refs");
+
+        let mut saw_birth = false;
+        let phase1_until = tokio::time::Instant::now() + DRAIN_WAIT;
+        while tokio::time::Instant::now() < phase1_until {
+            match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
+                Ok(Some(WatchEvent::GitHead)) => {
+                    saw_birth = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(saw_birth, "creating packed-refs must emit GitHead");
+
+        // Phase 2: rewrite the same packed-refs file in place. The watcher
+        // must still see this even though packed-refs did not exist at
+        // startup and therefore did not have a dedicated file watcher.
+        fs::write(
+            &packed_refs,
+            "1111111111111111111111111111111111111111 refs/heads/main\n",
+        )
+        .expect("rewrite packed-refs");
+
+        let mut saw_rewrite = false;
+        let phase2_until = tokio::time::Instant::now() + DRAIN_WAIT;
+        while tokio::time::Instant::now() < phase2_until {
+            match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
+                Ok(Some(WatchEvent::GitHead)) => {
+                    saw_rewrite = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            saw_rewrite,
+            "rewriting packed-refs after it is created must still emit GitHead"
         );
     }
 }
