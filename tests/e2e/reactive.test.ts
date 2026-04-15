@@ -38,7 +38,7 @@ test("filesystem writes during the session appear without user input", async () 
   expect(view).not.toContain("+0 -0");
 });
 
-test("editing an existing file replaces the diff content reactively", async () => {
+test("editing an existing file replaces same-size diff content reactively", async () => {
   repo = createTempRepo();
   repo.write("src/app.rs", "fn main() {}\n");
   repo.git("add", ".");
@@ -50,13 +50,10 @@ test("editing an existing file replaces the diff content reactively", async () =
 
   // Now change the file again — kizu must pick up the new content
   // and remove the old "hi" string from the display.
-  repo.write(
-    "src/app.rs",
-    "fn main() { println!(\"rewritten content\"); }\n",
-  );
-  await session.waitForText("rewritten content", { timeout: 10_000 });
+  repo.write("src/app.rs", "fn main() { println!(\"ok\"); }\n");
+  await session.waitForText('println!("ok")', { timeout: 10_000 });
 
   const view = await session.text({ trimEnd: true });
-  expect(view).toContain("rewritten content");
+  expect(view).toContain('println!("ok")');
   expect(view).not.toContain("println!(\"hi\")");
 });

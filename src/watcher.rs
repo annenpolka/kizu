@@ -235,7 +235,7 @@ fn spawn_worktree_debouncer(
     let git_dir = git_dir.to_path_buf();
     let mut debouncer = new_kizu_debouncer(
         WORKTREE_DEBOUNCE,
-        false,
+        true,
         move |result: DebounceEventResult| {
             let events = match result {
                 Ok(events) => events,
@@ -1059,6 +1059,42 @@ mod tests {
         assert!(
             saw_rewrite,
             "rewriting packed-refs after it is created must still emit GitHead"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_size_existing_file_rewrite_emits_worktree_event() {
+        let repo = init_repo();
+        fs::write(repo.path().join("same.txt"), "alpha\n").expect("write seed");
+        run_git(repo.path(), &["add", "same.txt"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "init"]);
+
+        let root = crate::git::find_root(repo.path()).expect("find_root");
+        let git_dir = crate::git::git_dir(&root).expect("git_dir");
+        let common = crate::git::git_common_dir(&root).expect("common git_dir");
+        let branch = crate::git::current_branch_ref(&root).expect("current branch");
+
+        let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
+
+        tokio::time::sleep(TokioDuration::from_millis(250)).await;
+        fs::write(root.join("same.txt"), "omega\n").expect("rewrite same-size file");
+
+        let mut saw_worktree = false;
+        let drain_until = tokio::time::Instant::now() + DRAIN_WAIT;
+        while tokio::time::Instant::now() < drain_until {
+            match timeout(TokioDuration::from_millis(200), handle.events.recv()).await {
+                Ok(Some(WatchEvent::Worktree)) => {
+                    saw_worktree = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            saw_worktree,
+            "rewriting an existing file with the same size must still emit Worktree"
         );
     }
 }

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **kizu** は AI コーディングエージェント (主に Claude Code) と並走させるリアルタイム diff 監視 TUI。Rust 製の単一バイナリ。
 
-現状は **v0.1 MVP 実装中** (feat/v0.1-mvp ブランチ)。`src/{app,git,watcher,ui}.rs` は全て実装済みで、Rust 単体テスト 123 本 + tuistory e2e 11 本が green。
+現状は **v0.1 MVP 実装中** (feat/v0.1-mvp ブランチ)。`src/{app,git,watcher,ui}.rs` は全て実装済みで、Rust 単体テスト 125 本 + tuistory e2e 11 本が green。
 
 ## 実装前に必ず読むもの
 
@@ -99,7 +99,7 @@ cd tests/e2e && bun install --frozen-lockfile && KIZU_BIN=../../target/release/k
 ## 実装上のメモ
 
 - **diff の取得は git CLI を shell out して行う** (ライブラリは使わない)。`git diff --no-renames <baseline_sha> --` を基本とし、untracked は `git status --porcelain` から合成する。`--no-renames` を含む高度なフラグを再実装せずに使えることが理由 → [ADR-0001](docs/adr/0001-git-cli-shell-out.md)
-- watcher のデバウンスは worktree = 300ms / `<git_dir>/HEAD` = 100ms (SPEC.md 記載値)。`notify-debouncer-full` を採用し、macOS では `PollWatcher` fallback + `HEAD` / `refs` / `packed-refs` に絞った git state watch root を使う → [ADR-0002](docs/adr/0002-notify-debouncer-full.md), [ADR-0010](docs/adr/0010-macos-poll-fallback-and-targeted-git-watch-roots.md)
+- watcher のデバウンスは worktree = 300ms / `<git_dir>/HEAD` = 100ms (SPEC.md 記載値)。`notify-debouncer-full` を採用し、macOS では `PollWatcher` fallback + common git-dir root 常設 watch で `HEAD` / `refs` / `packed-refs` の意味論を担保しつつ、worktree 監視でも `compare_contents` を有効にして same-size rewrite を取りこぼさない → [ADR-0002](docs/adr/0002-notify-debouncer-full.md), [ADR-0010](docs/adr/0010-macos-poll-fallback-and-targeted-git-watch-roots.md), [ADR-0011](docs/adr/0011-common-git-root-watch-for-late-packed-refs.md), [ADR-0012](docs/adr/0012-worktree-content-compare-on-macos-poll.md)
 - 非同期ランタイムは tokio の `current_thread` flavor。`crossterm::event::EventStream` と watcher の `tokio::sync::mpsc::UnboundedReceiver` を `tokio::select!` で統合 → [ADR-0003](docs/adr/0003-tokio-async-runtime.md)
 - e2e テストは tuistory + bun (`tests/e2e/`)。Rust 単体テストは `cargo test --all-targets`、e2e は `bun test` → [ADR-0004](docs/adr/0004-tuistory-e2e.md)
 - watcher → app 境界は **drain ベースの coalescing** で背圧を取る。kizu 側の `.gitignore` フィルタは持たず、`git diff` 自体の `.gitignore` 尊重と coalescing で吸収する → [ADR-0005](docs/adr/0005-watcher-coalescing-no-ignore-filter.md)

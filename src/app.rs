@@ -34,8 +34,8 @@ pub struct App {
     /// longer raises false HEAD-dirty signals (ADR-0007).
     pub current_branch_ref: Option<String>,
     pub baseline_sha: String,
-    /// Files in the diff, sorted by `mtime` descending. Index 0 is the
-    /// most-recently-modified file.
+    /// Files in the diff, sorted by `mtime` ascending. The newest file is the
+    /// last entry so the scroll view reads top-to-bottom chronologically.
     pub files: Vec<FileDiff>,
     /// Derived flat row plan for the scroll view. Rebuilt whenever `files`
     /// changes via `build_layout`.
