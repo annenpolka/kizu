@@ -69,7 +69,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         let hl = app
             .highlighter
             .get_or_init(crate::highlight::Highlighter::new);
-        render_file_view(frame, main, fv, Some(hl));
+        // Sample the file-view scroll animation if active.
+        let effective_top = if let Some(anim) = &fv.anim {
+            let (v, _done) = anim.sample(fv.scroll_top as f32, std::time::Instant::now());
+            v.round() as usize
+        } else {
+            fv.scroll_top
+        };
+        render_file_view(frame, main, fv, Some(hl), effective_top);
     } else if app.files.is_empty() {
         render_empty(frame, main, app);
     } else {
@@ -855,13 +862,14 @@ fn render_file_view(
     area: Rect,
     fv: &crate::app::FileViewState,
     hl: Option<&crate::highlight::Highlighter>,
+    effective_top: usize,
 ) {
     let height = area.height as usize;
     let width = area.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
 
     for i in 0..height {
-        let line_idx = fv.scroll_top + i;
+        let line_idx = effective_top + i;
         if line_idx >= fv.lines.len() {
             lines.push(Line::from(Span::styled(
                 "~",

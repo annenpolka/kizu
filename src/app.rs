@@ -744,6 +744,12 @@ pub struct FileViewState {
     pub line_bg: std::collections::HashMap<usize, ratatui::style::Color>,
     pub cursor: usize,
     pub scroll_top: usize,
+    /// Easing tween for the file view's scroll_top, matching the
+    /// main diff view's 150ms ease-out cubic animation.
+    pub anim: Option<ScrollAnim>,
+    /// Last rendered scroll position (in row units). Used as the
+    /// tween's start point when a new animation begins.
+    pub visual_top: f32,
 }
 
 /// Confirmation overlay for hunk revert (`x` key). Holds the
@@ -2176,6 +2182,7 @@ impl App {
             .unwrap_or(0)
             .min(lines.len().saturating_sub(1));
 
+        let scroll_top = initial_cursor.saturating_sub(self.last_body_height.get() / 2);
         self.file_view = Some(FileViewState {
             file_idx,
             path: file.path.clone(),
@@ -2183,7 +2190,9 @@ impl App {
             lines,
             line_bg,
             cursor: initial_cursor,
-            scroll_top: initial_cursor.saturating_sub(self.last_body_height.get() / 2),
+            scroll_top,
+            anim: None,
+            visual_top: scroll_top as f32,
         });
     }
 
@@ -2209,11 +2218,11 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('d') => {
-                    self.file_view_scroll_by(HALF_PAGE as isize);
+                    self.file_view_scroll_by(HALF_PAGE as isize, true);
                     return KeyEffect::None;
                 }
                 KeyCode::Char('u') => {
-                    self.file_view_scroll_by(-(HALF_PAGE as isize));
+                    self.file_view_scroll_by(-(HALF_PAGE as isize), true);
                     return KeyEffect::None;
                 }
                 _ => {}
@@ -2225,17 +2234,17 @@ impl App {
             // adaptive-motion feel. J/K: exact 1-row move.
             KeyCode::Char('j') | KeyCode::Down => {
                 let chunk = self.chunk_size() as isize;
-                self.file_view_scroll_by(chunk);
+                self.file_view_scroll_by(chunk, true);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 let chunk = self.chunk_size() as isize;
-                self.file_view_scroll_by(-chunk);
+                self.file_view_scroll_by(-chunk, true);
             }
             KeyCode::Char('J') => {
-                self.file_view_scroll_by(1);
+                self.file_view_scroll_by(1, false);
             }
             KeyCode::Char('K') => {
-                self.file_view_scroll_by(-1);
+                self.file_view_scroll_by(-1, false);
             }
             KeyCode::Char('g') => {
                 self.file_view_goto(0);
@@ -2267,7 +2276,7 @@ impl App {
         KeyEffect::None
     }
 
-    fn file_view_scroll_by(&mut self, delta: isize) {
+    fn file_view_scroll_by(&mut self, delta: isize, animate: bool) {
         let Some(fv) = self.file_view.as_mut() else {
             return;
         };
@@ -2275,10 +2284,38 @@ impl App {
         let new = (fv.cursor as isize + delta).clamp(0, max as isize) as usize;
         fv.cursor = new;
         let vh = self.last_body_height.get();
+        let old_top = fv.scroll_top;
         if fv.cursor < fv.scroll_top {
             fv.scroll_top = fv.cursor;
         } else if fv.cursor >= fv.scroll_top + vh {
             fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
+        }
+        if animate && fv.scroll_top != old_top {
+            fv.anim = Some(ScrollAnim {
+                from: fv.visual_top,
+                start: Instant::now(),
+                dur: SCROLL_ANIM_DURATION,
+            });
+        } else if !animate {
+            // Snap: clear any in-flight animation (J/K 1-row moves).
+            fv.anim = None;
+            fv.visual_top = fv.scroll_top as f32;
+        }
+    }
+
+    /// Advance the file-view scroll animation by one frame.
+    /// Updates `visual_top` and clears `anim` when the tween finishes.
+    pub fn tick_file_view_anim(&mut self) {
+        let Some(fv) = self.file_view.as_mut() else {
+            return;
+        };
+        let Some(anim) = &fv.anim else {
+            return;
+        };
+        let (v, done) = anim.sample(fv.scroll_top as f32, Instant::now());
+        fv.visual_top = v;
+        if done {
+            fv.anim = None;
         }
     }
 
@@ -2294,6 +2331,9 @@ impl App {
         } else if fv.cursor >= fv.scroll_top + vh {
             fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
         }
+        // g/G are instant jumps — no animation.
+        fv.anim = None;
+        fv.visual_top = fv.scroll_top as f32;
     }
 
     /// Enter the `/` search-query composer. Any previously
@@ -3258,6 +3298,7 @@ async fn run_loop(
         // final position — the next frame will then draw the static
         // target without another tween sample.
         app.tick_anim(Instant::now());
+        app.tick_file_view_anim();
 
         tokio::select! {
             event = events.next() => {
@@ -3325,7 +3366,7 @@ async fn run_loop(
                     app.recompute_diff();
                 }
             }
-            _ = frame.tick(), if app.anim.is_some() => {
+            _ = frame.tick(), if app.anim.is_some() || app.file_view.as_ref().is_some_and(|fv| fv.anim.is_some()) => {
                 // The tick itself carries no payload — falling through
                 // the bottom of the select! loops back to the `draw`
                 // call at the top, which is the whole point.
