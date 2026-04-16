@@ -77,6 +77,20 @@ pub enum LineKind {
 ///
 /// The `--no-renames` flag (ADR-0001) keeps the parser simple and avoids
 /// rename detection diverging from the user's mental model.
+/// Get the unified diff for a single file against the baseline.
+/// Returns the raw diff output as a string, or an empty string on failure.
+pub fn diff_single_file(root: &Path, baseline_sha: &str, file_path: &Path) -> Result<String> {
+    let rel = file_path
+        .strip_prefix(root)
+        .unwrap_or(file_path);
+    let output = Command::new("git")
+        .args(["diff", "--no-renames", baseline_sha, "--", &rel.to_string_lossy()])
+        .current_dir(root)
+        .output()
+        .context("git diff single file")?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 pub fn compute_diff(root: &Path, baseline_sha: &str) -> Result<Vec<FileDiff>> {
     let output = Command::new("git")
         .args(["diff", "--no-renames", baseline_sha, "--"])

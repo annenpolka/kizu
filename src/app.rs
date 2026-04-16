@@ -11,8 +11,35 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 const SCROLL_ANIM_DURATION: Duration = Duration::from_millis(150);
 
 use crate::git::{self, DiffContent, FileDiff, FileStatus, LineKind};
+use crate::hook::SanitizedEvent;
 use crate::scar::ScarKind;
 use crate::watcher::{self, WatchEvent, WatchSource};
+
+/// Which TUI view is currently active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// Main diff view — filesystem-based state view ("what does the repo look like now?").
+    #[default]
+    Diff,
+    /// Stream mode — event-log-based operation history ("what did the agent do?").
+    Stream,
+}
+
+/// One entry in the stream mode view. Combines the sanitized event
+/// metadata (from `hook-log-event`) with optionally captured diff
+/// snapshots for per-operation diff display.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields read by ui::render_stream_view (M3 render)
+pub struct StreamEvent {
+    pub metadata: SanitizedEvent,
+    /// Per-operation diff captured by the TUI in real-time.
+    /// `None` for events that occurred before the TUI was started.
+    pub diff_snapshot: Option<String>,
+    /// Number of added lines in this operation's diff.
+    pub add_count: usize,
+    /// Number of deleted lines in this operation's diff.
+    pub del_count: usize,
+}
 
 /// Half-page scroll constant for `Ctrl-d` / `Ctrl-u`. M5+ may swap this for
 /// the real viewport height once we plumb it through; until then a fixed
@@ -149,6 +176,15 @@ pub struct App {
     /// Controls keybindings, colors, debounce timing, editor command,
     /// and terminal auto-split preferences.
     pub config: crate::config::KizuConfig,
+    /// Active view mode: Diff (default) or Stream.
+    pub view_mode: ViewMode,
+    /// Stream mode events, ordered by timestamp ascending.
+    pub stream_events: Vec<StreamEvent>,
+    /// Cursor position in the stream events list.
+    pub stream_cursor: usize,
+    /// Per-file diff snapshots used to compute per-operation diffs.
+    /// Maps file path → most recent cumulative diff output.
+    pub diff_snapshots: std::collections::HashMap<PathBuf, String>,
 }
 
 /// Tracks whether the underlying notify debouncers are still pushing
@@ -846,6 +882,10 @@ impl App {
             watcher_health: WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
             config,
+            view_mode: ViewMode::default(),
+            stream_events: Vec::new(),
+            stream_cursor: 0,
+            diff_snapshots: std::collections::HashMap::new(),
         };
         app.apply_computed_files(initial);
         Ok(app)
@@ -887,6 +927,79 @@ impl App {
         // lands cleanly on the row's first visual line under the
         // new coordinate system.
         self.cursor_sub_row = 0;
+    }
+
+    /// Toggle between Diff and Stream view modes.
+    pub fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Diff => ViewMode::Stream,
+            ViewMode::Stream => ViewMode::Diff,
+        };
+    }
+
+    /// Handle a new event-log file notification. Reads the event file,
+    /// captures the per-operation diff snapshot, and appends to
+    /// `stream_events`. Failures are silently ignored (non-critical).
+    pub fn handle_event_log(&mut self, path: PathBuf) {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let event: SanitizedEvent = match serde_json::from_str(&content) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        // Capture per-operation diff for each affected file.
+        let mut operation_diff = String::new();
+        let mut add_count = 0usize;
+        let mut del_count = 0usize;
+
+        for file_path in &event.file_paths {
+            // Get current cumulative diff for this file.
+            let current_diff = git::diff_single_file(&self.root, &self.baseline_sha, file_path)
+                .unwrap_or_default();
+
+            // Compute per-operation diff by comparing with previous snapshot.
+            let prev = self.diff_snapshots.get(file_path).cloned().unwrap_or_default();
+            let op_diff = compute_operation_diff(&prev, &current_diff);
+
+            if !op_diff.is_empty() {
+                if !operation_diff.is_empty() {
+                    operation_diff.push('\n');
+                }
+                operation_diff.push_str(&op_diff);
+            }
+
+            // Count added/deleted lines.
+            for line in op_diff.lines() {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    add_count += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    del_count += 1;
+                }
+            }
+
+            // Update snapshot.
+            self.diff_snapshots.insert(file_path.clone(), current_diff);
+        }
+
+        let stream_event = StreamEvent {
+            metadata: event,
+            diff_snapshot: if operation_diff.is_empty() {
+                None
+            } else {
+                Some(operation_diff)
+            },
+            add_count,
+            del_count,
+        };
+        self.stream_events.push(stream_event);
+
+        // Auto-scroll to latest event if in stream mode.
+        if self.view_mode == ViewMode::Stream {
+            self.stream_cursor = self.stream_events.len().saturating_sub(1);
+        }
     }
 
     /// Re-run `git diff`, populate per-file mtimes, sort files by mtime
@@ -1038,6 +1151,9 @@ impl App {
                     head = true;
                     recovered_sources.push(source);
                 }
+                WatchEvent::EventLog(path) => {
+                    self.handle_event_log(path);
+                }
                 WatchEvent::Error { source, message } => {
                     failed_sources.insert(source, message);
                 }
@@ -1116,6 +1232,27 @@ impl App {
             }
         }
 
+        // In stream mode, j/k navigate the event list instead of the diff.
+        if self.view_mode == ViewMode::Stream {
+            match key.code {
+                KeyCode::Tab => self.toggle_view_mode(),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if self.stream_cursor + 1 < self.stream_events.len() {
+                        self.stream_cursor += 1;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.stream_cursor = self.stream_cursor.saturating_sub(1);
+                }
+                KeyCode::Char('g') => self.stream_cursor = 0,
+                KeyCode::Char('G') => {
+                    self.stream_cursor = self.stream_events.len().saturating_sub(1);
+                }
+                _ => {}
+            }
+            return KeyEffect::None;
+        }
+
         match key.code {
             // Lowercase `j`/`k` + arrows are the *daily driver*: adaptive
             // motion that reads like continuous scrolling in long hunks
@@ -1167,6 +1304,9 @@ impl App {
             KeyCode::Char('G') => {
                 self.scroll_to(self.last_row_index());
                 self.follow_mode = false;
+            }
+            KeyCode::Tab => {
+                self.toggle_view_mode();
             }
             KeyCode::Enter => {
                 self.open_file_view();
@@ -2766,6 +2906,24 @@ impl App {
 }
 
 /// Async event loop. See ADR-0003 / ADR-0005.
+/// Compute the "operation diff" — the lines in `current` that are
+/// not in `previous`. This is a simple set-difference on diff lines,
+/// not a true diff-of-diff. Good enough for showing what changed in
+/// one Write/Edit operation when we have cumulative diff snapshots
+/// before and after the operation.
+fn compute_operation_diff(previous: &str, current: &str) -> String {
+    use std::collections::HashSet;
+    let prev_lines: HashSet<&str> = previous.lines().collect();
+    let mut result = String::new();
+    for line in current.lines() {
+        if !prev_lines.contains(line) {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    result
+}
+
 pub async fn run() -> Result<()> {
     use std::io::Write;
     let log_path = std::env::var("KIZU_STARTUP_TIMING_FILE").ok();
@@ -3142,6 +3300,10 @@ mod tests {
             watcher_health: WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
             config: crate::config::KizuConfig::default(),
+            view_mode: ViewMode::default(),
+            stream_events: Vec::new(),
+            stream_cursor: 0,
+            diff_snapshots: std::collections::HashMap::new(),
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
@@ -6692,5 +6854,105 @@ mod tests {
             after, "a\n// @kizu[ask]: explain this change\nd\n",
             "scar on all-deleted hunk must land at the deletion gap"
         );
+    }
+
+    // ---- stream mode tests ----
+
+    #[test]
+    fn toggle_view_mode_switches_between_diff_and_stream() {
+        let mut app = fake_app(vec![]);
+        assert_eq!(app.view_mode, ViewMode::Diff);
+        app.toggle_view_mode();
+        assert_eq!(app.view_mode, ViewMode::Stream);
+        app.toggle_view_mode();
+        assert_eq!(app.view_mode, ViewMode::Diff);
+    }
+
+    #[test]
+    fn tab_key_toggles_view_mode() {
+        let mut app = fake_app(vec![]);
+        assert_eq!(app.view_mode, ViewMode::Diff);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.view_mode, ViewMode::Stream);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.view_mode, ViewMode::Diff);
+    }
+
+    #[test]
+    fn stream_mode_j_k_navigate_events() {
+        let mut app = fake_app(vec![]);
+        app.view_mode = ViewMode::Stream;
+
+        // Add some fake events.
+        for i in 0..5 {
+            app.stream_events.push(StreamEvent {
+                metadata: crate::hook::SanitizedEvent {
+                    session_id: None,
+                    hook_event_name: "PostToolUse".into(),
+                    tool_name: Some("Edit".into()),
+                    file_paths: vec![PathBuf::from(format!("file{i}.rs"))],
+                    cwd: PathBuf::from("/tmp"),
+                    timestamp_ms: 1000 + i as u64,
+                },
+                diff_snapshot: None,
+                add_count: 0,
+                del_count: 0,
+            });
+        }
+
+        assert_eq!(app.stream_cursor, 0);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.stream_cursor, 1);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.stream_cursor, 2);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.stream_cursor, 1);
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.stream_cursor, 4);
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.stream_cursor, 0);
+    }
+
+    #[test]
+    fn stream_mode_j_k_clamp_at_bounds() {
+        let mut app = fake_app(vec![]);
+        app.view_mode = ViewMode::Stream;
+
+        app.stream_events.push(StreamEvent {
+            metadata: crate::hook::SanitizedEvent {
+                session_id: None,
+                hook_event_name: "PostToolUse".into(),
+                tool_name: Some("Write".into()),
+                file_paths: vec![],
+                cwd: PathBuf::from("/tmp"),
+                timestamp_ms: 1000,
+            },
+            diff_snapshot: None,
+            add_count: 0,
+            del_count: 0,
+        });
+
+        // Can't go below 0.
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.stream_cursor, 0);
+
+        // Can't go past the last event.
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.stream_cursor, 0); // Only 1 event, already at 0
+    }
+
+    #[test]
+    fn compute_operation_diff_returns_new_lines_only() {
+        let prev = "+added line 1\n context\n";
+        let curr = "+added line 1\n+added line 2\n context\n";
+        let op = super::compute_operation_diff(prev, curr);
+        assert_eq!(op, "+added line 2\n");
+    }
+
+    #[test]
+    fn compute_operation_diff_empty_when_identical() {
+        let prev = "+line 1\n+line 2\n";
+        let op = super::compute_operation_diff(prev, prev);
+        assert!(op.is_empty());
     }
 }

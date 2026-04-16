@@ -70,6 +70,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             .highlighter
             .get_or_init(crate::highlight::Highlighter::new);
         render_file_view(frame, main, fv, Some(hl));
+    } else if app.view_mode == crate::app::ViewMode::Stream {
+        render_stream_view(frame, main, app);
     } else if app.files.is_empty() {
         render_empty(frame, main, app);
     } else {
@@ -913,6 +915,151 @@ fn render_file_view(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Render the stream mode view: a time-ordered list of operations
+/// in the left pane, and the selected operation's diff in the right pane.
+fn render_stream_view(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.stream_events.is_empty() {
+        let msg = Paragraph::new("No stream events yet. Waiting for hook-log-event...")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    // Split into left (event list) and right (diff detail).
+    let chunks = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+    let list_area = chunks[0];
+    let detail_area = chunks[1];
+
+    // Build event list items.
+    let items: Vec<ListItem<'_>> = app
+        .stream_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| {
+            let ts = ev.metadata.timestamp_ms;
+            let secs = ts / 1000;
+            let hours = (secs / 3600) % 24;
+            let mins = (secs / 60) % 60;
+            let s = secs % 60;
+            let time_str = format!("{hours:02}:{mins:02}:{s:02}");
+
+            let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
+            let file = ev
+                .metadata
+                .file_paths
+                .first()
+                .map(|p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_default();
+
+            let counts = if ev.add_count > 0 || ev.del_count > 0 {
+                format!(" +{}/-{}", ev.add_count, ev.del_count)
+            } else {
+                String::new()
+            };
+
+            let style = if i == app.stream_cursor {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{time_str} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{tool:<6}"), Style::default().fg(Color::Cyan)),
+                Span::styled(file, style),
+                Span::styled(counts, Style::default().fg(Color::Green)),
+            ]))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.stream_cursor));
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .title(" Stream ")
+                .title_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_stateful_widget(list, list_area, &mut list_state);
+
+    // Render selected event's diff.
+    if let Some(ev) = app.stream_events.get(app.stream_cursor) {
+        let diff_text = ev
+            .diff_snapshot
+            .as_deref()
+            .unwrap_or("[diff not captured — event occurred before TUI started]");
+
+        let hl = app
+            .highlighter
+            .get_or_init(crate::highlight::Highlighter::new);
+
+        let lines: Vec<Line<'_>> = diff_text
+            .lines()
+            .map(|line| {
+                let bg_added = app.config.colors.bg_added_color();
+                let bg_deleted = app.config.colors.bg_deleted_color();
+                let style = if line.starts_with('+') && !line.starts_with("+++") {
+                    Style::default().bg(bg_added)
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    Style::default().bg(bg_deleted)
+                } else if line.starts_with("@@") {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                // Try syntax highlight for the content.
+                let file_path = ev.metadata.file_paths.first();
+                if let Some(fp) = file_path {
+                    let content = line
+                        .strip_prefix('+')
+                        .or_else(|| line.strip_prefix('-'))
+                        .unwrap_or(line);
+                    let tokens = hl.highlight_line(content, fp);
+                    if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
+                        let spans: Vec<Span<'_>> = tokens
+                            .iter()
+                            .map(|t| {
+                                let mut s = Style::default().fg(t.fg);
+                                if let Some(bg) = style.bg {
+                                    s = s.bg(bg);
+                                }
+                                Span::styled(t.text.to_string(), s)
+                            })
+                            .collect();
+                        return Line::from(spans);
+                    }
+                }
+                let _ = hl; // suppress unused
+                Line::styled(line.to_string(), style)
+            })
+            .collect();
+
+        let detail = Paragraph::new(lines).block(
+            Block::default()
+                .title(" Diff ")
+                .title_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(detail, detail_area);
+    }
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Pre-styled spans for the four "static" pieces of the status bar.
     let dim = Style::default().fg(Color::DarkGray);
@@ -929,6 +1076,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("[search]", Color::Yellow)
     } else if app.file_view.is_some() {
         ("[file view]", Color::Cyan)
+    } else if app.view_mode == crate::app::ViewMode::Stream {
+        ("[stream]", Color::Blue)
     } else if app.follow_mode {
         ("[follow]", Color::Green)
     } else {
@@ -1309,6 +1458,10 @@ mod tests {
             watcher_health: crate::app::WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
             config: crate::config::KizuConfig::default(),
+            view_mode: crate::app::ViewMode::default(),
+            stream_events: Vec::new(),
+            stream_cursor: 0,
+            diff_snapshots: std::collections::HashMap::new(),
         }
     }
 

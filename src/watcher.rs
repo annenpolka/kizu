@@ -90,6 +90,11 @@ pub enum WatchEvent {
     Worktree,
     /// Something baseline-affecting inside `<git_dir>` changed.
     GitHead(WatchSource),
+    /// A new event-log file was created in `<state_dir>/events/`.
+    /// Carries the absolute path to the new file so the app can
+    /// read and parse it without re-scanning the directory.
+    #[allow(dead_code)] // Constructed when events dir watcher is wired up
+    EventLog(PathBuf),
     /// The underlying notify backend reported an error. The app
     /// treats this as a forced recompute plus a visible error string.
     Error {
@@ -792,7 +797,7 @@ mod tests {
                     saw_head = true;
                     break;
                 }
-                Ok(Some(WatchEvent::Error { .. })) => continue,
+                Ok(Some(WatchEvent::Error { .. } | WatchEvent::EventLog(_))) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
@@ -849,7 +854,7 @@ mod tests {
                     break;
                 }
                 Ok(Some(WatchEvent::Worktree)) => continue,
-                Ok(Some(WatchEvent::Error { .. })) => continue,
+                Ok(Some(WatchEvent::Error { .. } | WatchEvent::EventLog(_))) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
@@ -910,7 +915,7 @@ mod tests {
                     break;
                 }
                 Ok(Some(WatchEvent::Worktree)) => continue,
-                Ok(Some(WatchEvent::Error { .. })) => continue,
+                Ok(Some(WatchEvent::Error { .. } | WatchEvent::EventLog(_))) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
@@ -1000,7 +1005,7 @@ mod tests {
                     break;
                 }
                 Ok(Some(WatchEvent::Worktree)) => continue,
-                Ok(Some(WatchEvent::Error { .. })) => continue,
+                Ok(Some(WatchEvent::Error { .. } | WatchEvent::EventLog(_))) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
             }
