@@ -201,6 +201,17 @@ pub struct InstallReport {
     pub warnings: Vec<String>,
 }
 
+/// Resolve the kizu binary path for embedding in hook commands.
+/// Prefers the current executable's absolute path so hooks work
+/// even when `kizu` is not globally on PATH. Falls back to bare
+/// `kizu` if the executable path cannot be determined.
+fn kizu_bin() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "kizu".to_string())
+}
+
 /// Run `kizu init` interactively or non-interactively.
 pub fn run_init(
     project_root: &Path,
@@ -461,12 +472,13 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
             );
         }
         std::fs::rename(&hook_path, &user_hook)?;
+        let bin = kizu_bin();
         let shim = format!(
             "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
              # Run the original user hook first.\n\
              \"$(dirname \"$0\")/pre-commit.user\" \"$@\"\n\
              # Then run kizu scar guard.\n\
-             kizu hook-pre-commit\n"
+             {bin} hook-pre-commit\n"
         );
         std::fs::write(&hook_path, shim)?;
         println!(
@@ -474,10 +486,11 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
             user_hook.display()
         );
     } else {
+        let bin = kizu_bin();
         let shim = format!(
             "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
              # kizu scar guard\n\
-             kizu hook-pre-commit\n"
+             {bin} hook-pre-commit\n"
         );
         std::fs::write(&hook_path, shim)?;
     }
@@ -614,7 +627,11 @@ fn merge_hooks_into_settings(
                     cmds.iter().any(|cmd| {
                         cmd.get("command")
                             .and_then(|v| v.as_str())
-                            .is_some_and(|c| c.starts_with("kizu hook-"))
+                            .is_some_and(|c| {
+                                c.contains("kizu hook-")
+                                    || c.contains(" hook-post-tool")
+                                    || c.contains(" hook-stop")
+                            })
                     })
                 })
         });
@@ -650,13 +667,12 @@ fn merge_hooks_into_settings(
 
 fn install_claude_code(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::ClaudeCode, scope, project_root)?;
+    let bin = kizu_bin();
+    let post_cmd = format!("{bin} hook-post-tool --agent claude-code");
+    let stop_cmd = format!("{bin} hook-stop --agent claude-code");
     let hooks = &[
-        (
-            "PostToolUse",
-            "Edit|Write|MultiEdit",
-            "kizu hook-post-tool --agent claude-code",
-        ),
-        ("Stop", "", "kizu hook-stop --agent claude-code"),
+        ("PostToolUse", "Edit|Write|MultiEdit", post_cmd.as_str()),
+        ("Stop", "", stop_cmd.as_str()),
     ];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
@@ -688,9 +704,12 @@ fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
         .and_then(|v| v.as_object_mut())
         .ok_or_else(|| anyhow::anyhow!("hooks is not an object in hooks.json"))?;
 
+    let bin = kizu_bin();
+    let post_cmd = format!("{bin} hook-post-tool --agent cursor");
+    let stop_cmd = format!("{bin} hook-stop --agent cursor");
     let entries = &[
-        ("afterFileEdit", "kizu hook-post-tool --agent cursor"),
-        ("stop", "kizu hook-stop --agent cursor"),
+        ("afterFileEdit", post_cmd.as_str()),
+        ("stop", stop_cmd.as_str()),
     ];
 
     let mut added = 0;
@@ -703,9 +722,11 @@ fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
             .ok_or_else(|| anyhow::anyhow!("hooks.{event} is not an array"))?;
 
         let already = arr.iter().any(|e| {
-            e.get("command")
-                .and_then(|v| v.as_str())
-                .is_some_and(|c| c.starts_with("kizu hook-"))
+            e.get("command").and_then(|v| v.as_str()).is_some_and(|c| {
+                c.contains("kizu hook-")
+                    || c.contains(" hook-post-tool")
+                    || c.contains(" hook-stop")
+            })
         });
         if already {
             skipped += 1;
@@ -737,7 +758,9 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
             .join("hooks.json"),
     };
     // Codex: Stop only (PreTool/PostTool is Bash-only).
-    let hooks = &[("Stop", "", "kizu hook-stop --agent codex")];
+    let bin = kizu_bin();
+    let stop_cmd = format!("{bin} hook-stop --agent codex");
+    let hooks = &[("Stop", "", stop_cmd.as_str())];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
         agent: AgentKind::Codex,
@@ -752,13 +775,12 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
 
 fn install_qwen(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::QwenCode, scope, project_root)?;
+    let bin = kizu_bin();
+    let post_cmd = format!("{bin} hook-post-tool --agent qwen");
+    let stop_cmd = format!("{bin} hook-stop --agent qwen");
     let hooks = &[
-        (
-            "PostToolUse",
-            "Edit|Write|MultiEdit",
-            "kizu hook-post-tool --agent qwen",
-        ),
-        ("Stop", "", "kizu hook-stop --agent qwen"),
+        ("PostToolUse", "Edit|Write|MultiEdit", post_cmd.as_str()),
+        ("Stop", "", stop_cmd.as_str()),
     ];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
@@ -780,7 +802,7 @@ fn install_cline(project_root: &Path) -> Result<InstallReport> {
     let mut added = 0;
     if hook_file.exists() {
         let content = std::fs::read_to_string(&hook_file)?;
-        if content.contains("kizu hook-") {
+        if content.contains("hook-post-tool") || content.contains("hook-stop") {
             skipped = 1;
         } else {
             // Append to existing hook script.
@@ -788,12 +810,15 @@ fn install_cline(project_root: &Path) -> Result<InstallReport> {
             if !new.ends_with('\n') {
                 new.push('\n');
             }
-            new.push_str("kizu hook-post-tool --agent cline\n");
+            new.push_str(&format!("{} hook-post-tool --agent cline\n", kizu_bin()));
             std::fs::write(&hook_file, new)?;
             added = 1;
         }
     } else {
-        std::fs::write(&hook_file, "#!/bin/sh\nkizu hook-post-tool --agent cline\n")?;
+        std::fs::write(
+            &hook_file,
+            format!("#!/bin/sh\n{} hook-post-tool --agent cline\n", kizu_bin()),
+        )?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -905,10 +930,10 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
                 .join("PostToolUse");
             if hook_file.exists() {
                 let content = std::fs::read_to_string(&hook_file)?;
-                if content.contains("kizu hook-") {
+                if content.contains("hook-post-tool") || content.contains("hook-stop") {
                     let cleaned: String = content
                         .lines()
-                        .filter(|l| !l.contains("kizu hook-"))
+                        .filter(|l| !l.contains("hook-post-tool") && !l.contains("hook-stop"))
                         .collect::<Vec<_>>()
                         .join("\n");
                     if cleaned.trim().is_empty() || cleaned.trim() == "#!/bin/sh" {
@@ -1018,7 +1043,11 @@ fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
                 let flat_kizu = group
                     .get("command")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|c| c.starts_with("kizu hook-"));
+                    .is_some_and(|c| {
+                        c.contains("kizu hook-")
+                            || c.contains(" hook-post-tool")
+                            || c.contains(" hook-stop")
+                    });
                 // New nested schema: { "matcher": "...", "hooks": [{ "command": "kizu hook-..." }] }
                 let nested_kizu =
                     group
@@ -1028,7 +1057,11 @@ fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
                             cmds.iter().any(|cmd| {
                                 cmd.get("command")
                                     .and_then(|v| v.as_str())
-                                    .is_some_and(|c| c.starts_with("kizu hook-"))
+                                    .is_some_and(|c| {
+                                        c.contains("kizu hook-")
+                                            || c.contains(" hook-post-tool")
+                                            || c.contains(" hook-stop")
+                                    })
                             })
                         });
                 !flat_kizu && !nested_kizu

@@ -128,9 +128,16 @@ fn run_hook_pre_commit() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let root = git::find_root(&cwd)?;
 
-    // Get staged files.
+    // Get staged files via NUL-delimited output to handle paths
+    // with special characters safely.
     let output = Command::new("git")
-        .args(["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+        .args([
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMR",
+        ])
         .current_dir(&root)
         .output()
         .context("git diff --cached")?;
@@ -139,10 +146,11 @@ fn run_hook_pre_commit() -> Result<()> {
         return Ok(()); // Can't determine staged files; don't block.
     }
 
-    let staged: Vec<std::path::PathBuf> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| root.join(l.trim()))
+    let staged: Vec<std::path::PathBuf> = output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|r| !r.is_empty())
+        .map(|r| root.join(String::from_utf8_lossy(r).as_ref()))
         .collect();
 
     if staged.is_empty() {
