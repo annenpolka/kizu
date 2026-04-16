@@ -39,16 +39,16 @@ const BG_DELETED: Color = Color::Rgb(60, 10, 10);
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
 
-    // Determine input-line content + prefix for height calculation.
-    let input_line: Option<(String, &str)> = if let Some(state) = app.scar_comment.as_ref() {
-        Some((state.body.clone(), "> "))
+    // Determine input-line content + prefix + cursor pos for rendering.
+    let input_line: Option<(String, &str, usize)> = if let Some(state) = app.scar_comment.as_ref() {
+        Some((state.body.clone(), "> ", state.cursor_pos))
     } else if let Some(input) = app.search_input.as_ref() {
-        Some((input.query.clone(), "/"))
+        Some((input.query.clone(), "/", input.cursor_pos))
     } else {
         None
     };
 
-    let input_height: u16 = if let Some((ref text, prefix)) = input_line {
+    let input_height: u16 = if let Some((ref text, prefix, _)) = input_line {
         use unicode_width::UnicodeWidthStr;
         let total_width = prefix.width() + text.width() + 1; // +1 for cursor block
         let w = (area.width as usize).max(1);
@@ -76,8 +76,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     }
 
     // Render the dedicated input row when a text overlay is active.
-    if let Some((text, prefix)) = input_line {
-        render_input_line(frame, input_area, prefix, &text);
+    if let Some((text, prefix, cursor_pos)) = input_line {
+        render_input_line(frame, input_area, prefix, &text, cursor_pos);
     }
 
     render_footer(frame, footer, app);
@@ -90,32 +90,64 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 /// Render a text-input line with wrapping support and a blinking
 /// cursor block at the text end. Used for both scar-comment (`> `)
 /// and search (`/`) overlays.
-fn render_input_line(frame: &mut Frame<'_>, area: Rect, prefix: &str, text: &str) {
+fn render_input_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    prefix: &str,
+    text: &str,
+    cursor_pos: usize,
+) {
     use ratatui::widgets::Wrap;
+    use unicode_width::UnicodeWidthStr;
 
-    let display = format!("{prefix}{text}");
-    let paragraph = Paragraph::new(Line::from(vec![
+    // Split text at cursor position for visual cursor rendering.
+    let before_cursor: String = text.chars().take(cursor_pos).collect();
+    let cursor_char: String = text
+        .chars()
+        .nth(cursor_pos)
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    let after_cursor: String = text
+        .chars()
+        .skip(cursor_pos + cursor_char.chars().count())
+        .collect();
+
+    let mut spans = vec![
         Span::styled(
             prefix.to_string(),
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(text.to_string(), Style::default().fg(Color::White)),
-        Span::styled("_", Style::default().fg(Color::Magenta)),
-    ]))
-    .wrap(Wrap { trim: false });
+        Span::styled(before_cursor.clone(), Style::default().fg(Color::White)),
+    ];
 
+    if cursor_char.is_empty() {
+        // Cursor at end: show block cursor placeholder
+        spans.push(Span::styled(
+            " ",
+            Style::default().fg(Color::Black).bg(Color::White),
+        ));
+    } else {
+        // Cursor on a character: highlight it
+        spans.push(Span::styled(
+            cursor_char,
+            Style::default().fg(Color::Black).bg(Color::White),
+        ));
+        spans.push(Span::styled(
+            after_cursor,
+            Style::default().fg(Color::White),
+        ));
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 
-    // Place the terminal cursor at the text end for IME.
-    // Use display width (not char count) so CJK characters
-    // (2 cells each) don't shift the cursor to the left.
-    use unicode_width::UnicodeWidthStr;
-    let total_width = display.width() as u16;
-    let w = area.width.max(1);
-    let cursor_y = area.y + total_width / w;
-    let cursor_x = area.x + total_width % w;
+    // Place the terminal cursor at the edit position for IME.
+    let cursor_display_offset = prefix.width() + before_cursor.width();
+    let w = area.width.max(1) as usize;
+    let cursor_y = area.y + (cursor_display_offset / w) as u16;
+    let cursor_x = area.x + (cursor_display_offset % w) as u16;
     frame.set_cursor_position((
         cursor_x.min(area.right().saturating_sub(1)),
         cursor_y.min(area.bottom().saturating_sub(1)),

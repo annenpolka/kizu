@@ -277,6 +277,46 @@ fn uses_plus_line_format(basename: &str) -> bool {
     )
 }
 
+/// Insert a single character at `cursor_pos` (char index) and advance
+/// the cursor. Works correctly with multi-byte characters.
+fn edit_insert_char(text: &mut String, cursor_pos: &mut usize, c: char) {
+    let byte_idx = text
+        .char_indices()
+        .nth(*cursor_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    text.insert(byte_idx, c);
+    *cursor_pos += 1;
+}
+
+/// Insert a string at `cursor_pos` (char index) and advance the
+/// cursor by the number of inserted characters.
+fn edit_insert_str(text: &mut String, cursor_pos: &mut usize, s: &str) {
+    let byte_idx = text
+        .char_indices()
+        .nth(*cursor_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    text.insert_str(byte_idx, s);
+    *cursor_pos += s.chars().count();
+}
+
+/// Delete the character before `cursor_pos` and move the cursor back.
+fn edit_backspace(text: &mut String, cursor_pos: &mut usize) {
+    if *cursor_pos == 0 {
+        return;
+    }
+    let remove_idx = *cursor_pos - 1;
+    let byte_range = text
+        .char_indices()
+        .nth(remove_idx)
+        .map(|(i, c)| i..i + c.len_utf8());
+    if let Some(range) = byte_range {
+        text.drain(range);
+        *cursor_pos -= 1;
+    }
+}
+
 /// Two ways the renderer can park the cursor inside the viewport.
 /// Defaults to [`CursorPlacement::Centered`]; `z` toggles to
 /// [`CursorPlacement::Top`] (the cursor sits at the viewport ceiling
@@ -529,6 +569,9 @@ pub struct ScarCommentState {
     pub target_path: PathBuf,
     pub target_line: usize,
     pub body: String,
+    /// Cursor position as a **char index** (not byte offset).
+    /// 0 = before the first character, `body.chars().count()` = end.
+    pub cursor_pos: usize,
 }
 
 /// One hit inside the scroll layout. `row` is the logical layout
@@ -563,6 +606,8 @@ pub struct SearchState {
 #[derive(Debug, Clone, Default)]
 pub struct SearchInputState {
     pub query: String,
+    /// Cursor position as a char index within `query`.
+    pub cursor_pos: usize,
 }
 
 /// Find every occurrence of `query` across the **DiffLine** rows of
@@ -1760,6 +1805,7 @@ impl App {
             target_path,
             target_line,
             body: String::new(),
+            cursor_pos: 0,
         });
     }
 
@@ -2035,8 +2081,19 @@ impl App {
     /// (matches the other modal overlays).
     fn handle_search_input_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if matches!(key.code, KeyCode::Char('c')) {
-                self.close_search_input();
+            match key.code {
+                KeyCode::Char('c') => self.close_search_input(),
+                KeyCode::Char('a') => {
+                    if let Some(s) = self.search_input.as_mut() {
+                        s.cursor_pos = 0;
+                    }
+                }
+                KeyCode::Char('e') => {
+                    if let Some(s) = self.search_input.as_mut() {
+                        s.cursor_pos = s.query.chars().count();
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -2044,13 +2101,33 @@ impl App {
             KeyCode::Esc => self.close_search_input(),
             KeyCode::Enter => self.commit_search_input(),
             KeyCode::Backspace => {
-                if let Some(state) = self.search_input.as_mut() {
-                    state.query.pop();
+                if let Some(s) = self.search_input.as_mut() {
+                    edit_backspace(&mut s.query, &mut s.cursor_pos);
+                }
+            }
+            KeyCode::Left => {
+                if let Some(s) = self.search_input.as_mut() {
+                    s.cursor_pos = s.cursor_pos.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(s) = self.search_input.as_mut() {
+                    s.cursor_pos = (s.cursor_pos + 1).min(s.query.chars().count());
+                }
+            }
+            KeyCode::Home => {
+                if let Some(s) = self.search_input.as_mut() {
+                    s.cursor_pos = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(s) = self.search_input.as_mut() {
+                    s.cursor_pos = s.query.chars().count();
                 }
             }
             KeyCode::Char(c) => {
-                if let Some(state) = self.search_input.as_mut() {
-                    state.query.push(c);
+                if let Some(s) = self.search_input.as_mut() {
+                    edit_insert_char(&mut s.query, &mut s.cursor_pos, c);
                 }
             }
             _ => {}
@@ -2195,16 +2272,27 @@ impl App {
     /// mode are silently ignored.
     pub fn handle_paste(&mut self, text: &str) {
         if let Some(state) = self.scar_comment.as_mut() {
-            state.body.push_str(text);
+            edit_insert_str(&mut state.body, &mut state.cursor_pos, text);
         } else if let Some(state) = self.search_input.as_mut() {
-            state.query.push_str(text);
+            edit_insert_str(&mut state.query, &mut state.cursor_pos, text);
         }
     }
 
     fn handle_scar_comment_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if matches!(key.code, KeyCode::Char('c')) {
-                self.close_scar_comment();
+            match key.code {
+                KeyCode::Char('c') => self.close_scar_comment(),
+                KeyCode::Char('a') => {
+                    if let Some(s) = self.scar_comment.as_mut() {
+                        s.cursor_pos = 0;
+                    }
+                }
+                KeyCode::Char('e') => {
+                    if let Some(s) = self.scar_comment.as_mut() {
+                        s.cursor_pos = s.body.chars().count();
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -2212,13 +2300,33 @@ impl App {
             KeyCode::Esc => self.close_scar_comment(),
             KeyCode::Enter => self.commit_scar_comment(),
             KeyCode::Backspace => {
-                if let Some(state) = self.scar_comment.as_mut() {
-                    state.body.pop();
+                if let Some(s) = self.scar_comment.as_mut() {
+                    edit_backspace(&mut s.body, &mut s.cursor_pos);
+                }
+            }
+            KeyCode::Left => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    s.cursor_pos = s.cursor_pos.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    s.cursor_pos = (s.cursor_pos + 1).min(s.body.chars().count());
+                }
+            }
+            KeyCode::Home => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    s.cursor_pos = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    s.cursor_pos = s.body.chars().count();
                 }
             }
             KeyCode::Char(c) => {
-                if let Some(state) = self.scar_comment.as_mut() {
-                    state.body.push(c);
+                if let Some(s) = self.scar_comment.as_mut() {
+                    edit_insert_char(&mut s.body, &mut s.cursor_pos, c);
                 }
             }
             _ => {}
