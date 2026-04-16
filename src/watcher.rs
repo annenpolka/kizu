@@ -310,6 +310,16 @@ fn spawn_worktree_debouncer(
     tx: UnboundedSender<WatchEvent>,
 ) -> Result<(KizuDebouncer, std::collections::HashSet<PathBuf>)> {
     let git_dir = git_dir.to_path_buf();
+    // Pre-resolve excluded directory paths so the callback can filter
+    // cheaply. On Linux inotify, a non-recursive root watch still
+    // reports mtime changes on excluded child directories (e.g. when
+    // a file inside target/ is written, target/'s mtime updates and
+    // inotify fires on the root watch). Without this filter, those
+    // events leak through as Worktree and cause spurious recomputes.
+    let excluded_dirs: Vec<PathBuf> = WORKTREE_EXCLUDED_DIR_NAMES
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
     let callback_tx = tx.clone();
     let mut debouncer = new_kizu_debouncer(
         WORKTREE_DEBOUNCE,
@@ -318,10 +328,6 @@ fn spawn_worktree_debouncer(
             let events = match result {
                 Ok(events) => events,
                 Err(errors) => {
-                    // Surface backend failures (FSEvents drop, moved
-                    // watch target, kqueue overflow, …) so the app
-                    // layer can flip the footer to red and force a
-                    // recompute instead of silently drifting stale.
                     let message = format_notify_errors(WatchSource::Worktree, &errors);
                     let _ = callback_tx.send(WatchEvent::Error {
                         source: WatchSource::Worktree,
@@ -330,12 +336,15 @@ fn spawn_worktree_debouncer(
                     return;
                 }
             };
-            // If every path on every event lives inside `git_dir`, swallow
-            // the burst — that's git churning its own bookkeeping. As soon
-            // as one path is outside `git_dir`, we wake the app loop.
+            // Swallow events whose paths all live inside git_dir or an
+            // excluded directory (target/, node_modules/, etc.). Only
+            // wake the app loop when a genuine worktree path is touched.
+            let dominated = |p: &Path| {
+                is_inside(p, &git_dir) || excluded_dirs.iter().any(|excl| is_inside(p, excl))
+            };
             let touches_worktree = events
                 .iter()
-                .any(|ev| ev.event.paths.iter().any(|p| !is_inside(p, &git_dir)));
+                .any(|ev| ev.event.paths.iter().any(|p| !dominated(p)));
             if touches_worktree {
                 let _ = callback_tx.send(WatchEvent::Worktree);
             }
@@ -613,6 +622,21 @@ mod tests {
     /// debounce is 300 ms — anything shorter is racy.
     const DRAIN_WAIT: TokioDuration = TokioDuration::from_millis(2_000);
 
+    /// Drain all pending events for `wait` duration, discarding them.
+    /// Used to clear startup noise before testing a specific write.
+    async fn drain_events(handle: &mut WatchHandle, wait: TokioDuration) {
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let poll = remaining.min(TokioDuration::from_millis(200));
+            match timeout(poll, handle.events.recv()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+    }
+
     async fn saw_matching_event<F>(
         handle: &mut WatchHandle,
         wait: TokioDuration,
@@ -663,10 +687,6 @@ mod tests {
         assert_eq!(event, WatchEvent::Worktree);
     }
 
-    // On Linux, inotify's non-recursive root watch notifies on directory
-    // mtime changes even for excluded children, making this assertion
-    // timing-dependent. Reliable only with macOS PollWatcher.
-    #[cfg_attr(not(target_os = "macos"), ignore)]
     #[tokio::test(flavor = "current_thread")]
     async fn worktree_watcher_skips_target_directory() {
         let repo = init_repo();
@@ -683,7 +703,10 @@ mod tests {
 
         let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
 
-        tokio::time::sleep(TokioDuration::from_millis(250)).await;
+        // Drain any startup events (inotify may fire for files that
+        // existed before the watcher was created).
+        drain_events(&mut handle, TokioDuration::from_millis(800)).await;
+
         fs::write(root.join("target").join("foo.rs"), "fn build() { 1 }\n")
             .expect("rewrite target file");
 
@@ -734,8 +757,6 @@ mod tests {
         );
     }
 
-    // Same inotify timing issue as worktree_watcher_skips_target_directory.
-    #[cfg_attr(not(target_os = "macos"), ignore)]
     #[tokio::test(flavor = "current_thread")]
     async fn writes_inside_git_dir_do_not_emit_worktree_event() {
         let repo = init_repo();
@@ -746,7 +767,9 @@ mod tests {
 
         let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
 
-        tokio::time::sleep(TokioDuration::from_millis(150)).await;
+        // Drain startup events before testing the specific write.
+        drain_events(&mut handle, TokioDuration::from_millis(800)).await;
+
         // Drop a file inside .git/ to mimic git's own bookkeeping. notify
         // should fire — but the worktree filter must swallow it, and since
         // the path is not HEAD/refs/packed-refs the git_dir watcher must
