@@ -141,7 +141,6 @@ pub struct DetectedAgent {
     pub binary_found: bool,
     pub config_dir_found: bool,
     pub recommended: bool,
-    pub support_level: SupportLevel,
 }
 
 /// Detect which AI coding agents are available on this system.
@@ -164,7 +163,6 @@ pub fn detect_agents(project_root: &Path) -> Vec<DetectedAgent> {
                 binary_found,
                 config_dir_found,
                 recommended,
-                support_level: sl,
             }
         })
         .collect()
@@ -263,21 +261,18 @@ pub fn run_init(
         select_scope_interactive()?
     };
 
-    // Validate scope compatibility for every selected agent before
-    // writing anything. This prevents partial installs when one
-    // agent rejects the chosen scope after earlier agents already
-    // had their configs mutated.
     for agent_kind in &selected_agents {
-        if let Some(reason) = scope_incompatible(*agent_kind, scope) {
-            anyhow::bail!(
-                "{agent_kind} is incompatible with scope {scope}: {reason}\n\
-                 Choose a different scope or deselect {agent_kind}.",
+        let effective_scope = resolve_scope(*agent_kind, scope);
+        if effective_scope != scope {
+            println!(
+                "  {}  {} scope unavailable for {}; installing to {} instead",
+                c_yellow("⚠"),
+                scope,
+                agent_kind,
+                effective_scope,
             );
         }
-    }
-
-    for agent_kind in &selected_agents {
-        let report = install_agent(*agent_kind, scope, project_root)?;
+        let report = install_agent(*agent_kind, effective_scope, project_root)?;
         print_report(&report);
     }
 
@@ -296,9 +291,6 @@ pub fn run_init(
 
 fn c_bold(s: &str) -> String {
     format!("\x1b[1m{s}\x1b[0m")
-}
-fn c_cyan(s: &str) -> String {
-    format!("\x1b[36m{s}\x1b[0m")
 }
 fn c_green(s: &str) -> String {
     format!("\x1b[32m{s}\x1b[0m")
@@ -323,48 +315,32 @@ fn print_banner() {
     println!();
 }
 
-fn support_level_colored(sl: SupportLevel) -> String {
-    match sl {
-        SupportLevel::Full => c_green(&format!("● {sl}")),
-        SupportLevel::StopOnly => c_yellow(&format!("◐ {sl}")),
-        SupportLevel::PostToolOnlyBestEffort => c_yellow(&format!("◐ {sl}")),
-        SupportLevel::WriteSideOnly => c_dim(&format!("○ {sl}")),
-    }
-}
-
-fn detection_status_colored(d: &DetectedAgent) -> String {
-    if d.binary_found && d.config_dir_found {
-        c_green("✓ detected")
-    } else if d.binary_found {
-        c_yellow("~ bin only")
-    } else {
-        c_dim("✗ not found")
-    }
-}
-
 fn select_agents_interactive(detected: &[DetectedAgent]) -> Result<Vec<AgentKind>> {
     use dialoguer::{MultiSelect, theme::ColorfulTheme};
 
+    // dialoguer 0.11 uses byte length (not visible width) for line-
+    // clearing math, so ANSI escape sequences in items cause it to
+    // over-count and drift the display upward on every keystroke.
+    // Use plain text items to avoid this.
     let items: Vec<String> = detected
         .iter()
         .map(|d| {
-            format!(
-                "{}  {}  {}",
-                c_bold(&format!("{:<12}", d.kind.to_string())),
-                support_level_colored(d.support_level),
-                detection_status_colored(d),
-            )
+            let sl = support_level(d.kind);
+            let status = if d.binary_found && d.config_dir_found {
+                "detected"
+            } else if d.binary_found {
+                "bin only"
+            } else {
+                "not found"
+            };
+            format!("{:<12}  {:<36}  {}", d.kind, sl, status)
         })
         .collect();
 
     let defaults: Vec<bool> = detected.iter().map(|d| d.recommended).collect();
 
     let selections = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!(
-            "{}  {}",
-            c_cyan("?"),
-            c_bold("Select agents to install hooks for"),
-        ))
+        .with_prompt("Select agents to install hooks for")
         .items(&items)
         .defaults(&defaults)
         .interact()
@@ -377,24 +353,12 @@ fn select_scope_interactive() -> Result<Scope> {
     use dialoguer::{Select, theme::ColorfulTheme};
 
     let items = [
-        format!(
-            "{}  {}",
-            c_bold("project-local"),
-            c_dim("(gitignored · .claude/settings.local.json) ← recommended"),
-        ),
-        format!(
-            "{}  {}",
-            c_bold("project-shared"),
-            c_dim("(committed · .claude/settings.json)"),
-        ),
-        format!(
-            "{}  {}",
-            c_bold("user"),
-            c_dim("(global · ~/.claude/settings.json)"),
-        ),
+        "project-local   (gitignored, personal) <- recommended",
+        "project-shared   (committed, team-shared)",
+        "user             (global, ~/.claude/settings.json)",
     ];
     let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!("{}  {}", c_cyan("?"), c_bold("Install scope"),))
+        .with_prompt("Install scope")
         .items(&items)
         .default(0)
         .interact()
@@ -508,28 +472,30 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Returns `Some(reason)` if `kind` cannot be installed at `scope`.
-///
-/// Only Claude Code is known to support `settings.local.json` (the
-/// `project-local` gitignored variant). Qwen reads `.qwen/settings.json`
-/// only, so `project-local` would write a file Qwen never loads.
-fn scope_incompatible(kind: AgentKind, scope: Scope) -> Option<&'static str> {
-    match (kind, scope) {
-        (AgentKind::Cursor, Scope::User) => Some("Cursor only supports project-level hooks"),
-        (AgentKind::Cursor, Scope::ProjectLocal) => {
-            Some("Cursor has no local-only config; hooks.json is always committable")
-        }
-        (AgentKind::Codex, Scope::ProjectLocal) => {
-            Some("Codex has no local-only config; .codex/hooks.json is always committable")
-        }
-        (AgentKind::Cline, Scope::User | Scope::ProjectLocal) => {
-            Some("Cline uses file-based project hooks only")
-        }
-        (AgentKind::QwenCode, Scope::ProjectLocal) => {
-            Some("Qwen Code does not read settings.local.json; use project-shared or user")
-        }
-        (AgentKind::Gemini, _) => Some("Gemini CLI has no hook mechanism"),
-        _ => None,
+/// Resolve the effective scope for an agent. If the requested scope
+/// is not supported, fall back to the closest alternative instead of
+/// erroring out. Only Claude Code supports `project-local`
+/// (`settings.local.json`); other agents fall back to `user` (personal,
+/// not committed) to honor the "don't commit my hooks" intent.
+fn resolve_scope(kind: AgentKind, requested: Scope) -> Scope {
+    match (kind, requested) {
+        // Claude Code supports all three scopes.
+        (AgentKind::ClaudeCode, _) => requested,
+        // Cursor: ~/.cursor/hooks.json (user) is supported.
+        // project-local has no local variant → fall back to user.
+        (AgentKind::Cursor, Scope::ProjectLocal) => Scope::User,
+        (AgentKind::Cursor, Scope::User) => Scope::User,
+        (AgentKind::Cursor, Scope::ProjectShared) => Scope::ProjectShared,
+        // Codex: project-local has no local variant → fall back to user.
+        (AgentKind::Codex, Scope::ProjectLocal) => Scope::User,
+        // Qwen: no settings.local.json → fall back to user.
+        (AgentKind::QwenCode, Scope::ProjectLocal) => Scope::User,
+        // Cline: file-based hooks, only project scope exists.
+        (AgentKind::Cline, _) => Scope::ProjectShared,
+        // Gemini: no hooks at all → keep requested (install_gemini is a no-op).
+        (AgentKind::Gemini, _) => requested,
+        // Default: pass through.
+        _ => requested,
     }
 }
 
@@ -691,10 +657,12 @@ fn install_claude_code(scope: Scope, project_root: &Path) -> Result<InstallRepor
 }
 
 fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
-    // Cursor uses .cursor/hooks.json (not settings.json).
+    // Cursor uses .cursor/hooks.json at project or user level.
     let dir = match scope {
         Scope::ProjectLocal | Scope::ProjectShared => project_root.join(".cursor"),
-        Scope::User => anyhow::bail!("Cursor only supports project-level hooks"),
+        Scope::User => dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?
+            .join(".cursor"),
     };
     let path = dir.join("hooks.json");
 
