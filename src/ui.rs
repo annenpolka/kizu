@@ -642,11 +642,14 @@ fn render_file_view(frame: &mut Frame<'_>, area: Rect, fv: &crate::app::FileView
 
         let content = &fv.lines[line_idx];
         let body_width = width.saturating_sub(5).max(1);
-        let padded: String = if content.len() >= body_width {
-            content[..body_width].to_string()
+        let char_len = content.chars().count();
+        let padded: String = if char_len >= body_width {
+            content.chars().take(body_width).collect()
         } else {
-            let pad = body_width - content.len();
-            format!("{content}{}", " ".repeat(pad))
+            content
+                .chars()
+                .chain(std::iter::repeat_n(' ', body_width - char_len))
+                .collect()
         };
 
         let body_style = if let Some(&bg) = fv.line_bg.get(&line_idx) {
