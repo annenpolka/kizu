@@ -200,14 +200,21 @@ pub struct InstallReport {
 }
 
 /// Resolve the kizu binary path for embedding in hook commands.
-/// Prefers the current executable's absolute path so hooks work
-/// even when `kizu` is not globally on PATH. Falls back to bare
-/// `kizu` if the executable path cannot be determined.
-fn kizu_bin() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "kizu".to_string())
+///
+/// - `project-shared`: bare `kizu` — the file is committed and must
+///   be portable across machines. Assumes kizu is on PATH.
+/// - `project-local` / `user`: absolute path via `current_exe()` so
+///   hooks work even when kizu is not globally installed. These files
+///   are personal (gitignored or in `~/`) so machine-specific paths
+///   are acceptable.
+fn kizu_bin_for_scope(scope: Scope) -> String {
+    match scope {
+        Scope::ProjectShared => "kizu".to_string(),
+        _ => std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| "kizu".to_string()),
+    }
 }
 
 /// Run `kizu init` interactively or non-interactively.
@@ -446,7 +453,7 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
             );
         }
         std::fs::rename(&hook_path, &user_hook)?;
-        let bin = kizu_bin();
+        let bin = kizu_bin_for_scope(Scope::ProjectLocal);
         let shim = format!(
             "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
              # Run the original user hook first.\n\
@@ -460,7 +467,7 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
             user_hook.display()
         );
     } else {
-        let bin = kizu_bin();
+        let bin = kizu_bin_for_scope(Scope::ProjectLocal);
         let shim = format!(
             "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
              # kizu scar guard\n\
@@ -684,7 +691,7 @@ fn merge_hooks_into_settings(
 
 fn install_claude_code(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::ClaudeCode, scope, project_root)?;
-    let bin = kizu_bin();
+    let bin = kizu_bin_for_scope(scope);
     let post_cmd = format!("{bin} hook-post-tool --agent claude-code");
     let stop_cmd = format!("{bin} hook-stop --agent claude-code");
     let hooks = &[
@@ -723,7 +730,7 @@ fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
         .and_then(|v| v.as_object_mut())
         .ok_or_else(|| anyhow::anyhow!("hooks is not an object in hooks.json"))?;
 
-    let bin = kizu_bin();
+    let bin = kizu_bin_for_scope(scope);
     let post_cmd = format!("{bin} hook-post-tool --agent cursor");
     let stop_cmd = format!("{bin} hook-stop --agent cursor");
     let entries = &[
@@ -777,7 +784,7 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
             .join("hooks.json"),
     };
     // Codex: Stop only (PreTool/PostTool is Bash-only).
-    let bin = kizu_bin();
+    let bin = kizu_bin_for_scope(scope);
     let stop_cmd = format!("{bin} hook-stop --agent codex");
     let hooks = &[("Stop", "", stop_cmd.as_str())];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
@@ -794,7 +801,7 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
 
 fn install_qwen(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::QwenCode, scope, project_root)?;
-    let bin = kizu_bin();
+    let bin = kizu_bin_for_scope(scope);
     let post_cmd = format!("{bin} hook-post-tool --agent qwen");
     let stop_cmd = format!("{bin} hook-stop --agent qwen");
     let hooks = &[
@@ -829,14 +836,20 @@ fn install_cline(project_root: &Path) -> Result<InstallReport> {
             if !new.ends_with('\n') {
                 new.push('\n');
             }
-            new.push_str(&format!("{} hook-post-tool --agent cline\n", kizu_bin()));
+            new.push_str(&format!(
+                "{} hook-post-tool --agent cline\n",
+                kizu_bin_for_scope(Scope::ProjectShared)
+            ));
             std::fs::write(&hook_file, new)?;
             added = 1;
         }
     } else {
         std::fs::write(
             &hook_file,
-            format!("#!/bin/sh\n{} hook-post-tool --agent cline\n", kizu_bin()),
+            format!(
+                "#!/bin/sh\n{} hook-post-tool --agent cline\n",
+                kizu_bin_for_scope(Scope::ProjectShared)
+            ),
         )?;
         #[cfg(unix)]
         {
