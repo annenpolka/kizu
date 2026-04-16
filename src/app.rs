@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -11,12 +11,25 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 const SCROLL_ANIM_DURATION: Duration = Duration::from_millis(150);
 
 use crate::git::{self, DiffContent, FileDiff, FileStatus, LineKind};
+use crate::scar::ScarKind;
 use crate::watcher::{self, WatchEvent, WatchSource};
 
 /// Half-page scroll constant for `Ctrl-d` / `Ctrl-u`. M5+ may swap this for
 /// the real viewport height once we plumb it through; until then a fixed
 /// value keeps `handle_key` testable as a pure function.
 const HALF_PAGE: usize = 12;
+
+/// Canned scar body bound to the `a` key — "ask". The
+/// `@kizu[ask]:` marker itself is added by
+/// [`crate::scar::CommentSyntax::render_scar`],
+/// so this constant holds *just the instruction text*. Plain English
+/// imperatives travel across agents (Claude Code / Codex / Cursor /
+/// Gemini) without translation layers — the scar is read by the
+/// agent as part of the source file itself.
+pub(crate) const SCAR_TEXT_ASK: &str = "explain this change";
+
+/// Canned scar body bound to the `r` key — "reject".
+pub(crate) const SCAR_TEXT_REJECT: &str = "revert this change";
 
 /// Top-level application state. Single-threaded, mutated by the event loop
 /// via `&mut self` (we run on tokio's `current_thread` flavor — see ADR-0003).
@@ -61,8 +74,32 @@ pub struct App {
     /// looking at. Lets `recompute_diff` slide `scroll` to the same hunk
     /// even when the row count has shifted.
     pub anchor: Option<HunkAnchor>,
-    /// Modal file picker. `Some` when the user has pressed Space.
+    /// Modal file picker. `Some` when the user has pressed `s`.
     pub picker: Option<PickerState>,
+    /// Free-text scar input overlay. `Some` when the user has pressed
+    /// `c` on a scar-able row and is composing the comment body.
+    pub scar_comment: Option<ScarCommentState>,
+    /// Hunk-revert confirmation overlay. `Some` when the user has
+    /// pressed `x` on a hunk and is being asked `(y/N)`.
+    pub revert_confirm: Option<RevertConfirmState>,
+    /// Transient `/` query composer. `Some` while the user is
+    /// typing the search query; cleared on Enter (confirm) or Esc.
+    pub search_input: Option<SearchInputState>,
+    /// File-view zoom state. `Some` when the user has pressed
+    /// `Enter` on a hunk and is looking at the whole file.
+    pub file_view: Option<FileViewState>,
+    /// Confirmed search state (query + matches + current index).
+    /// Survives across normal-mode navigation so `n` / `N` can
+    /// jump between hits.
+    pub search: Option<SearchState>,
+    /// "Seen" marks for hunks the user has visually reviewed and
+    /// wants to hide from the attention surface. Keyed by
+    /// `(relative file path, hunk.old_start)` so the mark survives
+    /// a watcher-driven `compute_diff` as long as the hunk's
+    /// pre-image anchor doesn't move — same fingerprint used by
+    /// [`HunkAnchor`]. Space toggles; nothing is written to disk
+    /// (see plans/v0.2.md M4).
+    pub seen_hunks: BTreeSet<(PathBuf, usize)>,
     pub follow_mode: bool,
     /// Set when the most recent `compute_diff` failed. Cleared on success.
     pub last_error: Option<String>,
@@ -105,6 +142,9 @@ pub struct App {
     /// (ADR-0008). `Failed` persists until a subsequent non-Error
     /// watcher event confirms recovery, or the watcher is restarted.
     pub watcher_health: WatcherHealth,
+    /// Lazy-initialized syntax highlighter. Loaded on first render
+    /// to avoid paying syntect's SyntaxSet load cost at startup.
+    pub highlighter: std::cell::OnceCell<crate::highlight::Highlighter>,
 }
 
 /// Tracks whether the underlying notify debouncers are still pushing
@@ -172,6 +212,112 @@ pub enum KeyEffect {
     /// the watcher would stay pinned to the session's startup
     /// branch after `R`.
     ReconfigureWatcher,
+    /// The user pressed `e` on a scar-able row — the event loop
+    /// must suspend the ratatui terminal, spawn the resolved
+    /// editor, wait for it, and then re-enter the alternate screen.
+    /// The `EditorInvocation` carries a fully-resolved
+    /// `(program, args)` pair so the event loop does not need to
+    /// re-read `$EDITOR`.
+    OpenEditor(EditorInvocation),
+}
+
+/// Fully-resolved external-editor invocation. Produced inside
+/// [`App::open_in_editor`] via [`build_editor_invocation`] so the
+/// event loop can spawn the editor with no further parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorInvocation {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// Build an [`EditorInvocation`] from the user's `$EDITOR` value.
+///
+/// `$EDITOR` is split on whitespace (no shell quoting — matching
+/// `git`'s `GIT_EDITOR` conventions for MVP). The first token is
+/// the program; any remaining tokens are kept as leading args.
+///
+/// Line-number format depends on the editor:
+/// - vim/nvim/vi/nano/emacs/kak use `+<line> <file>`
+/// - zed/code/subl/hx/cursor and others use `<file>:<line>`
+///
+/// Returns `None` when `editor_env` is `None` or empty / all
+/// whitespace, so callers get a single consistent "no editor
+/// configured → no-op" path.
+pub fn build_editor_invocation(
+    editor_env: Option<&str>,
+    line: usize,
+    file: &Path,
+) -> Option<EditorInvocation> {
+    let env = editor_env?.trim();
+    if env.is_empty() {
+        return None;
+    }
+    let mut parts = env.split_whitespace().map(String::from);
+    let program = parts.next()?;
+    let mut args: Vec<String> = parts.collect();
+
+    let basename = Path::new(&program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if uses_plus_line_format(basename) {
+        args.push(format!("+{line}"));
+        args.push(file.display().to_string());
+    } else {
+        args.push(format!("{}:{line}", file.display()));
+    }
+
+    Some(EditorInvocation { program, args })
+}
+
+/// Editors that accept `+<line> <file>` for line-jump. All others
+/// default to the `<file>:<line>` convention (VS Code, Zed,
+/// Sublime, Helix, Cursor, etc.).
+fn uses_plus_line_format(basename: &str) -> bool {
+    matches!(
+        basename,
+        "vim" | "nvim" | "vi" | "nano" | "emacs" | "emacsclient" | "kak" | "mg" | "nvi"
+    )
+}
+
+/// Insert a single character at `cursor_pos` (char index) and advance
+/// the cursor. Works correctly with multi-byte characters.
+fn edit_insert_char(text: &mut String, cursor_pos: &mut usize, c: char) {
+    let byte_idx = text
+        .char_indices()
+        .nth(*cursor_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    text.insert(byte_idx, c);
+    *cursor_pos += 1;
+}
+
+/// Insert a string at `cursor_pos` (char index) and advance the
+/// cursor by the number of inserted characters.
+fn edit_insert_str(text: &mut String, cursor_pos: &mut usize, s: &str) {
+    let byte_idx = text
+        .char_indices()
+        .nth(*cursor_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    text.insert_str(byte_idx, s);
+    *cursor_pos += s.chars().count();
+}
+
+/// Delete the character before `cursor_pos` and move the cursor back.
+fn edit_backspace(text: &mut String, cursor_pos: &mut usize) {
+    if *cursor_pos == 0 {
+        return;
+    }
+    let remove_idx = *cursor_pos - 1;
+    let byte_range = text
+        .char_indices()
+        .nth(remove_idx)
+        .map(|(i, c)| i..i + c.len_utf8());
+    if let Some(range) = byte_range {
+        text.drain(range);
+        *cursor_pos -= 1;
+    }
 }
 
 /// Two ways the renderer can park the cursor inside the viewport.
@@ -415,6 +561,176 @@ pub struct PickerState {
     pub cursor: usize,
 }
 
+/// Free-text scar input overlay. The `c` key enters this mode when the
+/// cursor is on a scar-able row; `Enter` commits the accumulated
+/// [`Self::body`] as a `@kizu[free]:` scar above the target line and
+/// `Esc` cancels without touching the file. The target is captured at
+/// entry time (not re-read on commit) so that a watcher-driven diff
+/// recompute during typing cannot silently retarget the write.
+#[derive(Debug, Clone)]
+pub struct ScarCommentState {
+    pub target_path: PathBuf,
+    pub target_line: usize,
+    pub body: String,
+    /// Cursor position as a **char index** (not byte offset).
+    /// 0 = before the first character, `body.chars().count()` = end.
+    pub cursor_pos: usize,
+}
+
+/// One hit inside the scroll layout. `row` is the logical layout
+/// row index (suitable for `scroll_to`); `byte_start` / `byte_end`
+/// delimit the match inside the row's diff-line content for inline
+/// highlighting in a later M4b slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchLocation {
+    pub row: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+}
+
+/// Active search query + the row hits it produced, plus a cursor
+/// into that hit list that `n` / `N` advance. Created by confirming
+/// the [`SearchInputState`] composer; lives until the next `/` or
+/// until a recompute invalidates the row indices.
+#[derive(Debug, Clone)]
+pub struct SearchState {
+    // Reserved for M4b UI slice (footer echo + recompute
+    // rehydration). Dead_code for now so clippy-as-error builds
+    // don't fail between slices.
+    #[allow(dead_code)]
+    pub query: String,
+    pub matches: Vec<MatchLocation>,
+    pub current: usize,
+}
+
+/// Transient query-composing overlay. `/` opens it, typing appends
+/// to `query`, Backspace deletes, Enter confirms into a
+/// [`SearchState`], Esc cancels without touching the confirmed state.
+#[derive(Debug, Clone, Default)]
+pub struct SearchInputState {
+    pub query: String,
+    /// Cursor position as a char index within `query`.
+    pub cursor_pos: usize,
+}
+
+/// Find every occurrence of `query` across the **DiffLine** rows of
+/// `layout`, in row order. Empty queries return an empty vector so
+/// callers can treat "no matches" and "no query" identically.
+///
+/// Case handling is **smart case** (vim-style): a query with no
+/// uppercase characters matches case-insensitively, anything with
+/// at least one uppercase character matches case-sensitively.
+/// `byte_end` is guaranteed to be a UTF-8 char boundary because
+/// `str::find` always returns a char-boundary-aligned index.
+pub fn find_matches(layout: &ScrollLayout, files: &[FileDiff], query: &str) -> Vec<MatchLocation> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let case_sensitive = query.chars().any(|c| c.is_uppercase());
+    let needle: String = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+
+    let mut out = Vec::new();
+    for (row_idx, row) in layout.rows.iter().enumerate() {
+        let RowKind::DiffLine {
+            file_idx,
+            hunk_idx,
+            line_idx,
+        } = row
+        else {
+            continue;
+        };
+        let Some(file) = files.get(*file_idx) else {
+            continue;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            continue;
+        };
+        let Some(hunk) = hunks.get(*hunk_idx) else {
+            continue;
+        };
+        let Some(line) = hunk.lines.get(*line_idx) else {
+            continue;
+        };
+
+        // For smart-case insensitive matching we lowercase the
+        // haystack too. `str::to_lowercase` can change byte length
+        // under Unicode (e.g. `İ` → `i̇`), so we fall back to
+        // ASCII-only needles for the insensitive path to keep
+        // byte offsets meaningful. Non-ASCII lowercase queries
+        // degrade to case-sensitive matching, which is a clean
+        // failure mode.
+        let ascii_only = needle.is_ascii() && line.content.is_ascii();
+        let (haystack, search_needle): (String, String) = if case_sensitive || !ascii_only {
+            (line.content.clone(), needle.clone())
+        } else {
+            (line.content.to_ascii_lowercase(), needle.clone())
+        };
+
+        let mut start = 0;
+        while let Some(idx) = haystack[start..].find(&search_needle) {
+            let byte_start = start + idx;
+            let byte_end = byte_start + search_needle.len();
+            out.push(MatchLocation {
+                row: row_idx,
+                byte_start,
+                byte_end,
+            });
+            if byte_end == start {
+                // Defensive: empty needles already bail at the
+                // top, but if a future code path sends an empty
+                // after normalization we must not spin forever.
+                break;
+            }
+            start = byte_end;
+        }
+    }
+    out
+}
+
+/// Full-file zoom view entered via `Enter` on a hunk. The user
+/// sees the entire worktree file with diff-touched lines
+/// highlighted in `BG_ADDED` / `BG_DELETED`. `Esc` or `Enter`
+/// returns to the normal scroll view at the cursor position
+/// captured at entry time.
+///
+/// Navigation uses the same keys as normal mode (`j`/`k`/`J`/`K`/
+/// `g`/`G`/`Ctrl-d`/`Ctrl-u`) but addresses 1-indexed file lines
+/// instead of layout rows. Scar keys are deferred to a later
+/// slice.
+#[derive(Debug, Clone)]
+pub struct FileViewState {
+    #[allow(dead_code)]
+    pub file_idx: usize,
+    pub path: PathBuf,
+    pub return_scroll: usize,
+    pub lines: Vec<String>,
+    pub line_bg: std::collections::HashMap<usize, ratatui::style::Color>,
+    pub cursor: usize,
+    pub scroll_top: usize,
+}
+
+/// Confirmation overlay for hunk revert (`x` key). Holds the
+/// `(file_idx, hunk_idx)` captured the moment the user pressed `x`
+/// so a watcher-driven recompute while the dialog is open cannot
+/// re-target the operation. `y`/`Y`/`Enter` confirms and runs
+/// `git apply --reverse`; any other key closes the overlay without
+/// touching the worktree. See plans/v0.2.md M4 Decision Log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertConfirmState {
+    pub file_idx: usize,
+    pub hunk_idx: usize,
+    pub file_path: PathBuf,
+    /// Stable hunk identity: `old_start` captured when the dialog was
+    /// opened. Used in `confirm_revert` to re-resolve the hunk by
+    /// identity (path + old_start) instead of trusting the stale
+    /// index pair, which can drift after a watcher-driven refresh.
+    pub hunk_old_start: usize,
+}
+
 /// Single-shot easing state for the viewport's top-row tween.
 ///
 /// The tween sources its start point from `from` (captured at the moment
@@ -506,6 +822,12 @@ impl App {
             cursor_placement: CursorPlacement::Centered,
             anchor: None,
             picker: None,
+            scar_comment: None,
+            revert_confirm: None,
+            file_view: None,
+            search_input: None,
+            search: None,
+            seen_hunks: BTreeSet::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -517,6 +839,7 @@ impl App {
             anim: None,
             wrap_lines: false,
             watcher_health: WatcherHealth::default(),
+            highlighter: std::cell::OnceCell::new(),
         };
         app.apply_computed_files(initial);
         Ok(app)
@@ -743,6 +1066,17 @@ impl App {
         if self.picker.is_some() {
             self.handle_picker_key(key);
             KeyEffect::None
+        } else if self.scar_comment.is_some() {
+            self.handle_scar_comment_key(key);
+            KeyEffect::None
+        } else if self.revert_confirm.is_some() {
+            self.handle_revert_confirm_key(key);
+            KeyEffect::None
+        } else if self.search_input.is_some() {
+            self.handle_search_input_key(key);
+            KeyEffect::None
+        } else if self.file_view.is_some() {
+            self.handle_file_view_key(key)
         } else {
             self.handle_normal_key(key)
         }
@@ -780,9 +1114,16 @@ impl App {
             // Lowercase `j`/`k` + arrows are the *daily driver*: adaptive
             // motion that reads like continuous scrolling in long hunks
             // (chunk scroll) but collapses to a one-press hunk jump in
-            // short hunks. SHIFT-J / SHIFT-K are the strict "skip to
-            // next hunk header" motion, for when you want to blow past
-            // the current hunk regardless of its size.
+            // short hunks.
+            //
+            // v0.2 key remap (ADR-0015 / plans/v0.2.md M4):
+            // - `J` / `K` now move the cursor by **exactly one visual row**.
+            //   The old hunk-header jump behavior was relocated to `l` /
+            //   `h` so add/delete scar decisions can be made row-by-row.
+            // - `l` / `h` strictly jump to the next / previous hunk header,
+            //   mirroring the pre-v0.2 `J` / `K` binding.
+            // - Picker open moved from `Space` to `s` so `Space` can be
+            //   used for the scar "seen" mark (wired up in a later M4 slice).
             KeyCode::Char('j') | KeyCode::Down => {
                 self.next_change();
                 self.follow_mode = false;
@@ -792,10 +1133,24 @@ impl App {
                 self.follow_mode = false;
             }
             KeyCode::Char('J') => {
-                self.next_hunk();
+                self.scroll_by(1);
+                // Snap for 1-row moves: the 150ms ease-out tween
+                // restarts on every key-repeat tick, causing visible
+                // jitter when holding J/K. Clearing the animation
+                // makes rapid single-row scrolling buttery smooth.
+                self.anim = None;
                 self.follow_mode = false;
             }
             KeyCode::Char('K') => {
+                self.scroll_by(-1);
+                self.anim = None;
+                self.follow_mode = false;
+            }
+            KeyCode::Char('l') => {
+                self.next_hunk();
+                self.follow_mode = false;
+            }
+            KeyCode::Char('h') => {
                 self.prev_hunk();
                 self.follow_mode = false;
             }
@@ -810,8 +1165,49 @@ impl App {
             KeyCode::Char('f') => {
                 self.follow_restore();
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char('s') => {
                 self.open_picker();
+            }
+            // v0.2 M4 scar dispatch. `a` and `r` insert the two
+            // canned scars; the free-text `c`, hunk-revert `x`,
+            // external-editor `e`, and "seen" Space will land in
+            // later M4 slices. Picker mode is already handled
+            // upstream so these arms only fire in normal mode.
+            KeyCode::Char('a') => {
+                self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+            }
+            KeyCode::Char('r') => {
+                self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+            }
+            KeyCode::Char('c') => {
+                self.open_scar_comment();
+            }
+            KeyCode::Char('x') => {
+                self.open_revert_confirm();
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_seen_current_hunk();
+            }
+            KeyCode::Char('/') => {
+                self.open_search_input();
+            }
+            KeyCode::Char('n') => {
+                self.search_jump_next();
+            }
+            KeyCode::Char('N') => {
+                self.search_jump_prev();
+            }
+            KeyCode::Enter => {
+                self.open_file_view();
+            }
+            KeyCode::Char('e') => {
+                // Read `$EDITOR` at dispatch time (not at bootstrap)
+                // so users who `export EDITOR=` mid-session pick up
+                // the new value without restarting kizu.
+                let env = std::env::var("EDITOR").ok();
+                if let Some(inv) = self.open_in_editor(env.as_deref()) {
+                    return KeyEffect::OpenEditor(inv);
+                }
             }
             KeyCode::Char('R') => {
                 return self.reset_baseline();
@@ -1389,6 +1785,646 @@ impl App {
         }
     }
 
+    /// Insert a scar of the given `kind` with `body` as the human
+    /// text, at the cursor's current position. No-op when the
+    /// cursor is not on a diff row (file header, hunk header,
+    /// spacer, binary notice). Write failures from
+    /// [`crate::scar::insert_scar`] are captured in `last_error` so
+    /// the footer surfaces them instead of panicking. The watcher
+    /// picks up the resulting write on its next tick and re-runs
+    /// `compute_diff`, which shows the new scar line in place.
+    pub fn insert_canned_scar(&mut self, kind: ScarKind, body: &str) {
+        let Some((path, line)) = self.scar_target_line() else {
+            return;
+        };
+        if let Err(err) = crate::scar::insert_scar(&path, line, kind, body) {
+            self.last_error = Some(format!("scar: {err:#}"));
+        }
+    }
+
+    /// Enter free-text scar input mode. Captures the current
+    /// cursor's target `(path, line)` so a watcher-driven recompute
+    /// while the user is typing cannot retarget the write. No-op
+    /// when the cursor is not on a scar-able row.
+    pub fn open_scar_comment(&mut self) {
+        let Some((target_path, target_line)) = self.scar_target_line() else {
+            return;
+        };
+        self.scar_comment = Some(ScarCommentState {
+            target_path,
+            target_line,
+            body: String::new(),
+            cursor_pos: 0,
+        });
+    }
+
+    /// Abort free-text scar input without writing anything.
+    pub fn close_scar_comment(&mut self) {
+        self.scar_comment = None;
+    }
+
+    /// Commit the currently-composed free-text scar, if any. Empty
+    /// body is treated as a cancel (so double-`Enter` on an empty
+    /// input does not write a blank scar). Write failures land on
+    /// `last_error` with the same `scar:` prefix used by the canned
+    /// `a` / `r` dispatch.
+    pub fn commit_scar_comment(&mut self) {
+        let Some(state) = self.scar_comment.take() else {
+            return;
+        };
+        let body = state.body.trim();
+        if body.is_empty() {
+            return;
+        }
+        if let Err(err) =
+            crate::scar::insert_scar(&state.target_path, state.target_line, ScarKind::Free, body)
+        {
+            self.last_error = Some(format!("scar: {err:#}"));
+        }
+    }
+
+    /// Toggle the "seen" mark on the hunk the cursor is currently
+    /// inside. No-op when the cursor is on a file header, spacer,
+    /// binary notice, or any other row with no enclosing hunk.
+    /// Pure state change — nothing is written to disk (the mark
+    /// lives only for the session, see plans/v0.2.md M4).
+    pub fn toggle_seen_current_hunk(&mut self) {
+        let Some((file_idx, hunk_idx)) = self.current_hunk() else {
+            return;
+        };
+        let Some(file) = self.files.get(file_idx) else {
+            return;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return;
+        };
+        let Some(hunk) = hunks.get(hunk_idx) else {
+            return;
+        };
+        let key = (file.path.clone(), hunk.old_start);
+        if !self.seen_hunks.remove(&key) {
+            self.seen_hunks.insert(key);
+        }
+    }
+
+    /// Open the full-file zoom view for the cursor's current hunk.
+    /// Reads the worktree file, builds a line_bg map from diff
+    /// hunks, and parks the viewport so the hunk's first line is
+    /// visible. No-op when the cursor is not on a text hunk, or
+    /// the file cannot be read.
+    pub fn open_file_view(&mut self) {
+        use ratatui::style::Color;
+        use std::collections::HashMap;
+
+        let Some((file_idx, _hunk_idx)) = self.current_hunk() else {
+            return;
+        };
+        let Some(file) = self.files.get(file_idx) else {
+            return;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return;
+        };
+
+        let abs = self.root.join(&file.path);
+        let content = match std::fs::read_to_string(&abs) {
+            Ok(c) => c,
+            Err(e) => {
+                self.last_error = Some(format!("file view: {e}"));
+                return;
+            }
+        };
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+
+        let mut line_bg: HashMap<usize, Color> = HashMap::new();
+        for hunk in hunks {
+            let mut new_line = hunk.new_start; // 1-indexed
+            for dl in &hunk.lines {
+                match dl.kind {
+                    LineKind::Added => {
+                        if new_line >= 1 && (new_line - 1) < lines.len() {
+                            line_bg.insert(new_line - 1, Color::Rgb(10, 50, 10));
+                        }
+                        new_line += 1;
+                    }
+                    LineKind::Context => {
+                        new_line += 1;
+                    }
+                    LineKind::Deleted => {
+                        // Deleted lines don't exist in the worktree;
+                        // they're not rendered in file view.
+                    }
+                }
+            }
+        }
+
+        // Find cursor's hunk new_start to center the initial viewport.
+        let initial_cursor = self
+            .current_hunk()
+            .and_then(|(_, hi)| hunks.get(hi))
+            .map(|h| h.new_start.saturating_sub(1))
+            .unwrap_or(0)
+            .min(lines.len().saturating_sub(1));
+
+        self.file_view = Some(FileViewState {
+            file_idx,
+            path: file.path.clone(),
+            return_scroll: self.scroll,
+            lines,
+            line_bg,
+            cursor: initial_cursor,
+            scroll_top: initial_cursor.saturating_sub(self.last_body_height.get() / 2),
+        });
+    }
+
+    /// Close the file view and restore the normal-mode cursor to
+    /// the position it was at when the user entered.
+    pub fn close_file_view(&mut self) {
+        if let Some(state) = self.file_view.take() {
+            self.scroll_to(state.return_scroll);
+        }
+    }
+
+    /// Keystroke handler for the file-view zoom mode. Supports
+    /// `Enter`/`Esc` to exit, `j`/`k`/`J`/`K` for cursor
+    /// movement, `g`/`G` for top/bottom, and `q` to quit.
+    fn handle_file_view_key(&mut self, key: KeyEvent) -> KeyEffect {
+        if matches!(key.code, KeyCode::Char('q'))
+            || (matches!(key.code, KeyCode::Char('c'))
+                && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.should_quit = true;
+            return KeyEffect::None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => {
+                    self.file_view_scroll_by(HALF_PAGE as isize);
+                    return KeyEffect::None;
+                }
+                KeyCode::Char('u') => {
+                    self.file_view_scroll_by(-(HALF_PAGE as isize));
+                    return KeyEffect::None;
+                }
+                _ => {}
+            }
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc => self.close_file_view(),
+            // j/k: chunk scroll (viewport/3), matching normal-mode
+            // adaptive-motion feel. J/K: exact 1-row move.
+            KeyCode::Char('j') | KeyCode::Down => {
+                let chunk = self.chunk_size() as isize;
+                self.file_view_scroll_by(chunk);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let chunk = self.chunk_size() as isize;
+                self.file_view_scroll_by(-chunk);
+            }
+            KeyCode::Char('J') => {
+                self.file_view_scroll_by(1);
+            }
+            KeyCode::Char('K') => {
+                self.file_view_scroll_by(-1);
+            }
+            KeyCode::Char('g') => {
+                self.file_view_goto(0);
+            }
+            KeyCode::Char('G') => {
+                let last = self
+                    .file_view
+                    .as_ref()
+                    .map(|fv| fv.lines.len().saturating_sub(1))
+                    .unwrap_or(0);
+                self.file_view_goto(last);
+            }
+            KeyCode::Char('e') => {
+                // Open external editor at the file-view cursor's
+                // 1-indexed line. Uses the same path stored in
+                // FileViewState so the editor opens the exact file.
+                let env = std::env::var("EDITOR").ok();
+                if let Some(fv) = self.file_view.as_ref() {
+                    let line_1indexed = fv.cursor + 1;
+                    let abs = self.root.join(&fv.path);
+                    if let Some(inv) = build_editor_invocation(env.as_deref(), line_1indexed, &abs)
+                    {
+                        return KeyEffect::OpenEditor(inv);
+                    }
+                }
+            }
+            _ => {}
+        }
+        KeyEffect::None
+    }
+
+    fn file_view_scroll_by(&mut self, delta: isize) {
+        let Some(fv) = self.file_view.as_mut() else {
+            return;
+        };
+        let max = fv.lines.len().saturating_sub(1);
+        let new = (fv.cursor as isize + delta).clamp(0, max as isize) as usize;
+        fv.cursor = new;
+        let vh = self.last_body_height.get();
+        if fv.cursor < fv.scroll_top {
+            fv.scroll_top = fv.cursor;
+        } else if fv.cursor >= fv.scroll_top + vh {
+            fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
+        }
+    }
+
+    fn file_view_goto(&mut self, line: usize) {
+        let Some(fv) = self.file_view.as_mut() else {
+            return;
+        };
+        let max = fv.lines.len().saturating_sub(1);
+        fv.cursor = line.min(max);
+        let vh = self.last_body_height.get();
+        if fv.cursor < fv.scroll_top {
+            fv.scroll_top = fv.cursor;
+        } else if fv.cursor >= fv.scroll_top + vh {
+            fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
+        }
+    }
+
+    /// Enter the `/` search-query composer. Any previously
+    /// confirmed [`SearchState`] is left untouched until the user
+    /// actually commits the new query with Enter — Esc restores
+    /// everything, vim-style.
+    pub fn open_search_input(&mut self) {
+        self.search_input = Some(SearchInputState::default());
+    }
+
+    /// Abort the query composer without touching confirmed state.
+    pub fn close_search_input(&mut self) {
+        self.search_input = None;
+    }
+
+    /// Commit the composed query: run [`find_matches`] against the
+    /// current layout, install the resulting `SearchState`, and
+    /// jump the cursor to the first match (if any). Empty queries
+    /// close the composer without touching confirmed state so a
+    /// stray `/` + `Enter` does not wipe an existing search.
+    pub fn commit_search_input(&mut self) {
+        let Some(input) = self.search_input.take() else {
+            return;
+        };
+        let query = input.query;
+        if query.is_empty() {
+            return;
+        }
+        let matches = find_matches(&self.layout, &self.files, &query);
+        let first_row = matches.first().map(|m| m.row);
+        self.search = Some(SearchState {
+            query,
+            matches,
+            current: 0,
+        });
+        if let Some(row) = first_row {
+            self.follow_mode = false;
+            self.scroll_to(row);
+        }
+    }
+
+    /// `/`-composer keystroke handler. Typing appends, Backspace
+    /// deletes, Enter commits, Esc cancels. Ctrl-C also cancels
+    /// (matches the other modal overlays).
+    fn handle_search_input_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => self.close_search_input(),
+                KeyCode::Char('a') => {
+                    if let Some(s) = self.search_input.as_mut() {
+                        s.cursor_pos = 0;
+                    }
+                }
+                KeyCode::Char('e') => {
+                    if let Some(s) = self.search_input.as_mut() {
+                        s.cursor_pos = s.query.chars().count();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.close_search_input(),
+            KeyCode::Enter => self.commit_search_input(),
+            KeyCode::Backspace => {
+                if let Some(s) = self.search_input.as_mut() {
+                    edit_backspace(&mut s.query, &mut s.cursor_pos);
+                }
+            }
+            KeyCode::Left => {
+                if let Some(s) = self.search_input.as_mut() {
+                    s.cursor_pos = s.cursor_pos.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(s) = self.search_input.as_mut() {
+                    s.cursor_pos = (s.cursor_pos + 1).min(s.query.chars().count());
+                }
+            }
+            KeyCode::Home => {
+                if let Some(s) = self.search_input.as_mut() {
+                    s.cursor_pos = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(s) = self.search_input.as_mut() {
+                    s.cursor_pos = s.query.chars().count();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(s) = self.search_input.as_mut() {
+                    edit_insert_char(&mut s.query, &mut s.cursor_pos, c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `n` — advance to the next confirmed search hit and jump the
+    /// cursor to its row. Wraps around at the end. No-op when
+    /// there is no confirmed search or it has zero matches.
+    pub fn search_jump_next(&mut self) {
+        let Some(state) = self.search.as_mut() else {
+            return;
+        };
+        if state.matches.is_empty() {
+            return;
+        }
+        state.current = (state.current + 1) % state.matches.len();
+        let row = state.matches[state.current].row;
+        self.follow_mode = false;
+        self.scroll_to(row);
+    }
+
+    /// `N` — step back to the previous confirmed search hit,
+    /// wrapping to the tail at the start.
+    pub fn search_jump_prev(&mut self) {
+        let Some(state) = self.search.as_mut() else {
+            return;
+        };
+        if state.matches.is_empty() {
+            return;
+        }
+        state.current = if state.current == 0 {
+            state.matches.len() - 1
+        } else {
+            state.current - 1
+        };
+        let row = state.matches[state.current].row;
+        self.follow_mode = false;
+        self.scroll_to(row);
+    }
+
+    /// Read helper: does `(file_idx, hunk_idx)` currently carry a
+    /// "seen" mark? Used by the renderer to decorate the hunk
+    /// header without learning the fingerprint scheme.
+    pub fn hunk_is_seen(&self, file_idx: usize, hunk_idx: usize) -> bool {
+        let Some(file) = self.files.get(file_idx) else {
+            return false;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return false;
+        };
+        let Some(hunk) = hunks.get(hunk_idx) else {
+            return false;
+        };
+        self.seen_hunks
+            .contains(&(file.path.clone(), hunk.old_start))
+    }
+
+    /// Resolve the cursor's current target (path + 1-indexed line)
+    /// into an [`EditorInvocation`], reading the user's `$EDITOR`
+    /// preference from `editor_env`. Returns `None` when the cursor
+    /// is not on a scar-able row **or** the environment has no
+    /// editor configured — in either case the `e` key should be a
+    /// silent no-op.
+    pub fn open_in_editor(&self, editor_env: Option<&str>) -> Option<EditorInvocation> {
+        let (path, line) = self.scar_target_line()?;
+        build_editor_invocation(editor_env, line, &path)
+    }
+
+    /// Enter the hunk-revert confirmation overlay. No-op when the
+    /// cursor is not inside a diff hunk (file headers, spacers,
+    /// binary notices) or when the enclosing file is not text.
+    pub fn open_revert_confirm(&mut self) {
+        let Some((file_idx, hunk_idx)) = self.current_hunk() else {
+            return;
+        };
+        let Some(file) = self.files.get(file_idx) else {
+            return;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return;
+        };
+        let Some(hunk) = hunks.get(hunk_idx) else {
+            return;
+        };
+        self.revert_confirm = Some(RevertConfirmState {
+            file_idx,
+            hunk_idx,
+            file_path: file.path.clone(),
+            hunk_old_start: hunk.old_start,
+        });
+    }
+
+    /// Abort the revert overlay without touching the worktree.
+    pub fn close_revert_confirm(&mut self) {
+        self.revert_confirm = None;
+    }
+
+    /// Commit the revert: build a single-hunk patch from the
+    /// captured `(file_idx, hunk_idx)` and run
+    /// `git apply --reverse`. Closes the overlay unconditionally;
+    /// write failures surface on `last_error` with the `revert:`
+    /// prefix so the footer flags them.
+    pub fn confirm_revert(&mut self) {
+        let Some(state) = self.revert_confirm.take() else {
+            return;
+        };
+        // Re-resolve the hunk by stable identity (path + old_start)
+        // instead of trusting the saved indices, which may have
+        // drifted after a watcher-driven refresh.
+        let hunk = self
+            .files
+            .iter()
+            .find(|f| f.path == state.file_path)
+            .and_then(|f| match &f.content {
+                DiffContent::Text(hunks) => {
+                    hunks.iter().find(|h| h.old_start == state.hunk_old_start)
+                }
+                _ => None,
+            });
+        let Some(hunk) = hunk else {
+            self.last_error = Some("revert: hunk no longer present".into());
+            return;
+        };
+        let patch = git::build_hunk_patch(&state.file_path, hunk);
+        if let Err(err) = git::revert_hunk(&self.root, &patch) {
+            self.last_error = Some(format!("revert: {err:#}"));
+        }
+    }
+
+    /// Keystroke handler for the revert confirmation overlay.
+    /// `y` / `Y` / `Enter` confirms; every other key (including
+    /// `n` / `N` / `Esc` and stray navigation keys) cancels. This
+    /// is intentional — the overlay is a hard "did you mean to do
+    /// this?" gate, and any ambiguous input should bias toward
+    /// "no" so the user's work is preserved.
+    fn handle_revert_confirm_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.close_revert_confirm();
+            return;
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_revert(),
+            _ => self.close_revert_confirm(),
+        }
+    }
+
+    /// Keystroke handler used while the scar-comment overlay is
+    /// active. Typing characters appends to the body, Backspace
+    /// deletes one char, Enter commits, Esc cancels.
+    /// Handle pasted text (from bracketed paste or IME commit).
+    /// Routes to whichever text-input overlay is currently active.
+    /// No-op when no text input is open — stray pastes in normal
+    /// mode are silently ignored.
+    pub fn handle_paste(&mut self, text: &str) {
+        if let Some(state) = self.scar_comment.as_mut() {
+            edit_insert_str(&mut state.body, &mut state.cursor_pos, text);
+        } else if let Some(state) = self.search_input.as_mut() {
+            edit_insert_str(&mut state.query, &mut state.cursor_pos, text);
+        }
+    }
+
+    fn handle_scar_comment_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => self.close_scar_comment(),
+                KeyCode::Char('a') => {
+                    if let Some(s) = self.scar_comment.as_mut() {
+                        s.cursor_pos = 0;
+                    }
+                }
+                KeyCode::Char('e') => {
+                    if let Some(s) = self.scar_comment.as_mut() {
+                        s.cursor_pos = s.body.chars().count();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.close_scar_comment(),
+            KeyCode::Enter => self.commit_scar_comment(),
+            KeyCode::Backspace => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    edit_backspace(&mut s.body, &mut s.cursor_pos);
+                }
+            }
+            KeyCode::Left => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    s.cursor_pos = s.cursor_pos.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    s.cursor_pos = (s.cursor_pos + 1).min(s.body.chars().count());
+                }
+            }
+            KeyCode::Home => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    s.cursor_pos = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    s.cursor_pos = s.body.chars().count();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(s) = self.scar_comment.as_mut() {
+                    edit_insert_char(&mut s.body, &mut s.cursor_pos, c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve the cursor's current row to an absolute file path and a
+    /// 1-indexed **new-file** line number, suitable for
+    /// [`crate::scar::insert_scar`].
+    ///
+    /// - Returns `None` when the cursor is parked on a row that has no
+    ///   scar-able location: file headers (they point at a whole file,
+    ///   not a specific line), spacers, binary notices, or files whose
+    ///   content is binary / truncated.
+    /// - For a cursor on a **hunk header** row, returns the hunk's
+    ///   `new_start` so `insert_scar` drops the scar immediately above
+    ///   the first line of the hunk body. This is what the user wants
+    ///   when they hit `a` / `r` with the cursor on the `@@` header
+    ///   of a multi-line hunk: one scar that annotates the whole block.
+    /// - For a cursor on an **Added or Context line**, returns the
+    ///   new-file line number of that line itself. The scar lands
+    ///   directly above it, matching the "comment above the code"
+    ///   convention.
+    /// - For a cursor on a **Deleted line**, the line has no new-file
+    ///   position; we return the new-file line number of the next
+    ///   non-deleted line in the same hunk (i.e. the line that
+    ///   effectively "replaces" it). If the deleted run reaches the
+    ///   hunk tail we fall through to the same offset, which matches
+    ///   "insert the scar right after the deletion block".
+    pub fn scar_target_line(&self) -> Option<(PathBuf, usize)> {
+        let row = self.layout.rows.get(self.scroll)?;
+        let (file_idx, hunk_idx, diff_line_idx) = match *row {
+            RowKind::DiffLine {
+                file_idx,
+                hunk_idx,
+                line_idx,
+            } => (file_idx, hunk_idx, Some(line_idx)),
+            RowKind::HunkHeader { file_idx, hunk_idx } => (file_idx, hunk_idx, None),
+            _ => return None,
+        };
+        let file = self.files.get(file_idx)?;
+        let DiffContent::Text(hunks) = &file.content else {
+            return None;
+        };
+        let hunk = hunks.get(hunk_idx)?;
+
+        // Hunk header cursor: target the first *changed* line (Added
+        // or Deleted) in the hunk, skipping leading Context lines. If
+        // the hunk is all-context (unlikely but possible in corner
+        // cases), fall back to `new_start`. This places the scar
+        // directly above the change rather than above distant context.
+        let Some(line_idx) = diff_line_idx else {
+            for (offset, dl) in hunk.lines.iter().enumerate() {
+                if !matches!(dl.kind, LineKind::Context) {
+                    return Some((self.root.join(&file.path), hunk.new_start + offset));
+                }
+            }
+            return Some((self.root.join(&file.path), hunk.new_start));
+        };
+
+        // Diff line cursor: walk to compute the new-file line number.
+        let mut offset: usize = 0;
+        for (i, line) in hunk.lines.iter().enumerate() {
+            if i > line_idx {
+                break;
+            }
+            let is_deleted = matches!(line.kind, LineKind::Deleted);
+            if i == line_idx {
+                return Some((self.root.join(&file.path), hunk.new_start + offset));
+            }
+            if !is_deleted {
+                offset += 1;
+            }
+        }
+        None
+    }
+
     /// `(start, end_exclusive)` row range of the cursor's current hunk.
     /// Walks `layout.rows` from the start of the hunk header through
     /// every consecutive `DiffLine` belonging to the same hunk. Returns
@@ -1732,8 +2768,31 @@ impl App {
 
 /// Async event loop. See ADR-0003 / ADR-0005.
 pub async fn run() -> Result<()> {
+    use std::io::Write;
+    let log_path = std::env::var("KIZU_STARTUP_TIMING_FILE").ok();
+    let stage = |label: &str, t: Instant| {
+        if let Some(path) = log_path.as_deref()
+            && let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        {
+            let _ = writeln!(f, "[kizu-startup] {label:<28} +{:?}", t.elapsed());
+        }
+    };
+    let t_total = Instant::now();
     let cwd = std::env::current_dir().context("reading current directory")?;
+    stage("current_dir", t_total);
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
+    // Enable bracketed paste so terminals send IME-committed text
+    // (e.g. Japanese kanji) as Event::Paste instead of individual
+    // keystrokes. Without this, IME composition is invisible in
+    // raw mode and committed text may arrive garbled.
+    {
+        use crossterm::ExecutableCommand;
+        let _ = std::io::stdout().execute(crossterm::event::EnableBracketedPaste);
+    }
+    stage("ratatui::try_init", t_total);
     let result = async {
         // Show something immediately, even before the initial bootstrap
         // `git diff` completes. On large repos this avoids a black screen
@@ -1748,8 +2807,18 @@ pub async fn run() -> Result<()> {
                 );
             })
             .context("ratatui loading draw")?;
+        stage("draw Loading...", t_total);
 
+        let t_bootstrap = Instant::now();
         let mut app = App::bootstrap(cwd)?;
+        stage("App::bootstrap", t_bootstrap);
+
+        // Write session file so the Stop hook can scope its scan
+        // to files changed since this baseline. Best-effort: a
+        // failure here is not fatal to the TUI itself.
+        if let Err(e) = crate::session::write_session(&app.root, &app.baseline_sha) {
+            eprintln!("warning: failed to write kizu session file: {e}");
+        }
 
         // Draw one static frame before watcher startup. On macOS the
         // PollWatcher fallback may take noticeable time to arm because it
@@ -1759,15 +2828,26 @@ pub async fn run() -> Result<()> {
         terminal
             .draw(|frame| crate::ui::render(frame, &app))
             .context("ratatui initial draw")?;
+        stage("draw bootstrap snapshot", t_total);
+
+        let t_watcher = Instant::now();
         let mut watch = watcher::start(
             &app.root,
             &app.git_dir,
             &app.common_git_dir,
             app.current_branch_ref.as_deref(),
         )?;
-        run_loop(&mut terminal, &mut app, &mut watch).await
+        stage("watcher::start", t_watcher);
+        stage("total before loop", t_total);
+        let result = run_loop(&mut terminal, &mut app, &mut watch).await;
+        crate::session::remove_session(&app.root);
+        result
     }
     .await;
+    {
+        use crossterm::ExecutableCommand;
+        let _ = std::io::stdout().execute(crossterm::event::DisableBracketedPaste);
+    }
     let _ = ratatui::try_restore();
     result
 }
@@ -1817,7 +2897,18 @@ async fn run_loop(
                     Some(Ok(Event::Key(key))) => {
                         app.input_health = None;
                         let effect = app.handle_key(key);
-                        apply_key_effect(effect, app, watch);
+                        match effect {
+                            KeyEffect::OpenEditor(inv) => {
+                                if let Err(err) = run_external_editor(terminal, inv) {
+                                    app.last_error = Some(format!("editor: {err:#}"));
+                                }
+                            }
+                            other => apply_key_effect(other, app, watch),
+                        }
+                    }
+                    Some(Ok(Event::Paste(text))) => {
+                        app.input_health = None;
+                        app.handle_paste(&text);
                     }
                     Some(Ok(_)) => {
                         app.input_health = None;
@@ -1844,6 +2935,7 @@ async fn run_loop(
                     }
                     let (need_recompute, need_head_dirty) = app.handle_watch_burst(burst);
                     if need_recompute {
+                        watch.refresh_worktree_watches();
                         app.recompute_diff();
                     }
                     if need_head_dirty {
@@ -1879,7 +2971,72 @@ fn apply_key_effect(effect: KeyEffect, app: &App, watch: &watcher::WatchHandle) 
         KeyEffect::ReconfigureWatcher => {
             watch.update_current_branch_ref(app.current_branch_ref.as_deref());
         }
+        KeyEffect::OpenEditor(_) => {
+            // Handled inline inside `run_loop`: the editor
+            // spawn needs mutable access to the terminal for the
+            // suspend/resume dance, which this `&App` /
+            // `&WatchHandle` helper cannot provide. Any
+            // `OpenEditor` that reaches this arm is a caller
+            // bug.
+            debug_assert!(
+                false,
+                "OpenEditor must be handled by run_loop, not apply_key_effect"
+            );
+        }
     }
+}
+
+/// Suspend the ratatui terminal, run an external editor
+/// synchronously, then re-enter the alternate screen and force a
+/// full repaint on the next draw tick. Blocks the event loop for
+/// the editor's lifetime — intentional, because the user is
+/// inside the editor anyway and no diff-view update would be
+/// visible under it.
+fn run_external_editor(
+    terminal: &mut ratatui::DefaultTerminal,
+    invocation: EditorInvocation,
+) -> Result<()> {
+    use crossterm::{
+        ExecutableCommand,
+        event::{DisableBracketedPaste, EnableBracketedPaste},
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    };
+    use std::io::stdout;
+
+    // Tear down the ratatui terminal state so the child editor
+    // sees a plain cooked terminal. Errors here are surfaced —
+    // half-suspended state is worse than not launching the editor
+    // at all.
+    disable_raw_mode().context("disable raw mode before editor")?;
+    let mut out = stdout();
+    out.execute(LeaveAlternateScreen)
+        .context("leave alternate screen before editor")?;
+    out.execute(DisableBracketedPaste).ok();
+
+    let status = std::process::Command::new(&invocation.program)
+        .args(&invocation.args)
+        .status()
+        .with_context(|| format!("spawning editor `{}`", invocation.program));
+
+    // Always re-arm the alternate screen + raw mode even if the
+    // spawn itself failed. Otherwise a mistyped `$EDITOR` would
+    // leave the user stranded at a raw-mode prompt.
+    enable_raw_mode().context("re-enable raw mode after editor")?;
+    stdout()
+        .execute(EnterAlternateScreen)
+        .context("re-enter alternate screen after editor")?;
+    stdout().execute(EnableBracketedPaste).ok();
+    terminal.clear().ok();
+
+    let status = status?;
+    if !status.success() {
+        return Err(anyhow!(
+            "editor `{}` exited with status {}",
+            invocation.program,
+            status
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1967,6 +3124,12 @@ mod tests {
             cursor_placement: CursorPlacement::Centered,
             anchor: None,
             picker: None,
+            scar_comment: None,
+            revert_confirm: None,
+            file_view: None,
+            search_input: None,
+            search: None,
+            seen_hunks: BTreeSet::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -1978,6 +3141,7 @@ mod tests {
             anim: None,
             wrap_lines: false,
             watcher_health: WatcherHealth::default(),
+            highlighter: std::cell::OnceCell::new(),
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
@@ -2212,10 +3376,11 @@ mod tests {
     }
 
     #[test]
-    fn capital_j_in_short_run_jumps_to_next_run_anywhere() {
-        // Two short hunks. Each fits comfortably in the default viewport,
-        // so SHIFT-J should behave like `j` and jump to the next hunk's
-        // header row.
+    fn l_jumps_to_next_hunk_header() {
+        // v0.2 remap: `l` takes over the strict hunk-jump role the old
+        // SHIFT-J used to play. Two short hunks; pressing `l` from the
+        // first lands on the second; pressing `l` again stays put
+        // because there is no third hunk.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![
@@ -2229,12 +3394,12 @@ mod tests {
         let second_hunk = app.layout.hunk_starts[1];
 
         app.scroll_to(first_hunk);
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(app.scroll, second_hunk);
         assert!(!app.follow_mode);
 
         // No more hunks after this one → stay put.
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(app.scroll, second_hunk);
     }
 
@@ -2294,10 +3459,10 @@ mod tests {
     }
 
     #[test]
-    fn capital_j_crosses_hunk_and_file_boundaries() {
-        // One tiny hunk per file. Short-hunk SHIFT-J falls back to
-        // `next_hunk`, which jumps across the file boundary into b.rs
-        // for free.
+    fn l_crosses_hunk_and_file_boundaries() {
+        // v0.2 remap: `l` walks to the next hunk regardless of the
+        // file boundary between them. One tiny hunk per file so the
+        // jump has to cross from a.rs into b.rs.
         let mut app = fake_app(vec![
             make_file(
                 "a.rs",
@@ -2315,10 +3480,10 @@ mod tests {
         let second_hunk = app.layout.hunk_starts[1];
 
         app.scroll_to(first_hunk);
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(
             app.scroll, second_hunk,
-            "SHIFT-J on a short hunk must cross hunk + file boundaries"
+            "`l` on a short hunk must cross hunk + file boundaries"
         );
     }
 
@@ -2348,9 +3513,10 @@ mod tests {
     }
 
     #[test]
-    fn capital_k_in_short_hunk_jumps_to_previous_hunk() {
-        // Two short hunks. SHIFT-K from the second lands on the first
-        // hunk's header row, same behaviour as `k`.
+    fn h_jumps_to_previous_hunk_header() {
+        // v0.2 remap: `h` is the strict previous-hunk jump that the
+        // old SHIFT-K used to do. Two short hunks, cursor on the
+        // second — pressing `h` lands on the first hunk header.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![
@@ -2363,15 +3529,64 @@ mod tests {
         let second_hunk = app.layout.hunk_starts[1];
 
         app.scroll_to(second_hunk);
-        app.handle_key(key(KeyCode::Char('K')));
+        app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.scroll, first_hunk);
     }
 
     #[test]
-    fn capital_j_flows_from_end_of_long_hunk_into_next_hunk() {
-        // Long hunk + short hunk. SHIFT-J walks the long hunk in chunks,
-        // then on the *next* press flows into the next hunk's header row
-        // automatically — no extra key press to cross the boundary.
+    fn shift_j_moves_cursor_down_by_exactly_one_visual_row() {
+        // v0.2 remap: `J` is a one-row forward cursor move, not a
+        // hunk jump. Starting at the file header row, `J` walks one
+        // row at a time (header → hunk header → first diff line).
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "one"),
+                    diff_line(LineKind::Added, "two"),
+                    diff_line(LineKind::Added, "three"),
+                ],
+            )],
+            100,
+        )]);
+        app.scroll_to(0);
+        let before = app.scroll;
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.scroll, before + 1);
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.scroll, before + 2);
+        assert!(!app.follow_mode);
+    }
+
+    #[test]
+    fn shift_k_moves_cursor_up_by_exactly_one_visual_row() {
+        // v0.2 remap: `K` is a one-row backward cursor move.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "one"),
+                    diff_line(LineKind::Added, "two"),
+                    diff_line(LineKind::Added, "three"),
+                ],
+            )],
+            100,
+        )]);
+        app.scroll_to(3);
+        app.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(app.scroll, 2);
+        app.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(app.scroll, 1);
+        assert!(!app.follow_mode);
+    }
+
+    #[test]
+    fn l_flows_from_end_of_long_hunk_into_next_hunk_header() {
+        // Even from the last row of a long hunk, `l` jumps to the
+        // next hunk's header. This mirrors the old SHIFT-J "flow
+        // across boundary" behavior but now lives on `l`.
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
@@ -2389,8 +3604,8 @@ mod tests {
         // Park on the last row of the long hunk (row 21: 1 header + 20
         // diff lines starting at row 1).
         app.scroll_to(21);
-        // One more SHIFT-J should leap into the next hunk's header.
-        app.handle_key(key(KeyCode::Char('J')));
+        // `l` from there must leap into the next hunk's header.
+        app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(app.scroll, second_hunk);
     }
 
@@ -2844,17 +4059,101 @@ mod tests {
     }
 
     #[test]
-    fn space_opens_picker_and_esc_closes_it() {
+    fn s_opens_picker_and_esc_closes_it() {
+        // v0.2 remap: picker trigger moved from `Space` to `s` so
+        // `Space` is free for the scar "seen" mark (wired up in a
+        // later M4 slice).
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
             100,
         )]);
-        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('s')));
         assert!(app.picker.is_some());
 
         app.handle_key(key(KeyCode::Esc));
         assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn space_toggles_seen_mark_on_current_hunk() {
+        // M4 slice 6: Space flips the cursor's enclosing hunk
+        // into and out of the "seen" set. Pure TUI state — no
+        // file write, no cursor movement, no picker.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        let before_scroll = app.scroll;
+
+        app.handle_key(key(KeyCode::Char(' ')));
+
+        assert!(
+            app.hunk_is_seen(0, 0),
+            "Space must toggle the current hunk into the seen set"
+        );
+        assert!(app.picker.is_none(), "Space must not open the picker");
+        assert_eq!(app.scroll, before_scroll, "Space must not move cursor");
+
+        // Second press removes the mark.
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(
+            !app.hunk_is_seen(0, 0),
+            "a second Space must remove the seen mark"
+        );
+    }
+
+    #[test]
+    fn space_on_file_header_row_is_noop() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("header");
+        app.scroll_to(header_row);
+
+        app.handle_key(key(KeyCode::Char(' ')));
+
+        assert!(
+            app.seen_hunks.is_empty(),
+            "file-header Space must not add anything to seen_hunks"
+        );
+    }
+
+    #[test]
+    fn seen_mark_persists_across_a_recompute_that_preserves_hunk_old_start() {
+        // seen_hunks is keyed by (path, hunk.old_start) so a
+        // watcher-driven recompute that rebuilds the FileDiff
+        // list without moving the hunk's pre-image anchor must
+        // leave the mark in place.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 0));
+
+        let fresh = vec![make_file(
+            "a.rs",
+            vec![hunk(42, vec![diff_line(LineKind::Added, "y")])],
+            100,
+        )];
+        app.apply_computed_files(fresh);
+
+        assert!(
+            app.hunk_is_seen(0, 0),
+            "recompute that preserves hunk.old_start must preserve the seen mark"
+        );
     }
 
     #[test]
@@ -4077,6 +5376,1321 @@ mod tests {
         assert!(
             app.anim.is_none(),
             "wrap toggle must clear scroll animation to avoid cross-coordinate tween"
+        );
+    }
+
+    // ---- M4: scar dispatch (a / r canned insertion) -----------------
+
+    /// Build an `App` backed by a real tempdir on disk so `insert_scar`
+    /// can actually read + write the target file. The source files and
+    /// the `FileDiff` layout are kept in sync by hand — enough to
+    /// exercise the `a` / `r` keybinding end-to-end without booting a
+    /// full git repo.
+    fn scar_app_with_real_fs(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        lines: Vec<DiffLine>,
+    ) -> App {
+        let abs = tmp.path().join(rel_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(&abs, source).expect("seed source file");
+
+        let file = make_file(rel_path, vec![hunk(hunk_new_start, lines)], 100);
+        let mut app = fake_app(vec![file]);
+        app.root = tmp.path().to_path_buf();
+        app
+    }
+
+    /// Park the cursor on the Nth DiffLine row in the layout (0-indexed
+    /// across the whole scroll, not per file). Panics if there aren't
+    /// enough DiffLine rows — the tests control the layout exactly so
+    /// this is a loud-failure helper on purpose.
+    fn cursor_on_nth_diff_line(app: &mut App, n: usize) {
+        let mut seen = 0;
+        for (i, row) in app.layout.rows.iter().enumerate() {
+            if matches!(row, RowKind::DiffLine { .. }) {
+                if seen == n {
+                    app.scroll_to(i);
+                    return;
+                }
+                seen += 1;
+            }
+        }
+        panic!("layout has fewer than {} DiffLine rows", n + 1);
+    }
+
+    #[test]
+    fn handle_key_a_inserts_ask_scar_above_cursor_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Simulate a diff where line 2 of main.rs was newly added. The
+        // cursor lands on that added row, and pressing `a` should insert
+        // the canned "ask" scar directly above it.
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn one() {}\nfn two() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn two() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(tmp.path().join("src/main.rs")).expect("read back");
+        assert_eq!(
+            after, "fn one() {}\n// @kizu[ask]: explain this change\nfn two() {}\n",
+            "`a` key must insert the canned ask scar above the cursor row",
+        );
+        assert!(
+            app.last_error.is_none(),
+            "successful scar insert must not touch last_error"
+        );
+    }
+
+    #[test]
+    fn handle_key_r_inserts_reject_scar_above_cursor_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "auth.py",
+            "def main():\n    return 1\n",
+            2,
+            vec![diff_line(LineKind::Added, "    return 1")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('r')));
+
+        let after = std::fs::read_to_string(tmp.path().join("auth.py")).expect("read back");
+        assert_eq!(
+            after, "def main():\n# @kizu[reject]: revert this change\n    return 1\n",
+            "`r` key must insert the canned reject scar using python # syntax",
+        );
+    }
+
+    #[test]
+    fn handle_key_a_is_noop_when_cursor_is_on_a_file_header_row() {
+        // File header rows have no hunk id → `scar_target_line`
+        // returns None → `a` must be a no-op. The source file on
+        // disk stays untouched and no error is recorded.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let original = "fn one() {}\n";
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "lib.rs",
+            original,
+            1,
+            vec![diff_line(LineKind::Added, "fn one() {}")],
+        );
+        // Park the cursor on the FileHeader row explicitly.
+        let file_header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("file header exists");
+        app.scroll_to(file_header_row);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(tmp.path().join("lib.rs")).expect("read back");
+        assert_eq!(after, original, "header-row `a` must not touch the file");
+        assert!(app.last_error.is_none(), "header-row `a` is a clean no-op");
+    }
+
+    #[test]
+    fn handle_key_a_surfaces_insert_failure_on_last_error() {
+        // Point `file.path` at a path that does not exist on disk.
+        // `insert_scar` will fail inside the read phase, and the
+        // dispatch must surface that through `last_error` without
+        // panicking.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = make_file(
+            "ghost.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "fn missing()")])],
+            100,
+        );
+        let mut app = fake_app(vec![file]);
+        app.root = tmp.path().to_path_buf();
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        assert!(
+            app.last_error
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with("scar:")),
+            "missing-file scar failure must land on last_error, got {:?}",
+            app.last_error
+        );
+    }
+
+    #[test]
+    fn scar_target_line_maps_hunk_header_to_first_changed_line_no_context() {
+        // Hunk starts immediately with Added lines (no leading context).
+        // The first changed line IS new_start, so the result equals new_start.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                42,
+                vec![
+                    diff_line(LineKind::Added, "first"),
+                    diff_line(LineKind::Added, "second"),
+                ],
+            )],
+            100,
+        )]);
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
+            .expect("hunk header row exists");
+        app.scroll_to(header_row);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(
+            line, 42,
+            "no-context hunk header → first changed line = new_start"
+        );
+    }
+
+    #[test]
+    fn scar_target_line_maps_hunk_header_skipping_leading_context() {
+        // Hunk has 2 leading Context lines before the first Added line.
+        // The scar should land above the Added line, not above the context.
+        // new_start=10, context, context, added → target = 10 + 2 = 12.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                10,
+                vec![
+                    diff_line(LineKind::Context, "ctx1"),
+                    diff_line(LineKind::Context, "ctx2"),
+                    diff_line(LineKind::Added, "new_stuff"),
+                    diff_line(LineKind::Context, "ctx3"),
+                ],
+            )],
+            100,
+        )]);
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
+            .expect("hunk header row exists");
+        app.scroll_to(header_row);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(
+            line, 12,
+            "hunk header with 2 leading context lines → first changed line at new_start+2"
+        );
+    }
+
+    #[test]
+    fn handle_key_a_on_hunk_header_writes_scar_above_first_hunk_line() {
+        // Real tempdir end-to-end: cursor on the hunk header row,
+        // press `a`, and the source file should now carry the
+        // canned ask scar directly above the first body line.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/lib.rs",
+            "line_a\nline_b\n",
+            2,
+            vec![diff_line(LineKind::Added, "line_b")],
+        );
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
+            .expect("hunk header row exists");
+        app.scroll_to(header_row);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(tmp.path().join("src/lib.rs")).expect("read back");
+        assert_eq!(
+            after, "line_a\n// @kizu[ask]: explain this change\nline_b\n",
+            "`a` on a hunk header must drop the scar above hunk.new_start",
+        );
+    }
+
+    // ---- M4 slice 3: `c` free-text scar overlay --------------------
+
+    #[test]
+    fn handle_key_c_opens_scar_comment_overlay_with_captured_target() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/foo.rs",
+            "fn alpha() {}\nfn beta() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn beta() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('c')));
+
+        let state = app
+            .scar_comment
+            .as_ref()
+            .expect("`c` must open the comment overlay on a diff row");
+        assert_eq!(state.body, "", "body starts empty");
+        assert_eq!(state.target_line, 2, "captures current diff-row line");
+        assert_eq!(
+            state.target_path,
+            tmp.path().join("src/foo.rs"),
+            "captures absolute target path"
+        );
+        let after = std::fs::read_to_string(tmp.path().join("src/foo.rs")).expect("read");
+        assert_eq!(
+            after, "fn alpha() {}\nfn beta() {}\n",
+            "`c` must not touch the file until `Enter` commits"
+        );
+    }
+
+    #[test]
+    fn handle_key_c_is_noop_on_file_header_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let original = "fn one() {}\n";
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "lib.rs",
+            original,
+            1,
+            vec![diff_line(LineKind::Added, "fn one() {}")],
+        );
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("file header exists");
+        app.scroll_to(header_row);
+
+        app.handle_key(key(KeyCode::Char('c')));
+
+        assert!(
+            app.scar_comment.is_none(),
+            "file-header `c` must not open the overlay"
+        );
+    }
+
+    #[test]
+    fn scar_comment_typing_appends_characters_to_body() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "a.rs",
+            "x\ny\n",
+            2,
+            vec![diff_line(LineKind::Added, "y")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('!')));
+
+        let state = app.scar_comment.as_ref().expect("still open");
+        assert_eq!(state.body, "hi!");
+    }
+
+    #[test]
+    fn scar_comment_backspace_deletes_last_character() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "a.rs",
+            "x\ny\n",
+            2,
+            vec![diff_line(LineKind::Added, "y")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        for ch in "ab".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        app.handle_key(key(KeyCode::Backspace));
+        let state = app.scar_comment.as_ref().expect("still open");
+        assert_eq!(state.body, "a");
+    }
+
+    #[test]
+    fn scar_comment_esc_cancels_without_writing_to_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let original = "fn one() {}\nfn two() {}\n";
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "cancel.rs",
+            original,
+            2,
+            vec![diff_line(LineKind::Added, "fn two() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        for ch in "dont".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.scar_comment.is_none(), "Esc closes the overlay");
+        let after = std::fs::read_to_string(tmp.path().join("cancel.rs")).expect("read");
+        assert_eq!(after, original, "cancel must not touch the file");
+        assert!(app.last_error.is_none(), "cancel is not an error");
+    }
+
+    #[test]
+    fn scar_comment_enter_commits_free_scar_above_target_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "commit.rs",
+            "fn one() {}\nfn two() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn two() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        for ch in "why two?".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.scar_comment.is_none(), "commit closes the overlay");
+        let after = std::fs::read_to_string(tmp.path().join("commit.rs")).expect("read");
+        assert_eq!(
+            after, "fn one() {}\n// @kizu[free]: why two?\nfn two() {}\n",
+            "Enter must write a free-scar above the captured target line"
+        );
+    }
+
+    #[test]
+    fn scar_comment_enter_on_empty_body_is_cancel() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let original = "fn one() {}\nfn two() {}\n";
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "empty.rs",
+            original,
+            2,
+            vec![diff_line(LineKind::Added, "fn two() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            app.scar_comment.is_none(),
+            "empty commit closes the overlay"
+        );
+        let after = std::fs::read_to_string(tmp.path().join("empty.rs")).expect("read");
+        assert_eq!(after, original, "empty body must not write a blank scar");
+    }
+
+    #[test]
+    fn normal_keys_are_inert_while_scar_comment_overlay_is_open() {
+        // While the overlay is open, typing `q` must accumulate into
+        // the body instead of quitting the app. Proves the router
+        // correctly parks normal-mode dispatch behind the overlay.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "quit.rs",
+            "x\ny\n",
+            2,
+            vec![diff_line(LineKind::Added, "y")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+
+        app.handle_key(key(KeyCode::Char('q')));
+
+        assert!(!app.should_quit, "q while overlay open must not quit");
+        let state = app.scar_comment.as_ref().expect("still open");
+        assert_eq!(state.body, "q");
+    }
+
+    // ---- M4c: Enter file-view zoom ---------------------------------
+
+    #[test]
+    fn enter_transitions_to_file_view_from_hunk() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        let before_scroll = app.scroll;
+
+        app.handle_key(key(KeyCode::Enter));
+
+        let fv = app.file_view.as_ref().expect("file view opened");
+        assert_eq!(fv.path, PathBuf::from("foo.rs"));
+        assert_eq!(fv.return_scroll, before_scroll);
+        assert_eq!(fv.lines.len(), 2, "file has 2 lines");
+        assert_eq!(fv.lines[0], "fn one() {}");
+        assert_eq!(fv.lines[1], "fn two() {}");
+        assert!(
+            fv.line_bg.contains_key(&1),
+            "line 1 (fn two) should have added bg"
+        );
+        assert!(!fv.line_bg.contains_key(&0), "line 0 is context — no bg");
+    }
+
+    #[test]
+    fn file_view_esc_returns_to_scroll_and_restores_cursor() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        let saved = app.scroll;
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.file_view.is_some());
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.file_view.is_none(), "Esc closes file view");
+        assert_eq!(app.scroll, saved, "cursor restored");
+    }
+
+    #[test]
+    fn file_view_enter_also_exits() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter)); // open
+        app.handle_key(key(KeyCode::Enter)); // close
+        assert!(app.file_view.is_none());
+    }
+
+    #[test]
+    fn file_view_j_k_chunk_scroll_and_shift_j_k_single_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) =
+            revert_app_with_real_repo(&tmp, "foo.rs", "a\nb\nc\n", "a\nb\nc\nd\n");
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter));
+        let start = app.file_view.as_ref().unwrap().cursor;
+
+        // j moves by chunk_size (viewport/3, at least 1)
+        let chunk = app.chunk_size();
+        app.handle_key(key(KeyCode::Char('j')));
+        let after_j = app.file_view.as_ref().unwrap().cursor;
+        assert_eq!(after_j, (start + chunk).min(3));
+
+        // k reverses it
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, start);
+
+        // J moves exactly 1 row
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, start + 1);
+
+        // K reverses 1 row
+        app.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, start);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn file_view_g_goes_to_top_and_G_to_bottom() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) =
+            revert_app_with_real_repo(&tmp, "foo.rs", "a\nb\nc\n", "a\nb\nc\nd\n");
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, 3); // 4 lines, 0-indexed last = 3
+
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn enter_is_noop_on_file_header_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("header");
+        app.scroll_to(header_row);
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.file_view.is_none());
+    }
+
+    // ---- M4b slice 1: `/` search + first-match jump ---------------
+
+    fn find_first_row_matching<F: Fn(&RowKind) -> bool>(app: &App, f: F) -> usize {
+        app.layout.rows.iter().position(f).expect("row exists")
+    }
+
+    #[test]
+    fn find_matches_returns_empty_for_empty_query() {
+        let app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "hello world")])],
+            100,
+        )]);
+        let m = find_matches(&app.layout, &app.files, "");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn find_matches_finds_substring_case_insensitive_when_query_is_lowercase() {
+        let app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "Hello WORLD"),
+                    diff_line(LineKind::Context, "no match here"),
+                    diff_line(LineKind::Added, "World wide"),
+                ],
+            )],
+            100,
+        )]);
+        let m = find_matches(&app.layout, &app.files, "world");
+        assert_eq!(m.len(), 2, "smart-case lowercase query matches both rows");
+        assert!(m.iter().all(|loc| loc.byte_start < loc.byte_end));
+    }
+
+    #[test]
+    fn find_matches_is_case_sensitive_when_query_has_uppercase() {
+        let app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "hello World"),
+                    diff_line(LineKind::Added, "hello world"),
+                ],
+            )],
+            100,
+        )]);
+        let m = find_matches(&app.layout, &app.files, "World");
+        assert_eq!(m.len(), 1, "uppercase query is case-sensitive");
+    }
+
+    #[test]
+    fn find_matches_captures_multiple_hits_on_one_row() {
+        let app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo foo foo")])],
+            100,
+        )]);
+        let m = find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0].byte_start, 0);
+        assert_eq!(m[1].byte_start, 4);
+        assert_eq!(m[2].byte_start, 8);
+    }
+
+    #[test]
+    fn slash_opens_search_input_composer() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+
+        app.handle_key(key(KeyCode::Char('/')));
+
+        assert!(app.search_input.is_some(), "/ must open the composer");
+        assert_eq!(app.search_input.as_ref().unwrap().query, "");
+    }
+
+    #[test]
+    fn search_input_typing_appends_to_query_and_backspace_deletes() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "foo".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.search_input.as_ref().unwrap().query, "foo");
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.search_input.as_ref().unwrap().query, "fo");
+    }
+
+    #[test]
+    fn search_input_esc_cancels_without_installing_search_state() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo")])],
+            100,
+        )]);
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('f')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.search_input.is_none());
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn search_input_enter_commits_and_jumps_cursor_to_first_match() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "alpha"),
+                    diff_line(LineKind::Added, "beta"),
+                    diff_line(LineKind::Added, "gamma"),
+                ],
+            )],
+            100,
+        )]);
+        // Park the cursor on the first diff row (alpha).
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "beta".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.search_input.is_none(), "composer closed on commit");
+        let state = app.search.as_ref().expect("search installed");
+        assert_eq!(state.matches.len(), 1);
+        assert_eq!(state.current, 0);
+        // Cursor landed on the "beta" row — not the first diff row.
+        let beta_row =
+            find_first_row_matching(&app, |r| matches!(r, RowKind::DiffLine { line_idx: 1, .. }));
+        assert_eq!(app.scroll, beta_row);
+        assert!(!app.follow_mode, "manual jump drops follow mode");
+    }
+
+    #[test]
+    fn search_input_enter_with_empty_query_does_not_wipe_existing_search() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "alpha")])],
+            100,
+        )]);
+        // Pre-install a fake confirmed search state.
+        app.search = Some(SearchState {
+            query: "alpha".into(),
+            matches: vec![MatchLocation {
+                row: 0,
+                byte_start: 0,
+                byte_end: 5,
+            }],
+            current: 0,
+        });
+
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Enter)); // empty body
+
+        assert!(
+            app.search.is_some(),
+            "empty-query commit must preserve prior search state"
+        );
+    }
+
+    // ---- M4b slice 2: n/N navigation ------------------------------
+
+    fn commit_search(app: &mut App, query: &str) {
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in query.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn search_jump_next_walks_matches_in_order() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "bar"),
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "foo"),
+                ],
+            )],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        commit_search(&mut app, "foo");
+
+        // After commit, current = 0 (first foo row). Advance twice.
+        app.handle_key(key(KeyCode::Char('n')));
+        let mid = app.search.as_ref().unwrap().current;
+        app.handle_key(key(KeyCode::Char('n')));
+        let tail = app.search.as_ref().unwrap().current;
+        assert_eq!(mid, 1);
+        assert_eq!(tail, 2);
+    }
+
+    #[test]
+    fn search_jump_next_wraps_around_at_end() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "foo"),
+                ],
+            )],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        commit_search(&mut app, "foo");
+
+        // current=0 → n → 1 → n → 0 (wrap)
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.search.as_ref().unwrap().current, 0);
+    }
+
+    #[test]
+    fn search_jump_prev_wraps_around_at_start() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "foo"),
+                ],
+            )],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        commit_search(&mut app, "foo");
+
+        // current=0 → N → 2 (wrap to tail)
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(app.search.as_ref().unwrap().current, 2);
+    }
+
+    #[test]
+    fn search_jump_next_is_noop_when_no_search_state() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo")])],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        let before = app.scroll;
+
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert!(app.search.is_none());
+        assert_eq!(app.scroll, before, "stray `n` must not move the cursor");
+    }
+
+    // ---- M4 slice 5: `e` external editor --------------------------
+
+    #[test]
+    fn build_editor_invocation_vim_uses_plus_line_format() {
+        let inv = build_editor_invocation(Some("vim"), 42, Path::new("/tmp/foo.rs"))
+            .expect("some invocation");
+        assert_eq!(inv.program, "vim");
+        assert_eq!(inv.args, vec!["+42", "/tmp/foo.rs"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_nvim_preserves_leading_args_and_plus_line() {
+        let inv = build_editor_invocation(Some("nvim -f"), 7, Path::new("x.rs")).unwrap();
+        assert_eq!(inv.program, "nvim");
+        assert_eq!(inv.args, vec!["-f", "+7", "x.rs"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_zed_uses_colon_line_format() {
+        let inv = build_editor_invocation(Some("zed"), 10, Path::new("a.rs")).unwrap();
+        assert_eq!(inv.program, "zed");
+        assert_eq!(inv.args, vec!["a.rs:10"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_code_with_flags_uses_colon_format() {
+        let inv = build_editor_invocation(Some("code --wait --new-window"), 1, Path::new("a.rs"))
+            .unwrap();
+        assert_eq!(inv.program, "code");
+        assert_eq!(inv.args, vec!["--wait", "--new-window", "a.rs:1"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_helix_uses_colon_format() {
+        let inv = build_editor_invocation(Some("hx"), 5, Path::new("b.rs")).unwrap();
+        assert_eq!(inv.program, "hx");
+        assert_eq!(inv.args, vec!["b.rs:5"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_nano_uses_plus_line_format() {
+        let inv = build_editor_invocation(Some("nano"), 3, Path::new("c.py")).unwrap();
+        assert_eq!(inv.program, "nano");
+        assert_eq!(inv.args, vec!["+3", "c.py"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_returns_none_when_env_is_unset() {
+        assert!(build_editor_invocation(None, 1, Path::new("x.rs")).is_none());
+    }
+
+    #[test]
+    fn build_editor_invocation_returns_none_when_env_is_blank() {
+        assert!(build_editor_invocation(Some("   "), 1, Path::new("x.rs")).is_none());
+        assert!(build_editor_invocation(Some(""), 1, Path::new("x.rs")).is_none());
+    }
+
+    #[test]
+    fn open_in_editor_pairs_cursor_target_line_with_env_program() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/bar.rs",
+            "a\nb\n",
+            2,
+            vec![diff_line(LineKind::Added, "b")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        let inv = app.open_in_editor(Some("vim")).expect("invocation");
+        assert_eq!(inv.program, "vim");
+        assert_eq!(inv.args.len(), 2);
+        assert_eq!(inv.args[0], "+2");
+        assert_eq!(
+            inv.args[1],
+            tmp.path().join("src/bar.rs").display().to_string()
+        );
+    }
+
+    #[test]
+    fn open_in_editor_returns_none_when_cursor_is_on_file_header() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "lib.rs",
+            "x\n",
+            1,
+            vec![diff_line(LineKind::Added, "x")],
+        );
+        let header = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("header");
+        app.scroll_to(header);
+
+        assert!(app.open_in_editor(Some("vim")).is_none());
+    }
+
+    #[test]
+    fn open_in_editor_returns_none_when_env_is_empty() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "a.rs",
+            "x\n",
+            1,
+            vec![diff_line(LineKind::Added, "x")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        assert!(app.open_in_editor(None).is_none());
+    }
+
+    // ---- M4 slice 4: `x` hunk revert confirmation dialog ----------
+
+    /// Build a real git repo in `tmp` with a single committed file,
+    /// modify it so there's a one-line diff, bootstrap an App
+    /// against it, and return both the App and the worktree file
+    /// path. Lets `x`-key tests exercise the real `git apply
+    /// --reverse` path end-to-end.
+    fn revert_app_with_real_repo(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        committed: &str,
+        modified: &str,
+    ) -> (App, PathBuf) {
+        use std::process::Command;
+        let repo = tmp.path();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "--quiet", "--initial-branch=main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "kizu test"]);
+
+        let abs = repo.join(rel_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
+        }
+        std::fs::write(&abs, committed).expect("seed");
+        run(&["add", rel_path]);
+        run(&["commit", "--quiet", "-m", "seed"]);
+        std::fs::write(&abs, modified).expect("modify");
+
+        let app = App::bootstrap(repo.to_path_buf()).expect("bootstrap");
+        (app, abs)
+    }
+
+    #[test]
+    fn handle_key_x_opens_revert_confirm_overlay_without_touching_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('x')));
+
+        let state = app
+            .revert_confirm
+            .as_ref()
+            .expect("x must open the confirmation overlay");
+        assert_eq!(state.file_path, PathBuf::from("foo.rs"));
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\nfn two() {}\n",
+            "opening the overlay must not touch the file"
+        );
+    }
+
+    #[test]
+    fn revert_confirm_n_cancels_without_reverting() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert!(app.revert_confirm.is_none(), "`n` must close the overlay");
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\nfn two() {}\n",
+            "`n` must not touch the worktree"
+        );
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn revert_confirm_esc_cancels_without_reverting() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.revert_confirm.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\nfn two() {}\n",
+            "Esc must not touch the worktree"
+        );
+    }
+
+    #[test]
+    fn revert_confirm_y_reverts_hunk_on_disk() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert!(
+            app.revert_confirm.is_none(),
+            "confirm must close the overlay"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\n",
+            "`y` must run git apply --reverse on the target hunk"
+        );
+        assert!(
+            app.last_error.is_none(),
+            "successful revert leaves last_error clean"
+        );
+    }
+
+    #[test]
+    fn revert_confirm_enter_also_confirms() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.revert_confirm.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\n"
+        );
+    }
+
+    #[test]
+    fn handle_key_x_on_file_header_row_is_noop() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        let file_header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("file header exists");
+        app.scroll_to(file_header_row);
+
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert!(
+            app.revert_confirm.is_none(),
+            "x on the file header must not open the overlay"
+        );
+    }
+
+    #[test]
+    fn normal_keys_are_inert_while_revert_confirm_overlay_is_open() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+
+        // `q` while the overlay is open must CANCEL the dialog, not quit.
+        app.handle_key(key(KeyCode::Char('q')));
+
+        assert!(!app.should_quit, "q while overlay open must not quit");
+        assert!(
+            app.revert_confirm.is_none(),
+            "any key other than y/Y/Enter closes the dialog"
+        );
+    }
+
+    #[test]
+    fn scar_target_line_maps_cursor_on_deleted_line_to_next_live_line() {
+        // hunk: Added "x" (new file line 10), Deleted "y" (no new pos),
+        //       Added "z" (new file line 11). Cursor on the Deleted
+        //       row should resolve to line 11 — the replacement.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                10,
+                vec![
+                    diff_line(LineKind::Added, "x"),
+                    diff_line(LineKind::Deleted, "y"),
+                    diff_line(LineKind::Added, "z"),
+                ],
+            )],
+            100,
+        )]);
+        // Cursor on the Deleted row (2nd diff line in the hunk = nth=1).
+        cursor_on_nth_diff_line(&mut app, 1);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(
+            line, 11,
+            "deleted-row cursor must map to the next live line"
+        );
+    }
+
+    #[test]
+    fn scar_target_line_on_all_deleted_hunk_returns_hunk_new_start() {
+        // A pure-deletion hunk has no Added/Context lines in the
+        // new file. The cursor on any deleted row should still
+        // resolve to `hunk.new_start` — the position in the new
+        // file where the deletion gap sits. The scar will land
+        // above that line (which may be a surviving neighbour or
+        // the end of the file).
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                5,
+                vec![
+                    diff_line(LineKind::Deleted, "gone_a"),
+                    diff_line(LineKind::Deleted, "gone_b"),
+                    diff_line(LineKind::Deleted, "gone_c"),
+                ],
+            )],
+            100,
+        )]);
+        // Cursor on the first deleted row.
+        cursor_on_nth_diff_line(&mut app, 0);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(
+            line, 5,
+            "pure-deletion hunk cursor must resolve to hunk.new_start"
+        );
+
+        // Middle deleted row — same target.
+        cursor_on_nth_diff_line(&mut app, 1);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(line, 5);
+
+        // Last deleted row — same target.
+        cursor_on_nth_diff_line(&mut app, 2);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(line, 5);
+    }
+
+    #[test]
+    fn scar_on_deleted_line_writes_above_next_surviving_line() {
+        // End-to-end: commit "a\nb\nc\n", worktree becomes "a\nc\n"
+        // (line "b" deleted). Cursor on the deleted "b" row, press
+        // `a` → scar should land above line 2 of the new file
+        // (which is "c", the survivor after the deletion).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(&tmp, "del.rs", "a\nb\nc\n", "a\nc\n");
+        // Find the deleted row (LineKind::Deleted for "b").
+        let del_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                if let RowKind::DiffLine {
+                    file_idx,
+                    hunk_idx,
+                    line_idx,
+                } = r
+                {
+                    app.files
+                        .get(*file_idx)
+                        .and_then(|f| match &f.content {
+                            DiffContent::Text(hunks) => hunks
+                                .get(*hunk_idx)
+                                .and_then(|h| h.lines.get(*line_idx))
+                                .map(|l| l.kind == LineKind::Deleted),
+                            _ => None,
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            })
+            .expect("a deleted row exists");
+        app.scroll_to(del_row);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(&abs).expect("read back");
+        assert_eq!(
+            after, "a\n// @kizu[ask]: explain this change\nc\n",
+            "scar on a deleted row must land above the next surviving line"
+        );
+    }
+
+    #[test]
+    fn scar_on_all_deleted_hunk_writes_at_deletion_point() {
+        // Commit "a\nb\nc\nd\n", worktree "a\nd\n" (lines b,c
+        // deleted). The hunk's new_start points at the gap between
+        // "a" and "d". Scar should land above line 2 of the new
+        // file (which is "d").
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(&tmp, "gap.rs", "a\nb\nc\nd\n", "a\nd\n");
+        // Park on the first deleted row.
+        let del_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                if let RowKind::DiffLine {
+                    file_idx,
+                    hunk_idx,
+                    line_idx,
+                } = r
+                {
+                    app.files
+                        .get(*file_idx)
+                        .and_then(|f| match &f.content {
+                            DiffContent::Text(hunks) => hunks
+                                .get(*hunk_idx)
+                                .and_then(|h| h.lines.get(*line_idx))
+                                .map(|l| l.kind == LineKind::Deleted),
+                            _ => None,
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            })
+            .expect("deleted row");
+        app.scroll_to(del_row);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(&abs).expect("read back");
+        assert_eq!(
+            after, "a\n// @kizu[ask]: explain this change\nd\n",
+            "scar on all-deleted hunk must land at the deletion gap"
         );
     }
 }

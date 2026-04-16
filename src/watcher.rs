@@ -4,12 +4,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use notify::RecursiveMode;
-use notify_debouncer_full::{
-    DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt,
-    notify::{Config as NotifyConfig, PollWatcher},
-};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache};
 #[cfg(not(target_os = "macos"))]
 use notify_debouncer_full::{new_debouncer, notify::RecommendedWatcher};
+#[cfg(target_os = "macos")]
+use notify_debouncer_full::{
+    new_debouncer_opt,
+    notify::{Config as NotifyConfig, PollWatcher},
+};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Worktree debounce window (SPEC.md).
@@ -17,6 +19,26 @@ const WORKTREE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// `<git_dir>` debounce window (SPEC.md). HEAD/refs move much less often than
 /// random worktree edits, so we keep the window short.
 const HEAD_DEBOUNCE: Duration = Duration::from_millis(100);
+/// Top-level worktree directories we intentionally do not recurse into.
+/// These are common dependency caches / build outputs whose initial poll scan
+/// is far more expensive than the value they provide to the v0.1 diff UI.
+const WORKTREE_EXCLUDED_DIR_NAMES: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".direnv",
+    ".venv",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".cache",
+    ".gradle",
+    ".mvn",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+];
 
 #[cfg(target_os = "macos")]
 type KizuWatcher = PollWatcher;
@@ -99,8 +121,13 @@ pub struct WatchHandle {
     /// Common git dir (equal to `git_dir` for normal repos, different
     /// for linked worktrees). Same rationale as `git_dir`.
     common_git_dir: PathBuf,
+    /// Worktree root, kept for `refresh_worktree_watches`.
+    worktree_root: PathBuf,
+    /// Set of top-level child directories that already have recursive
+    /// watches. `refresh_worktree_watches` adds any new ones.
+    watched_children: std::collections::HashSet<PathBuf>,
     // The debouncers must outlive `events`; dropping them stops the watchers.
-    _worktree: KizuDebouncer,
+    worktree_debouncer: KizuDebouncer,
     _git_state: Vec<KizuDebouncer>,
 }
 
@@ -121,6 +148,30 @@ impl WatchHandle {
             BaselineMatcherInner::new(&self.git_dir, &self.common_git_dir, current_branch_ref);
         if let Ok(mut guard) = self.matcher.write() {
             *guard = new_inner;
+        }
+    }
+
+    /// Re-scan the worktree root for new top-level directories and
+    /// add recursive watches for any that appeared since the last scan.
+    /// Called by the app after `WatchEvent::Worktree` to close the
+    /// blind spot where a directory created after startup would not be
+    /// watched recursively.
+    pub fn refresh_worktree_watches(&mut self) {
+        let children = match recursive_worktree_children(&self.worktree_root) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for child in children {
+            if self.watched_children.contains(&child) {
+                continue;
+            }
+            if self
+                .worktree_debouncer
+                .watch(&child, RecursiveMode::Recursive)
+                .is_ok()
+            {
+                self.watched_children.insert(child);
+            }
         }
     }
 }
@@ -167,7 +218,8 @@ pub fn start(
         current_branch_ref,
     )));
 
-    let worktree = spawn_worktree_debouncer(&worktree_root, &git_dir_owned, tx.clone())?;
+    let (worktree_debouncer, initial_children) =
+        spawn_worktree_debouncer(&worktree_root, &git_dir_owned, tx.clone())?;
     let mut git_state = Vec::new();
     for watch_root in git_state_watch_roots(&git_dir_owned, &common_git_dir_owned) {
         git_state.push(spawn_git_state_debouncer(
@@ -182,7 +234,9 @@ pub fn start(
         matcher,
         git_dir: git_dir_owned,
         common_git_dir: common_git_dir_owned,
-        _worktree: worktree,
+        worktree_root,
+        watched_children: initial_children,
+        worktree_debouncer,
         _git_state: git_state,
     })
 }
@@ -254,8 +308,19 @@ fn spawn_worktree_debouncer(
     root: &Path,
     git_dir: &Path,
     tx: UnboundedSender<WatchEvent>,
-) -> Result<KizuDebouncer> {
+) -> Result<(KizuDebouncer, std::collections::HashSet<PathBuf>)> {
     let git_dir = git_dir.to_path_buf();
+    // Pre-resolve excluded directory paths so the callback can filter
+    // cheaply. On Linux inotify, a non-recursive root watch still
+    // reports mtime changes on excluded child directories (e.g. when
+    // a file inside target/ is written, target/'s mtime updates and
+    // inotify fires on the root watch). Without this filter, those
+    // events leak through as Worktree and cause spurious recomputes.
+    let excluded_dirs: Vec<PathBuf> = WORKTREE_EXCLUDED_DIR_NAMES
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    let callback_tx = tx.clone();
     let mut debouncer = new_kizu_debouncer(
         WORKTREE_DEBOUNCE,
         true,
@@ -263,35 +328,81 @@ fn spawn_worktree_debouncer(
             let events = match result {
                 Ok(events) => events,
                 Err(errors) => {
-                    // Surface backend failures (FSEvents drop, moved
-                    // watch target, kqueue overflow, …) so the app
-                    // layer can flip the footer to red and force a
-                    // recompute instead of silently drifting stale.
                     let message = format_notify_errors(WatchSource::Worktree, &errors);
-                    let _ = tx.send(WatchEvent::Error {
+                    let _ = callback_tx.send(WatchEvent::Error {
                         source: WatchSource::Worktree,
                         message,
                     });
                     return;
                 }
             };
-            // If every path on every event lives inside `git_dir`, swallow
-            // the burst — that's git churning its own bookkeeping. As soon
-            // as one path is outside `git_dir`, we wake the app loop.
+            // Swallow events whose paths all live inside git_dir or an
+            // excluded directory (target/, node_modules/, etc.). Only
+            // wake the app loop when a genuine worktree path is touched.
+            let dominated = |p: &Path| {
+                is_inside(p, &git_dir) || excluded_dirs.iter().any(|excl| is_inside(p, excl))
+            };
             let touches_worktree = events
                 .iter()
-                .any(|ev| ev.event.paths.iter().any(|p| !is_inside(p, &git_dir)));
+                .any(|ev| ev.event.paths.iter().any(|p| !dominated(p)));
             if touches_worktree {
-                let _ = tx.send(WatchEvent::Worktree);
+                let _ = callback_tx.send(WatchEvent::Worktree);
             }
         },
     )
     .context("failed to create worktree debouncer")?;
 
     debouncer
-        .watch(root, RecursiveMode::Recursive)
+        .watch(root, RecursiveMode::NonRecursive)
         .with_context(|| format!("failed to watch worktree at {}", root.display()))?;
-    Ok(debouncer)
+
+    let recursive_children = match recursive_worktree_children(root) {
+        Ok(children) => children,
+        Err(err) => {
+            let _ = tx.send(WatchEvent::Error {
+                source: WatchSource::Worktree,
+                message: format!("watcher [{}]: {err:#}", WatchSource::Worktree.label()),
+            });
+            return Ok((debouncer, std::collections::HashSet::new()));
+        }
+    };
+
+    let mut watched = std::collections::HashSet::with_capacity(recursive_children.len());
+    for child in recursive_children {
+        debouncer
+            .watch(&child, RecursiveMode::Recursive)
+            .with_context(|| format!("failed to watch worktree at {}", child.display()))?;
+        watched.insert(child);
+    }
+    Ok((debouncer, watched))
+}
+
+fn recursive_worktree_children(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut children = Vec::new();
+    let entries = std::fs::read_dir(root)
+        .with_context(|| format!("failed to read worktree root {}", root.display()))?;
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("failed to enumerate worktree root {}", root.display()))?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_excluded_worktree_dir_name)
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.is_dir() {
+            children.push(path);
+        }
+    }
+    children.sort();
+    Ok(children)
+}
+
+fn is_excluded_worktree_dir_name(name: &str) -> bool {
+    WORKTREE_EXCLUDED_DIR_NAMES.contains(&name)
 }
 
 fn git_state_watch_roots(git_dir: &Path, common_git_dir: &Path) -> Vec<WatchRoot> {
@@ -511,6 +622,48 @@ mod tests {
     /// debounce is 300 ms — anything shorter is racy.
     const DRAIN_WAIT: TokioDuration = TokioDuration::from_millis(2_000);
 
+    /// Drain all pending events for `wait` duration, discarding them.
+    /// Used to clear startup noise before testing a specific write.
+    async fn drain_events(handle: &mut WatchHandle, wait: TokioDuration) {
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let poll = remaining.min(TokioDuration::from_millis(200));
+            match timeout(poll, handle.events.recv()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    async fn saw_matching_event<F>(
+        handle: &mut WatchHandle,
+        wait: TokioDuration,
+        mut matches: F,
+    ) -> bool
+    where
+        F: FnMut(&WatchEvent) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline {
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            let next_poll = if remaining > TokioDuration::from_millis(200) {
+                TokioDuration::from_millis(200)
+            } else {
+                remaining
+            };
+            match timeout(next_poll, handle.events.recv()).await {
+                Ok(Some(event)) if matches(&event) => return true,
+                Ok(Some(_)) => continue,
+                Ok(None) => return false,
+                Err(_) => continue,
+            }
+        }
+        false
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn worktree_event_is_received_for_a_new_file() {
         let repo = init_repo();
@@ -535,6 +688,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worktree_watcher_skips_target_directory() {
+        let repo = init_repo();
+        fs::create_dir_all(repo.path().join("target")).expect("create target");
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        fs::write(repo.path().join("target").join("foo.rs"), "fn build() {}\n")
+            .expect("write target file");
+        fs::write(repo.path().join("src").join("bar.rs"), "fn app() {}\n").expect("write src file");
+
+        let root = crate::git::find_root(repo.path()).expect("find_root");
+        let git_dir = crate::git::git_dir(&root).expect("git_dir");
+        let common = crate::git::git_common_dir(&root).expect("common git_dir");
+        let branch = crate::git::current_branch_ref(&root).expect("current branch");
+
+        let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
+
+        // Drain any startup events (inotify may fire for files that
+        // existed before the watcher was created).
+        drain_events(&mut handle, TokioDuration::from_millis(800)).await;
+
+        fs::write(root.join("target").join("foo.rs"), "fn build() { 1 }\n")
+            .expect("rewrite target file");
+
+        let saw_target_event =
+            saw_matching_event(&mut handle, TokioDuration::from_millis(1_000), |event| {
+                *event == WatchEvent::Worktree
+            })
+            .await;
+        assert!(
+            !saw_target_event,
+            "nested writes under excluded target/ must not emit Worktree"
+        );
+
+        fs::write(root.join("src").join("bar.rs"), "fn app() { 1 }\n").expect("rewrite src file");
+
+        let saw_src_event = saw_matching_event(&mut handle, DRAIN_WAIT, |event| {
+            *event == WatchEvent::Worktree
+        })
+        .await;
+        assert!(
+            saw_src_event,
+            "nested writes under non-excluded top-level directories must still emit Worktree"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worktree_watcher_still_sees_root_level_file_writes() {
+        let repo = init_repo();
+        fs::write(repo.path().join("README.md"), "before\n").expect("write root file");
+
+        let root = crate::git::find_root(repo.path()).expect("find_root");
+        let git_dir = crate::git::git_dir(&root).expect("git_dir");
+        let common = crate::git::git_common_dir(&root).expect("common git_dir");
+        let branch = crate::git::current_branch_ref(&root).expect("current branch");
+
+        let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
+
+        tokio::time::sleep(TokioDuration::from_millis(250)).await;
+        fs::write(root.join("README.md"), "after!\n").expect("rewrite root file");
+
+        let saw_root_event = saw_matching_event(&mut handle, DRAIN_WAIT, |event| {
+            *event == WatchEvent::Worktree
+        })
+        .await;
+        assert!(
+            saw_root_event,
+            "root-level file writes must still emit Worktree with a non-recursive root watch"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn writes_inside_git_dir_do_not_emit_worktree_event() {
         let repo = init_repo();
         let root = crate::git::find_root(repo.path()).expect("find_root");
@@ -544,7 +767,9 @@ mod tests {
 
         let mut handle = start(&root, &git_dir, &common, branch.as_deref()).expect("start watcher");
 
-        tokio::time::sleep(TokioDuration::from_millis(150)).await;
+        // Drain startup events before testing the specific write.
+        drain_events(&mut handle, TokioDuration::from_millis(800)).await;
+
         // Drop a file inside .git/ to mimic git's own bookkeeping. notify
         // should fire — but the worktree filter must swallow it, and since
         // the path is not HEAD/refs/packed-refs the git_dir watcher must

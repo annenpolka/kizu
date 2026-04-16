@@ -3,6 +3,12 @@ use clap::{Parser, Subcommand};
 
 mod app;
 mod git;
+mod highlight;
+mod hook;
+mod init;
+mod paths;
+mod scar;
+mod session;
 mod ui;
 mod watcher;
 
@@ -19,16 +25,34 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Initialize Claude Code hooks in .claude/settings.json (v0.2)
-    Init,
-    /// Remove Claude Code hooks (v0.2)
+    /// Initialize agent hooks
+    Init {
+        /// Comma-separated agent names (e.g. claude-code,cursor)
+        #[arg(long, value_delimiter = ',')]
+        agent: Option<Vec<String>>,
+        /// Install scope: project or user
+        #[arg(long)]
+        scope: Option<String>,
+        /// Skip interactive prompts
+        #[arg(long)]
+        non_interactive: bool,
+    },
+    /// Remove all kizu hooks from detected agents
     Teardown,
-    /// PostToolUse hook entry: synchronous single-file scar grep (v0.2)
-    HookPostTool,
-    /// PostToolUse hook entry: async event log writer for stream mode (v0.2)
+    /// PostToolUse hook: scan the edited file for @kizu scars
+    HookPostTool {
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+    },
+    /// Git pre-commit hook: block commit if staged files contain scars
+    HookPreCommit,
+    /// PostToolUse hook: async event log writer for stream mode (v0.2)
     HookLogEvent,
-    /// Stop hook entry: detect outstanding @review: scars (v0.2)
-    HookStop,
+    /// Stop hook: block if unresolved @kizu scars remain
+    HookStop {
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -37,10 +61,116 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => app::run().await,
-        Some(Command::Init) => unimplemented!("v0.2: kizu init"),
-        Some(Command::Teardown) => unimplemented!("v0.2: kizu teardown"),
-        Some(Command::HookPostTool) => unimplemented!("v0.2: kizu hook-post-tool"),
+        Some(Command::Init {
+            agent,
+            scope,
+            non_interactive,
+        }) => {
+            let cwd = std::env::current_dir()?;
+            let root = git::find_root(&cwd).unwrap_or(cwd);
+            init::run_init(&root, agent.as_deref(), scope.as_deref(), non_interactive)
+        }
+        Some(Command::Teardown) => {
+            let cwd = std::env::current_dir()?;
+            let root = git::find_root(&cwd).unwrap_or(cwd);
+            init::run_teardown(&root)
+        }
+        Some(Command::HookPostTool { agent }) => run_hook_post_tool(&agent),
+        Some(Command::HookPreCommit) => run_hook_pre_commit(),
         Some(Command::HookLogEvent) => unimplemented!("v0.2: kizu hook-log-event"),
-        Some(Command::HookStop) => unimplemented!("v0.2: kizu hook-stop"),
+        Some(Command::HookStop { agent }) => run_hook_stop(&agent),
     }
+}
+
+fn run_hook_post_tool(agent_str: &str) -> Result<()> {
+    let agent = hook::AgentKind::from_str(agent_str)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent: {agent_str}"))?;
+    let input = hook::parse_hook_input(agent, std::io::stdin().lock())?;
+
+    if input.file_paths.is_empty() {
+        return Ok(());
+    }
+
+    let hits = hook::scan_scars(&input.file_paths);
+    if let Some(json) = hook::format_additional_context(agent, &hits) {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn run_hook_stop(agent_str: &str) -> Result<()> {
+    let agent = hook::AgentKind::from_str(agent_str)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent: {agent_str}"))?;
+    let input = hook::parse_hook_input(agent, std::io::stdin().lock())?;
+
+    if input.stop_hook_active {
+        return Ok(());
+    }
+
+    let cwd = input
+        .cwd
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let root = git::find_root(&cwd)?;
+    let changed = hook::enumerate_session_files(&root)?;
+    let hits = hook::scan_scars(&changed);
+
+    if !hits.is_empty() {
+        eprint!("{}", hook::format_stop_stderr(&hits));
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn run_hook_pre_commit() -> Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let cwd = std::env::current_dir()?;
+    let root = git::find_root(&cwd)?;
+
+    // Get staged files via NUL-delimited output to handle paths
+    // with special characters safely.
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMR",
+        ])
+        .current_dir(&root)
+        .output()
+        .context("git diff --cached")?;
+
+    if !output.status.success() {
+        return Ok(()); // Can't determine staged files; don't block.
+    }
+
+    let staged: Vec<std::path::PathBuf> = output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|r| !r.is_empty())
+        .map(|r| root.join(String::from_utf8_lossy(r).as_ref()))
+        .collect();
+
+    if staged.is_empty() {
+        return Ok(());
+    }
+
+    let hits = hook::scan_scars_from_index(&root, &staged);
+    if !hits.is_empty() {
+        eprintln!("kizu: commit blocked — unresolved scars in staged files:");
+        for hit in &hits {
+            eprintln!(
+                "  {}:{} @kizu[{}]: {}",
+                hit.path.display(),
+                hit.line_number,
+                hit.kind,
+                hit.message,
+            );
+        }
+        eprintln!("\nResolve or unstage the scars before committing.");
+        std::process::exit(1);
+    }
+    Ok(())
 }

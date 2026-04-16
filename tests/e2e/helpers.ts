@@ -68,13 +68,14 @@ export function createTempRepo(): Repo {
  */
 export async function launchKizu(opts: {
   cwd: string;
+  args?: string[];
   cols?: number;
   rows?: number;
   env?: Record<string, string>;
 }): Promise<Session> {
   return await launchTerminal({
     command: KIZU_BIN,
-    args: [],
+    args: opts.args ?? [],
     cols: opts.cols ?? 100,
     rows: opts.rows ?? 30,
     cwd: opts.cwd,

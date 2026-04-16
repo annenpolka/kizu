@@ -68,7 +68,7 @@ scar機能追加（a/r/c/xキーバインド、言語判定、ファイル書き
     │
     notify(fsnotify) ─→ [TUI メインdiffビュー] ─→ git diff再計算 ─→ 画面更新
                              │
-                             ├─ a/r/c キー ─→ @review: コメント書き込み ─→ [ソースファイル]
+                             ├─ a/r/c キー ─→ @kizu[*]: コメント書き込み ─→ [ソースファイル]
                              └─ x キー ─→ git checkout（hunk revert）─→ [ソースファイル]
 
 [データソース2: PostToolUseイベントログ → 操作履歴ビュー]
@@ -79,8 +79,8 @@ scar機能追加（a/r/c/xキーバインド、言語判定、ファイル書き
 
 [Claude Codeへのフィードバック]
     │
-    ├─ PostToolUse hook ─→ 書いたファイルに @review: があれば additionalContext で通知
-    └─ Stop hook ─→ git diff --name-only | xargs grep '@review:' → 未対応ならexit 2
+    ├─ PostToolUse hook ─→ 書いたファイルに @kizu[*]: があれば additionalContext で通知
+    └─ Stop hook ─→ tracked + untracked を合成して grep '@kizu\[' → 未対応ならexit 2
 ```
 
 **メインdiffビュー（状態）**: 「今どうなっているか」を見る。hunk境界はgitが決める。
@@ -121,7 +121,7 @@ scar機能追加（a/r/c/xキーバインド、言語判定、ファイル書き
 
 `kizu hook-post-tool`サブコマンドの動作:
 1. `$CLAUDE_TOOL_INPUT_FILE_PATH`を読み取り
-2. そのファイルだけ`grep '@review:'`
+2. そのファイルだけ`grep '@kizu\['`
 3. 見つかれば`additionalContext`でClaude Codeに通知
 4. 見つからなければexit 0（何もしない）
 
@@ -147,7 +147,7 @@ scar機能追加（a/r/c/xキーバインド、言語判定、ファイル書き
 
 `kizu hook-stop`サブコマンドの動作:
 1. `stop_hook_active`チェック（無限ループ防止）
-2. `git diff --name-only | xargs grep -ln '@review:'`
+2. tracked + untracked の両方を列挙し `grep '@kizu\['` で scan（`git diff --name-only` 単独は untracked を取りこぼすので `git status --porcelain --untracked-files=all` と合成する）
 3. 未対応があればstderrに内容を出力 + exit 2（Claude Code継続）
 4. なければexit 0（停止許可）
 
@@ -205,31 +205,32 @@ scar機能追加（a/r/c/xキーバインド、言語判定、ファイル書き
 ### キーバインド
 
 ```
-a       ask — 「この変更について説明して」をscarとして挿入
-r       reject — 「この変更をやめて」をscarとして挿入
-c       comment — ミニ入力欄→任意のコメントをscarとして挿入
+a       ask — `explain this change` を ask scar として挿入
+r       reject — `revert this change` を reject scar として挿入
+c       comment — ミニ入力欄→任意のコメントを free scar として挿入
 x       revert — hunkをgit checkoutで元に戻す（scarなし）
+e       editor — $EDITOR +<line> <file> で外部エディタを起動
 space   見たマーク（TUI内部のみ、ファイルに何も書かない）
 ```
 
 全キーバインドは`~/.config/kizu/config.toml`でリマップ可能。
 
-### @review:コメントフォーマット
+### `@kizu[...]:` コメントフォーマット
 
-変更行の直上に、言語のコメント構文で挿入:
+変更行の直上に、言語のコメント構文で挿入。`@kizu[<kind>]:` の `<kind>` は `ask` / `reject` / `free` の 3 種で、hook 層がカテゴリ別に未対応 scar を分類できる:
 
 ```rust
-// @review: この変更について説明して
+// @kizu[ask]: explain this change
 if claims.exp < Utc::now() {
 ```
 
 ```ruby
-# @review: この変更をやめて
+# @kizu[reject]: revert this change
 validate :email, presence: true
 ```
 
 ```html
-<!-- @review: このclass削除するとレイアウト崩れない？ -->
+<!-- @kizu[free]: このclass削除するとレイアウト崩れない？ -->
 <div class="container">
 ```
 
@@ -237,13 +238,13 @@ validate :email, presence: true
 
 | 拡張子 | 構文 |
 |:---|:---|
-| .rs, .ts, .js, .java, .go, .c, .cpp, .swift | `// @review: ...` |
-| .rb, .py, .sh, .yaml, .yml, .toml | `# @review: ...` |
-| .html, .xml, .svg | `<!-- @review: ... -->` |
-| .css, .scss | `/* @review: ... */` |
-| .sql | `-- @review: ...` |
-| .lua, .hs | `-- @review: ...` |
-| その他/不明 | `# @review: ...`（フォールバック） |
+| .rs, .ts, .js, .java, .go, .c, .cpp, .swift | `// @kizu[<kind>]: ...` |
+| .rb, .py, .sh, .yaml, .yml, .toml | `# @kizu[<kind>]: ...` |
+| .html, .xml, .svg | `<!-- @kizu[<kind>]: ... -->` |
+| .css, .scss | `/* @kizu[<kind>]: ... */` |
+| .sql | `-- @kizu[<kind>]: ...` |
+| .lua, .hs | `-- @kizu[<kind>]: ...` |
+| その他/不明 | `# @kizu[<kind>]: ...`（フォールバック） |
 
 ### revert操作（xキー）
 

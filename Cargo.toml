@@ -1,6 +1,6 @@
 [package]
 name = "kizu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Realtime diff monitor + inline scar review TUI for AI coding agents (Claude Code, etc.)"
 license = "MIT"
@@ -10,16 +10,22 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.102"
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
+dialoguer = "0.12"
+dirs = "6"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+libc = "0.2"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
 ratatui = "0.30.0"
+regex = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 syntect = "5.3.0"
 tokio = { version = "1.52", features = ["rt", "macros", "sync", "time"] }
+unicode-width = "0.2"
+which = "8"
 
 [dev-dependencies]
 tempfile = "3"

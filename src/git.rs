@@ -550,6 +550,88 @@ pub fn find_root(start: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(raw.trim()))
 }
 
+/// Serialize a single hunk back into a unified-diff patch string
+/// that `git apply` can consume. The output is a minimal, single-hunk
+/// patch with the `--- a/<path>` / `+++ b/<path>` header pair and
+/// the `@@` range reconstructed from the hunk metadata.
+///
+/// `rel_path` is the worktree-relative path of the owning file,
+/// written as-is on both sides of the header (we use the git-diff
+/// convention of prefixing with `a/` / `b/` so `git apply` without
+/// `-p0` accepts the patch).
+///
+/// A trailing-newline-missing hunk (`has_trailing_newline = false`
+/// on the last body line) gets a `\ No newline at end of file`
+/// marker so `git apply` does not silently mangle the file's EOL
+/// state during revert.
+pub fn build_hunk_patch(rel_path: &Path, hunk: &Hunk) -> String {
+    let mut out = String::new();
+    let display = rel_path.display();
+    out.push_str(&format!("--- a/{display}\n"));
+    out.push_str(&format!("+++ b/{display}\n"));
+    out.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count,
+    ));
+    let last = hunk.lines.len().saturating_sub(1);
+    for (i, line) in hunk.lines.iter().enumerate() {
+        let prefix = match line.kind {
+            LineKind::Context => ' ',
+            LineKind::Added => '+',
+            LineKind::Deleted => '-',
+        };
+        out.push(prefix);
+        out.push_str(&line.content);
+        out.push('\n');
+        if i == last && !line.has_trailing_newline {
+            out.push_str("\\ No newline at end of file\n");
+        }
+    }
+    out
+}
+
+/// Apply a single-hunk patch (as produced by [`build_hunk_patch`])
+/// in reverse, mutating the worktree so the target hunk is undone.
+///
+/// Uses `git apply --reverse --unidiff-zero=no -` so the patch is
+/// read from stdin and applied against the worktree copy of the file.
+/// `--reject` is intentionally **not** passed: if the hunk no longer
+/// cleanly reverses (because the user edited the same line after
+/// reviewing it), we want the operation to fail loud rather than
+/// leave a `.rej` file behind.
+pub fn revert_hunk(root: &Path, patch: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new("git")
+        .args(["apply", "--reverse", "--whitespace=nowarn", "-"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn `git apply --reverse`")?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("`git apply` stdin unavailable"))?;
+        stdin
+            .write_all(patch.as_bytes())
+            .context("failed to write patch to `git apply` stdin")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for `git apply --reverse`")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("`git apply --reverse` failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 /// Parse a unified diff payload (the stdout of `git diff --no-renames ...`)
 /// into a vector of [`FileDiff`].
 pub(crate) fn parse_unified_diff(raw: &str) -> Result<Vec<FileDiff>> {
@@ -1441,5 +1523,129 @@ index 1111111..2222222 100644
         for f in &files {
             assert_eq!(f.status, FileStatus::Added);
         }
+    }
+
+    // ---- revert hunk helpers (M4 slice 4) --------------------------
+
+    fn line_context(content: &str) -> DiffLine {
+        DiffLine {
+            kind: LineKind::Context,
+            content: content.to_string(),
+            has_trailing_newline: true,
+        }
+    }
+    fn line_added(content: &str) -> DiffLine {
+        DiffLine {
+            kind: LineKind::Added,
+            content: content.to_string(),
+            has_trailing_newline: true,
+        }
+    }
+    fn line_deleted(content: &str) -> DiffLine {
+        DiffLine {
+            kind: LineKind::Deleted,
+            content: content.to_string(),
+            has_trailing_newline: true,
+        }
+    }
+
+    #[test]
+    fn build_hunk_patch_round_trips_a_modify_hunk_into_a_git_apply_payload() {
+        // Mirrors what `git diff` would emit for a 1-line replacement
+        // inside `foo.rs`: 1 context line on each side, one delete,
+        // one add. `git apply --reverse` must accept this.
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+            lines: vec![line_context("keep"), line_deleted("old"), line_added("new")],
+            context: None,
+        };
+        let patch = build_hunk_patch(Path::new("foo.rs"), &hunk);
+        assert_eq!(
+            patch,
+            "\
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,2 +1,2 @@
+ keep
+-old
++new
+"
+        );
+    }
+
+    #[test]
+    fn revert_hunk_undoes_an_added_line_on_disk() {
+        // Seed a committed file, add one line in the worktree,
+        // compute a real diff, round-trip the hunk through
+        // `build_hunk_patch` + `revert_hunk`, and confirm the
+        // worktree file goes back to the original content.
+        let repo = init_repo();
+        let file_path = repo.path().join("hello.rs");
+        fs::write(&file_path, "fn one() {}\n").expect("write seed");
+        run_git(repo.path(), &["add", "hello.rs"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "seed"]);
+
+        fs::write(&file_path, "fn one() {}\nfn two() {}\n").expect("write modified");
+
+        let baseline = head_sha(repo.path()).expect("head_sha");
+        let files = compute_diff(repo.path(), &baseline).expect("compute_diff");
+        let file = files
+            .iter()
+            .find(|f| f.path == Path::new("hello.rs"))
+            .expect("hello.rs in diff");
+        let hunk = match &file.content {
+            DiffContent::Text(hunks) => hunks.first().expect("one hunk"),
+            _ => panic!("expected text content"),
+        };
+
+        let patch = build_hunk_patch(&file.path, hunk);
+        revert_hunk(repo.path(), &patch).expect("revert");
+
+        let after = fs::read_to_string(&file_path).expect("read back");
+        assert_eq!(
+            after, "fn one() {}\n",
+            "revert must restore the worktree file to its committed state"
+        );
+    }
+
+    #[test]
+    fn revert_hunk_returns_err_when_patch_no_longer_applies_cleanly() {
+        // Build a patch against one state, mutate the worktree so
+        // the hunk no longer reverses cleanly, confirm revert_hunk
+        // surfaces the failure as an Err rather than silently
+        // leaving the file in a half-applied state.
+        let repo = init_repo();
+        let file_path = repo.path().join("drift.rs");
+        fs::write(&file_path, "alpha\n").expect("seed");
+        run_git(repo.path(), &["add", "drift.rs"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "seed"]);
+        fs::write(&file_path, "alpha\nbeta\n").expect("add beta");
+
+        let baseline = head_sha(repo.path()).expect("head_sha");
+        let files = compute_diff(repo.path(), &baseline).expect("diff");
+        let file = files
+            .iter()
+            .find(|f| f.path == Path::new("drift.rs"))
+            .unwrap();
+        let hunk = match &file.content {
+            DiffContent::Text(h) => h.first().unwrap(),
+            _ => panic!(),
+        };
+        let patch = build_hunk_patch(&file.path, hunk);
+
+        // Now mutate the worktree: replace `beta` with `gamma`.
+        // The reverse patch is still trying to delete `beta`, so
+        // it must fail cleanly instead of creating a .rej file.
+        fs::write(&file_path, "alpha\ngamma\n").expect("drift");
+        let err = revert_hunk(repo.path(), &patch)
+            .expect_err("patch must fail when the hunk has drifted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git apply"),
+            "error must name the failing command, got {msg}",
+        );
     }
 }

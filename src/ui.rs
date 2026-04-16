@@ -18,18 +18,69 @@ use crate::git::{DiffContent, FileDiff, FileStatus, Hunk, LineKind};
 /// every modified file.
 const SCROLL_ROW_LIMIT: usize = 2000;
 
+/// Delta-style background color for added lines. Dim enough to stay
+/// legible against a standard terminal text color but saturated enough
+/// that the eye distinguishes add vs. delete without a `+`/`-` prefix.
+/// See ADR-0014.
+const BG_ADDED: Color = Color::Rgb(10, 50, 10);
+
+/// Delta-style background color for deleted lines. Paired with
+/// [`BG_ADDED`] so the two form a clear contrast.
+const BG_DELETED: Color = Color::Rgb(60, 10, 10);
+
 /// Render the entire kizu frame: scroll view (main) + footer (bottom),
 /// optionally with the modal file picker overlaid on top.
+///
+/// When a text-input overlay is active (scar comment `c` or search
+/// `/`), a dedicated input row is inserted between the main area
+/// and the footer. The input row wraps long text and the terminal
+/// cursor is placed at the text end so the IME composition window
+/// appears in the right spot.
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    let main = chunks[0];
-    let footer = chunks[1];
 
-    if app.files.is_empty() {
+    // Determine input-line content + prefix + cursor pos for rendering.
+    let input_line: Option<(String, &str, usize)> = if let Some(state) = app.scar_comment.as_ref() {
+        Some((state.body.clone(), "> ", state.cursor_pos))
+    } else if let Some(input) = app.search_input.as_ref() {
+        Some((input.query.clone(), "/", input.cursor_pos))
+    } else {
+        None
+    };
+
+    let input_height: u16 = if let Some((ref text, prefix, _)) = input_line {
+        use unicode_width::UnicodeWidthStr;
+        let total_width = prefix.width() + text.width() + 1; // +1 for cursor block
+        let w = (area.width as usize).max(1);
+        total_width.div_ceil(w).max(1) as u16
+    } else {
+        0
+    };
+
+    let chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(input_height),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let main = chunks[0];
+    let input_area = chunks[1];
+    let footer = chunks[2];
+
+    if let Some(fv) = app.file_view.as_ref() {
+        let hl = app
+            .highlighter
+            .get_or_init(crate::highlight::Highlighter::new);
+        render_file_view(frame, main, fv, Some(hl));
+    } else if app.files.is_empty() {
         render_empty(frame, main, app);
     } else {
         render_scroll(frame, main, app);
+    }
+
+    // Render the dedicated input row when a text overlay is active.
+    if let Some((text, prefix, cursor_pos)) = input_line {
+        render_input_line(frame, input_area, prefix, &text, cursor_pos);
     }
 
     render_footer(frame, footer, app);
@@ -37,6 +88,73 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     if app.picker.is_some() {
         render_picker(frame, area, app);
     }
+}
+
+/// Render a text-input line with wrapping support and a blinking
+/// cursor block at the text end. Used for both scar-comment (`> `)
+/// and search (`/`) overlays.
+fn render_input_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    prefix: &str,
+    text: &str,
+    cursor_pos: usize,
+) {
+    use ratatui::widgets::Wrap;
+    use unicode_width::UnicodeWidthStr;
+
+    // Split text at cursor position for visual cursor rendering.
+    let before_cursor: String = text.chars().take(cursor_pos).collect();
+    let cursor_char: String = text
+        .chars()
+        .nth(cursor_pos)
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    let after_cursor: String = text
+        .chars()
+        .skip(cursor_pos + cursor_char.chars().count())
+        .collect();
+
+    let mut spans = vec![
+        Span::styled(
+            prefix.to_string(),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(before_cursor.clone(), Style::default().fg(Color::White)),
+    ];
+
+    if cursor_char.is_empty() {
+        // Cursor at end: show block cursor placeholder
+        spans.push(Span::styled(
+            " ",
+            Style::default().fg(Color::Black).bg(Color::White),
+        ));
+    } else {
+        // Cursor on a character: highlight it
+        spans.push(Span::styled(
+            cursor_char,
+            Style::default().fg(Color::Black).bg(Color::White),
+        ));
+        spans.push(Span::styled(
+            after_cursor,
+            Style::default().fg(Color::White),
+        ));
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+
+    // Place the terminal cursor at the edit position for IME.
+    let cursor_display_offset = prefix.width() + before_cursor.width();
+    let w = area.width.max(1) as usize;
+    let cursor_y = area.y + (cursor_display_offset / w) as u16;
+    let cursor_x = area.x + (cursor_display_offset % w) as u16;
+    frame.set_cursor_position((
+        cursor_x.min(area.right().saturating_sub(1)),
+        cursor_y.min(area.bottom().saturating_sub(1)),
+    ));
 }
 
 fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -58,16 +176,20 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cursor_row = app.scroll;
     let now = std::time::Instant::now();
 
-    // In wrap mode we reserve 7 cells per row: 5 for the left bar,
-    // 1 for the `+`/`-`/` ` prefix, 1 for the `¶` newline marker.
-    // Compute this *before* calling `viewport_placement` because the
-    // placement math needs the wrap body width to produce a correct
-    // `VisualIndex`.
+    // In wrap mode we reserve 6 cells per row: 5 for the left bar,
+    // 1 for the `¶` newline marker (ADR-0014 dropped the `+`/`-`
+    // prefix column). Compute this *before* calling
+    // `viewport_placement` because the placement math needs the wrap
+    // body width to produce a correct `VisualIndex`.
     let wrap_body_width: Option<usize> = if app.wrap_lines {
-        Some((area.width as usize).saturating_sub(7).max(1))
+        Some((area.width as usize).saturating_sub(6).max(1))
     } else {
         None
     };
+    // Nowrap mode still needs a body width so the diff row
+    // background color can extend to the viewport edge. 5 cells for
+    // the left bar, the rest is body.
+    let nowrap_body_width: usize = (area.width as usize).saturating_sub(5).max(1);
 
     // Sticky header decision (ADR-0009 fix):
     //
@@ -173,13 +295,19 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             None
         };
-        let row_lines = render_row(
-            &app.layout.rows[row_idx],
-            &app.files,
-            selected,
+        let hl = app
+            .highlighter
+            .get_or_init(crate::highlight::Highlighter::new);
+        let ctx = RowRenderCtx {
+            files: &app.files,
+            selected_hunk: selected,
             cursor_sub,
             wrap_body_width,
-        );
+            nowrap_body_width,
+            seen_hunks: &app.seen_hunks,
+            hl: Some(hl),
+        };
+        let row_lines = render_row(&app.layout.rows[row_idx], &ctx);
         let mut take = row_lines.into_iter();
         // Discard any leading visual lines requested by the
         // placement layer (only the first logical row ever carries
@@ -215,7 +343,12 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let (Some(header_rect), Some((file_idx, hunk_idx))) = (header_area, sticky)
         && let DiffContent::Text(hunks) = &app.files[file_idx].content
     {
-        let line = render_hunk_header(&hunks[hunk_idx], true, false);
+        let line = render_hunk_header(
+            &hunks[hunk_idx],
+            true,
+            false,
+            app.hunk_is_seen(file_idx, hunk_idx),
+        );
         frame.render_widget(Paragraph::new(line), header_rect);
     }
 }
@@ -235,6 +368,19 @@ fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> O
     })
 }
 
+/// Per-frame rendering context passed to [`render_row`]. Bundles
+/// the shared state that every row type needs without inflating
+/// the function signature.
+struct RowRenderCtx<'a> {
+    files: &'a [FileDiff],
+    selected_hunk: Option<(usize, usize)>,
+    cursor_sub: Option<usize>,
+    wrap_body_width: Option<usize>,
+    nowrap_body_width: usize,
+    seen_hunks: &'a std::collections::BTreeSet<(std::path::PathBuf, usize)>,
+    hl: Option<&'a crate::highlight::Highlighter>,
+}
+
 /// Build the styled visual `Line`s for a single logical layout row.
 /// Most row types produce exactly one `Line`; a `DiffLine` in wrap
 /// mode (`wrap_body_width.is_some()`) can produce multiple lines
@@ -249,13 +395,18 @@ fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> O
 /// middle of a long wrapped line via Ctrl-d / J). The arrow marker
 /// lands on that visual sub-row instead of always on the first
 /// (ADR-0009 fix). `None` for non-cursor rows.
-fn render_row(
-    row: &RowKind,
-    files: &[FileDiff],
-    selected_hunk: Option<(usize, usize)>,
-    cursor_sub: Option<usize>,
-    wrap_body_width: Option<usize>,
-) -> Vec<Line<'static>> {
+///
+/// Rendering context is bundled into [`RowRenderCtx`] to keep the
+/// signature manageable as we add more per-frame state (seen marks,
+/// highlighter, etc.).
+fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
+    let files = ctx.files;
+    let selected_hunk = ctx.selected_hunk;
+    let cursor_sub = ctx.cursor_sub;
+    let wrap_body_width = ctx.wrap_body_width;
+    let nowrap_body_width = ctx.nowrap_body_width;
+    let seen_hunks = ctx.seen_hunks;
+    let hl = ctx.hl;
     match row {
         RowKind::FileHeader { file_idx } => {
             vec![render_file_header(
@@ -273,6 +424,7 @@ fn render_row(
                 &hunks[*hunk_idx],
                 is_selected,
                 cursor_sub.is_some(),
+                seen_hunks.contains(&(files[*file_idx].path.clone(), hunks[*hunk_idx].old_start)),
             )]
         }
         RowKind::DiffLine {
@@ -287,8 +439,22 @@ fn render_row(
             let line = &hunks[*hunk_idx].lines[*line_idx];
             let is_cursor = cursor_sub.is_some();
             match wrap_body_width {
-                Some(width) => render_diff_line_wrapped(line, is_selected, cursor_sub, width),
-                None => vec![render_diff_line(line, is_selected, is_cursor)],
+                Some(width) => render_diff_line_wrapped(
+                    line,
+                    is_selected,
+                    cursor_sub,
+                    width,
+                    hl,
+                    Some(&files[*file_idx].path),
+                ),
+                None => vec![render_diff_line(
+                    line,
+                    is_selected,
+                    is_cursor,
+                    nowrap_body_width,
+                    hl,
+                    Some(&files[*file_idx].path),
+                )],
             }
         }
         RowKind::BinaryNotice { .. } => vec![Line::from(Span::styled(
@@ -333,54 +499,87 @@ fn wrap_at_chars(content: &str, width: usize) -> Vec<&str> {
 }
 
 /// Wrap-mode variant of [`render_diff_line`]. Splits `line.content`
-/// at `body_width` chars, preserves the `+`/`-`/` ` prefix on every
-/// continuation row, and decorates the *last* visual row with a `¶`
-/// newline marker so the reader can tell real newlines from wrap
-/// boundaries.
+/// at `body_width` chars and paints every visual row with the delta-style
+/// background color (ADR-0014). The last visual row gets a `¶` newline
+/// marker so the reader can tell real newlines from wrap boundaries.
+///
+/// Each visual row is padded out to `body_width` with trailing spaces
+/// so the background color extends uniformly to the right margin
+/// instead of stopping at the last content character.
 fn render_diff_line_wrapped(
     line: &crate::git::DiffLine,
     is_selected: bool,
     cursor_sub: Option<usize>,
     body_width: usize,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: Option<&std::path::Path>,
 ) -> Vec<Line<'static>> {
-    let (prefix_char, color) = match line.kind {
-        LineKind::Added => ('+', Some(Color::Green)),
-        LineKind::Deleted => ('-', Some(Color::Red)),
-        LineKind::Context => (' ', None),
+    // ADR-0014: background-color diff rendering. Focused hunks keep
+    // full brightness; unfocused hunks wear `Modifier::DIM` so the
+    // eye still flows to the cursor band. Context rows use the
+    // terminal default inside the focus and dark-gray + DIM outside.
+    let bg = match line.kind {
+        LineKind::Added => Some(BG_ADDED),
+        LineKind::Deleted => Some(BG_DELETED),
+        LineKind::Context => None,
     };
-    let body_style = match (color, is_selected) {
-        (Some(c), true) => Style::default().fg(c),
-        (Some(c), false) => Style::default().fg(c).add_modifier(Modifier::DIM),
+    let base_style = match (bg, is_selected) {
+        (Some(b), true) => Style::default().bg(b),
+        (Some(b), false) => Style::default().bg(b).add_modifier(Modifier::DIM),
         (None, true) => Style::default(),
         (None, false) => Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
     };
-    let prefix_style = match (color, is_selected) {
-        (Some(c), true) => Style::default().fg(c),
-        (Some(c), false) => Style::default().fg(c).add_modifier(Modifier::DIM),
-        (None, true) => Style::default(),
-        (None, false) => Style::default().add_modifier(Modifier::DIM),
+    let marker_style = match bg {
+        // Keep the marker legible on top of the colored bg.
+        Some(b) => Style::default()
+            .bg(b)
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+        None => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
     };
-    let marker_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM);
+
+    // Highlight the full line once, then distribute tokens across
+    // wrapped visual rows by tracking character positions.
+    let tokens: Option<Vec<crate::highlight::HlToken>> =
+        if let (Some(hl), Some(path)) = (hl, file_path) {
+            let toks = hl.highlight_line(&line.content, path);
+            if toks.len() > 1 || toks.first().is_some_and(|t| t.fg != Color::Reset) {
+                Some(toks)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // Pre-compute per-character fg colors from tokens (if available).
+    // This avoids complex token-boundary tracking when distributing
+    // across wrapped chunks.
+    let char_colors: Vec<Color> = if let Some(ref toks) = tokens {
+        let mut colors = Vec::with_capacity(line.content.len());
+        for tok in toks {
+            for _ in tok.text.chars() {
+                colors.push(tok.fg);
+            }
+        }
+        colors
+    } else {
+        Vec::new()
+    };
 
     let chunks = wrap_at_chars(&line.content, body_width.max(1));
     let last_idx = chunks.len().saturating_sub(1);
+    let mut char_offset = 0usize;
 
     chunks
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
-            let is_first = i == 0;
             let is_last = i == last_idx;
-            // ADR-0009: the cursor arrow lands on the visual sub-row
-            // the user has actually walked to via Ctrl-d / J inside
-            // a long wrapped line, not always on the first visual
-            // row. If `cursor_sub` is larger than the available
-            // visual rows (e.g. after a clamped move), fall back to
-            // the last visual row so the marker never disappears.
             let cursor_line = cursor_sub.map(|s| s.min(last_idx));
             let bar = if cursor_line == Some(i) {
                 Span::styled(
@@ -394,20 +593,44 @@ fn render_diff_line_wrapped(
             } else {
                 Span::raw("     ")
             };
-            // Only the first visual row of a logical diff line carries
-            // the `+`/`-`/` ` prefix. Continuation rows leave the
-            // prefix column blank so the reader's eye treats them as
-            // "same line, wrapped" rather than a new add/delete.
-            let prefix_span = if is_first {
-                Span::styled(prefix_char.to_string(), prefix_style)
+            let marker_reserve = if is_last && line.has_trailing_newline {
+                1
             } else {
-                Span::raw(" ")
+                0
             };
-            let body_span = Span::styled(chunk.to_string(), body_style);
-            let mut spans = vec![bar, prefix_span, body_span];
+            let chunk_char_count = chunk.chars().count();
+            let pad = body_width.saturating_sub(chunk_char_count + marker_reserve);
+
+            let mut spans = vec![bar];
+
+            if !char_colors.is_empty() {
+                // Build per-token spans for this wrapped chunk.
+                let chunk_colors = &char_colors[char_offset..char_offset + chunk_char_count];
+                let mut run_start = 0usize;
+                let chunk_chars: Vec<char> = chunk.chars().collect();
+                while run_start < chunk_chars.len() {
+                    let run_color = chunk_colors[run_start];
+                    let run_end = (run_start + 1..chunk_chars.len())
+                        .find(|&j| chunk_colors[j] != run_color)
+                        .unwrap_or(chunk_chars.len());
+                    let text: String = chunk_chars[run_start..run_end].iter().collect();
+                    spans.push(Span::styled(text, base_style.fg(run_color)));
+                    run_start = run_end;
+                }
+                if pad > 0 {
+                    spans.push(Span::styled(" ".repeat(pad), base_style));
+                }
+            } else {
+                // No highlighting: single span for the whole chunk.
+                let padded_body: String =
+                    chunk.chars().chain(std::iter::repeat_n(' ', pad)).collect();
+                spans.push(Span::styled(padded_body, base_style));
+            }
+
             if is_last && line.has_trailing_newline {
                 spans.push(Span::styled("¶", marker_style));
             }
+            char_offset += chunk_char_count;
             Line::from(spans)
         })
         .collect()
@@ -456,11 +679,23 @@ fn render_file_header(_file_idx: usize, file: &FileDiff, is_cursor: bool) -> Lin
     Line::from(spans)
 }
 
-fn render_hunk_header(hunk: &Hunk, is_selected: bool, is_cursor: bool) -> Line<'static> {
+fn render_hunk_header(
+    hunk: &Hunk,
+    is_selected: bool,
+    is_cursor: bool,
+    is_seen: bool,
+) -> Line<'static> {
+    // Seen-mark indicator sits in front of the `@@` body. It only
+    // takes one cell and keeps the existing 5-cell left bar so
+    // diff-line alignment below the header is unchanged.
+    let seen_mark = if is_seen { "• " } else { "  " };
     let body = match &hunk.context {
-        Some(ctx) => format!("{}  @@ {ctx}", if is_cursor { "  ▶  " } else { "     " }),
+        Some(ctx) => format!(
+            "{}{seen_mark}@@ {ctx}",
+            if is_cursor { "  ▶  " } else { "     " }
+        ),
         None => format!(
-            "{}  @@ -{},{} +{},{} @@",
+            "{}{seen_mark}@@ -{},{} +{},{} @@",
             if is_cursor { "  ▶  " } else { "     " },
             hunk.old_start,
             hunk.old_count,
@@ -479,15 +714,15 @@ fn render_diff_line(
     line: &crate::git::DiffLine,
     is_selected: bool,
     is_cursor: bool,
+    body_width: usize,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: Option<&std::path::Path>,
 ) -> Line<'static> {
-    let (prefix_char, color) = match line.kind {
-        LineKind::Added => ('+', Some(Color::Green)),
-        LineKind::Deleted => ('-', Some(Color::Red)),
-        LineKind::Context => (' ', None),
+    let bg = match line.kind {
+        LineKind::Added => Some(BG_ADDED),
+        LineKind::Deleted => Some(BG_DELETED),
+        LineKind::Context => None,
     };
-    // Left margin (5 cells). When this is the cursor's exact row, drop
-    // a `▶` arrow there so it stands out from the `▎` ribbon that the
-    // selected hunk shares across all of its rows.
     let bar = if is_cursor {
         Span::styled(
             "  ▶  ",
@@ -500,31 +735,56 @@ fn render_diff_line(
     } else {
         Span::raw("     ")
     };
-    let prefix_span = match (color, is_selected) {
-        (Some(c), true) => Span::styled(prefix_char.to_string(), Style::default().fg(c)),
-        (Some(c), false) => Span::styled(
-            prefix_char.to_string(),
-            Style::default().fg(c).add_modifier(Modifier::DIM),
-        ),
-        (None, true) => Span::raw(prefix_char.to_string()),
-        (None, false) => Span::styled(
-            prefix_char.to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-    };
-    let body_style = match (color, is_selected) {
-        (Some(c), true) => Style::default().fg(c),
-        (Some(c), false) => Style::default().fg(c).add_modifier(Modifier::DIM),
+    let base_style = match (bg, is_selected) {
+        (Some(b), true) => Style::default().bg(b),
+        (Some(b), false) => Style::default().bg(b).add_modifier(Modifier::DIM),
         (None, true) => Style::default(),
         (None, false) => Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
     };
-    Line::from(vec![
-        bar,
-        prefix_span,
-        Span::styled(line.content.clone(), body_style),
-    ])
+
+    // Try syntax highlighting. If available, produce per-token spans
+    // with the token fg color + the diff bg style overlay.
+    if let (Some(hl), Some(path)) = (hl, file_path) {
+        let tokens = hl.highlight_line(&line.content, path);
+        if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
+            let mut spans = vec![bar];
+            let mut chars_emitted = 0;
+            for token in &tokens {
+                let token_chars = token.text.chars().count();
+                let remaining = body_width.saturating_sub(chars_emitted);
+                if remaining == 0 {
+                    break;
+                }
+                let take = token_chars.min(remaining);
+                let text: String = token.text.chars().take(take).collect();
+                spans.push(Span::styled(text, base_style.fg(token.fg)));
+                chars_emitted += take;
+            }
+            // Pad to body_width.
+            if chars_emitted < body_width {
+                spans.push(Span::styled(
+                    " ".repeat(body_width - chars_emitted),
+                    base_style,
+                ));
+            }
+            return Line::from(spans);
+        }
+    }
+
+    // Fallback: single-span body (no highlighting or unknown extension).
+    let chunk_len = line.content.chars().count();
+    let padded_body: String = if chunk_len >= body_width {
+        line.content.chars().take(body_width).collect()
+    } else {
+        let pad = body_width - chunk_len;
+        line.content
+            .chars()
+            .chain(std::iter::repeat_n(' ', pad))
+            .collect()
+    };
+    Line::from(vec![bar, Span::styled(padded_body, base_style)])
 }
 
 /// `HH:MM` formatted local time. Returns `--:--` when the metadata read
@@ -560,6 +820,87 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(p, mid);
 }
 
+fn render_file_view(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    fv: &crate::app::FileViewState,
+    hl: Option<&crate::highlight::Highlighter>,
+) {
+    let height = area.height as usize;
+    let width = area.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+
+    for i in 0..height {
+        let line_idx = fv.scroll_top + i;
+        if line_idx >= fv.lines.len() {
+            lines.push(Line::from(Span::styled(
+                "~",
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+        let is_cursor = line_idx == fv.cursor;
+        let bar = if is_cursor {
+            Span::styled(
+                "  ▶  ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("     ")
+        };
+
+        let content = &fv.lines[line_idx];
+        let body_width = width.saturating_sub(5).max(1);
+        let char_len = content.chars().count();
+        let padded: String = if char_len >= body_width {
+            content.chars().take(body_width).collect()
+        } else {
+            content
+                .chars()
+                .chain(std::iter::repeat_n(' ', body_width - char_len))
+                .collect()
+        };
+
+        let base_style = if let Some(&bg) = fv.line_bg.get(&line_idx) {
+            Style::default().bg(bg)
+        } else {
+            Style::default()
+        };
+
+        if let Some(hl) = hl {
+            let tokens = hl.highlight_line(content, &fv.path);
+            if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
+                let mut spans = vec![bar];
+                let mut chars_emitted = 0;
+                for token in &tokens {
+                    let remaining = body_width.saturating_sub(chars_emitted);
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = token.text.chars().count().min(remaining);
+                    let text: String = token.text.chars().take(take).collect();
+                    spans.push(Span::styled(text, base_style.fg(token.fg)));
+                    chars_emitted += take;
+                }
+                if chars_emitted < body_width {
+                    spans.push(Span::styled(
+                        " ".repeat(body_width - chars_emitted),
+                        base_style,
+                    ));
+                }
+                lines.push(Line::from(spans));
+                continue;
+            }
+        }
+
+        lines.push(Line::from(vec![bar, Span::styled(padded, base_style)]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Pre-styled spans for the four "static" pieces of the status bar.
     let dim = Style::default().fg(Color::DarkGray);
@@ -568,6 +909,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let (mode_text, mode_color) = if app.picker.is_some() {
         ("[picker]", Color::Magenta)
+    } else if app.scar_comment.is_some() {
+        ("[scar]", Color::Magenta)
+    } else if app.revert_confirm.is_some() {
+        ("[revert?]", Color::Red)
+    } else if app.search_input.is_some() {
+        ("[search]", Color::Yellow)
+    } else if app.file_view.is_some() {
+        ("[file view]", Color::Cyan)
     } else if app.follow_mode {
         ("[follow]", Color::Green)
     } else {
@@ -598,6 +947,50 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("jump", dim));
+        spans.push(Span::styled(" / ", dim));
+        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("cancel", dim));
+    } else if let Some(fv) = app.file_view.as_ref() {
+        spans.push(sep());
+        spans.push(Span::styled(
+            fv.path.display().to_string(),
+            Style::default().fg(Color::Cyan).add_modifier(bold),
+        ));
+        spans.push(Span::styled(
+            format!(" [{}/{}]", fv.cursor + 1, fv.lines.len()),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(sep());
+        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
+        spans.push(Span::styled("/", dim));
+        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("back", dim));
+    } else if app.search_input.is_some() {
+        // Body is rendered in the dedicated input row above.
+        spans.push(sep());
+        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("find", dim));
+        spans.push(Span::styled(" / ", dim));
+        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("cancel", dim));
+    } else if let Some(state) = app.revert_confirm.as_ref() {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("revert hunk in {} ?", state.file_path.display()),
+            Style::default().fg(Color::Red).add_modifier(bold),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("(y/N)", Style::default().fg(Color::Yellow)));
+    } else if app.scar_comment.is_some() {
+        // Body is rendered in the dedicated input row above.
+        spans.push(sep());
+        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("save", dim));
         spans.push(Span::styled(" / ", dim));
         spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
         spans.push(Span::raw(" "));
@@ -676,7 +1069,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
 
         spans.push(sep());
-        spans.push(Span::styled("⎵", Style::default().fg(Color::Magenta)));
+        spans.push(Span::styled("s", Style::default().fg(Color::Magenta)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("picker", dim));
     }
@@ -885,6 +1278,12 @@ mod tests {
             cursor_placement: crate::app::CursorPlacement::Centered,
             anchor: None,
             picker: None,
+            scar_comment: None,
+            revert_confirm: None,
+            file_view: None,
+            search_input: None,
+            search: None,
+            seen_hunks: std::collections::BTreeSet::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -896,6 +1295,7 @@ mod tests {
             anim: None,
             wrap_lines: false,
             watcher_health: crate::app::WatcherHealth::default(),
+            highlighter: std::cell::OnceCell::new(),
         }
     }
 
@@ -956,15 +1356,20 @@ mod tests {
             view.contains("@@ -10,1 +10,1 @@"),
             "missing hunk header:\n{view}"
         );
-        assert!(view.contains("+let x = 1;"), "missing added line:\n{view}");
-        assert!(
-            view.contains("-let y = 2;"),
-            "missing deleted line:\n{view}"
-        );
+        // ADR-0014: no `+`/`-` prefix; the body text appears bare on
+        // the row and the add/delete signal lives in the background.
+        assert!(view.contains("let x = 1;"), "missing added line:\n{view}");
+        assert!(view.contains("let y = 2;"), "missing deleted line:\n{view}");
     }
 
     #[test]
-    fn render_scroll_lines_carry_added_and_deleted_colors() {
+    fn render_scroll_lines_use_background_color_for_added_and_deleted() {
+        // ADR-0014: delta-style background color for diff rows.
+        //
+        // The `+`/`-` prefix column is gone; added/deleted rows are
+        // identified purely by their background color. We assert that
+        // (a) the body text carries a green or red `bg` Style and
+        // (b) no literal `+`/`-` prefix cell appears on the row body.
         let app = populated_app(vec![make_file(
             "src/foo.rs",
             vec![hunk(
@@ -981,21 +1386,99 @@ mod tests {
         terminal.draw(|f| render(f, &app)).expect("draw");
         let buffer = terminal.backend().buffer().clone();
 
-        let mut found_added_green = false;
-        let mut found_deleted_red = false;
+        let mut found_added_bg = false;
+        let mut found_deleted_bg = false;
         for y in 0..buffer.area().height {
             for x in 0..buffer.area().width {
                 let cell = &buffer[(x, y)];
-                if cell.symbol() == "+" && cell.style().fg == Some(Color::Green) {
-                    found_added_green = true;
+                if cell.symbol() == "x" && cell.style().bg == Some(BG_ADDED) {
+                    found_added_bg = true;
                 }
-                if cell.symbol() == "-" && cell.style().fg == Some(Color::Red) {
-                    found_deleted_red = true;
+                if cell.symbol() == "y" && cell.style().bg == Some(BG_DELETED) {
+                    found_deleted_bg = true;
                 }
             }
         }
-        assert!(found_added_green, "expected an added '+' rendered in green");
-        assert!(found_deleted_red, "expected a deleted '-' rendered in red");
+        assert!(
+            found_added_bg,
+            "expected an added 'x' cell with green background"
+        );
+        assert!(
+            found_deleted_bg,
+            "expected a deleted 'y' cell with red background"
+        );
+    }
+
+    #[test]
+    fn nowrap_added_row_background_extends_to_viewport_edge() {
+        // ADR-0014: the delta-style coloured band must run from the
+        // first body cell to the last cell of the viewport, even
+        // when the diff content is shorter than the width. This
+        // tests nowrap mode (the default). If the padding logic
+        // breaks, the right edge of a short added row will fall
+        // back to the terminal default background.
+        let app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "tiny")])],
+            100,
+        )]);
+        let width: u16 = 40;
+        let backend = TestBackend::new(width, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        // Find the row that contains the "tiny" body text.
+        let mut tiny_y: Option<u16> = None;
+        for y in 0..buffer.area().height {
+            let row: String = (0..width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            if row.contains("tiny") {
+                tiny_y = Some(y);
+                break;
+            }
+        }
+        let y = tiny_y.expect("tiny row must render somewhere");
+
+        // Every cell from the start of the body region (x = 5) to
+        // the last column must carry BG_ADDED.
+        for x in 5..width {
+            let cell = &buffer[(x, y)];
+            assert_eq!(
+                cell.style().bg,
+                Some(BG_ADDED),
+                "cell (x={x}, y={y}) lost the added background; symbol = {:?}",
+                cell.symbol()
+            );
+        }
+    }
+
+    #[test]
+    fn render_scroll_lines_omit_plus_minus_prefix() {
+        // ADR-0014: there must be no `+`/`-` prefix cells in the diff
+        // body region (rows past the 5-char bar margin). The background
+        // color encodes add/delete instead.
+        let app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "ADDED_LINE"),
+                    diff_line(LineKind::Deleted, "DELETED_LINE"),
+                ],
+            )],
+            100,
+        )]);
+        let view = render_to_string(&app, 80, 12);
+        assert!(
+            !view.contains("+ADDED_LINE"),
+            "must not carry a `+` prefix next to added body:\n{view}"
+        );
+        assert!(
+            !view.contains("-DELETED_LINE"),
+            "must not carry a `-` prefix next to deleted body:\n{view}"
+        );
     }
 
     #[test]
@@ -1323,51 +1806,71 @@ mod tests {
     }
 
     #[test]
-    fn selected_hunk_diff_lines_render_at_full_color() {
-        // 2 hunks in 1 file: cursor lives inside the first hunk after
-        // bootstrap (because there is only one file → mtime newest = it,
-        // and follow_target lands on the *last* hunk of the newest file
-        // → the second hunk here). So we manually scroll to the first
-        // hunk to test the selection contrast.
+    fn selected_hunk_is_bright_and_unselected_hunk_is_dim() {
+        // ADR-0014: the delta-style bg color is the same for both
+        // focused and unfocused add rows — the contrast comes from
+        // `Modifier::DIM` on the unfocused hunk (plus the left bar
+        // `▎` / `▶` on the focused one). This pins both halves of
+        // that contract so a future refactor can't silently flatten
+        // the focus signal.
+        //
+        // We use content-only characters ('~', '!') that don't appear
+        // in file paths, hunk headers (`@@`), or scroll chrome so the
+        // cell lookup doesn't collide.
         let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
+            "a.rs",
             vec![
-                hunk(1, vec![diff_line(LineKind::Added, "first")]),
-                hunk(20, vec![diff_line(LineKind::Added, "second")]),
+                hunk(1, vec![diff_line(LineKind::Added, "~~~~")]),
+                hunk(20, vec![diff_line(LineKind::Added, "!!!!")]),
             ],
             100,
         )]);
-        // Snap to the first hunk header.
+        // Snap to the first hunk so one hunk is focused and the other
+        // is not.
         app.scroll_to(app.layout.hunk_starts[0]);
         let backend = TestBackend::new(100, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| render(f, &app)).expect("draw");
         let buffer = terminal.backend().buffer().clone();
 
-        // The cursor's hunk should render its `+` at full Color::Green
-        // *without* DIM. The other hunk's `+` should still be Green but
-        // with DIM modifier.
-        let mut found_bright = false;
-        let mut found_dim = false;
+        // Both body characters must sit on BG_ADDED (the colored
+        // band never disappears), but the unfocused row must also
+        // carry `Modifier::DIM` while the focused row must not.
+        let mut focused_cells: Vec<(Option<Color>, Modifier)> = Vec::new();
+        let mut unfocused_cells: Vec<(Option<Color>, Modifier)> = Vec::new();
         for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
+            for x in 5..buffer.area().width {
                 let cell = &buffer[(x, y)];
-                if cell.symbol() == "+" && cell.style().fg == Some(Color::Green) {
-                    if cell.style().add_modifier.contains(Modifier::DIM) {
-                        found_dim = true;
-                    } else {
-                        found_bright = true;
-                    }
+                let style = cell.style();
+                if cell.symbol() == "~" {
+                    focused_cells.push((style.bg, style.add_modifier));
+                }
+                if cell.symbol() == "!" {
+                    unfocused_cells.push((style.bg, style.add_modifier));
                 }
             }
         }
         assert!(
-            found_bright,
-            "expected at least one bright '+' for selected hunk"
+            !focused_cells.is_empty(),
+            "focused hunk body '~' never rendered"
         );
         assert!(
-            found_dim,
-            "expected at least one DIM '+' for unselected hunk"
+            !unfocused_cells.is_empty(),
+            "unfocused hunk body '!' never rendered"
+        );
+        // Focused: BG_ADDED, no DIM.
+        assert!(
+            focused_cells
+                .iter()
+                .all(|(bg, m)| *bg == Some(BG_ADDED) && !m.contains(Modifier::DIM)),
+            "focused hunk must be BG_ADDED without DIM, got {focused_cells:?}"
+        );
+        // Unfocused: BG_ADDED, with DIM.
+        assert!(
+            unfocused_cells
+                .iter()
+                .all(|(bg, m)| *bg == Some(BG_ADDED) && m.contains(Modifier::DIM)),
+            "unfocused hunk must be BG_ADDED with DIM, got {unfocused_cells:?}"
         );
     }
 

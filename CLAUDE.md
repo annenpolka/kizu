@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**kizu** は AI コーディングエージェント (主に Claude Code) と並走させるリアルタイム diff 監視 TUI。Rust 製の単一バイナリ。
+**kizu** は AI コーディングエージェント (Claude Code, Cursor, Codex, Qwen Code, Cline, Gemini 等) と並走させるリアルタイム diff 監視 + inline scar review TUI。Rust 製の単一バイナリ。
 
-現状は **v0.1 MVP 実装中** (feat/v0.1-mvp ブランチ)。`src/{app,git,watcher,ui}.rs` は全て実装済みで、Rust 単体テストと tuistory e2e が green。
+現状は **v0.2 実装中** (feat/v0.2 ブランチ)。v0.1 MVP (diff 監視 TUI) に加え、scar (`@kizu[ask|reject|free]:`) によるインラインレビュー、マルチエージェント hook 統合、`kizu init/teardown` CLI を実装済み。
 
 ## 実装前に必ず読むもの
 
@@ -16,8 +16,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `docs/SPEC.md` — 全体仕様、フェーズ分割、TUI/hook 層スキーマ
 - `docs/claude-code-hooks.md` — PostToolUse/Stop hook の入出力と落とし穴 (`stop_hook_active` 無限ループ等)
-- `docs/inline-scar-pattern.md` — scar (`@review:` インラインコメント) を非同期ファイル書き込みで実現する設計理由
+- `docs/inline-scar-pattern.md` — scar (`@kizu[ask|reject|free]:` インラインコメント) を非同期ファイル書き込みで実現する設計理由
 - `docs/related-tools.md` — diffpane など類似ツールのサーベイ
+- `docs/deep-research-ai-agent-hooks.md` — 10 AI コーディングエージェントの hook 機構調査 (v0.2 統合地図)
 - `docs/adr/` — Architecture Decision Records。採用した設計判断の「なぜ」を記録する不可逆な履歴
 
 ## ドキュメントの役割分担
@@ -88,7 +89,7 @@ cargo build --release --locked
 cd tests/e2e && bun install --frozen-lockfile && KIZU_BIN=../../target/release/kizu bun test
 ```
 
-`tests/e2e/` は TypeScript + bun:test で書かれた black-box e2e テスト群。kizu バイナリを実 pty で起動し、キー操作・`waitForText`・inline snapshot で検証する。代表シナリオは smoke / navigation / reactive / reset / colors。ratatui の basic ANSI 色は tuistory の `foreground` フィルタでマッチしないので、色検証は Rust 単体テスト (`ui::tests::render_scroll_lines_carry_added_and_deleted_colors`) に寄せ、e2e では `+`/`-` テキストレイアウトを pin する。詳細は ADR-0004。
+`tests/e2e/` は TypeScript + bun:test で書かれた black-box e2e テスト群。kizu バイナリを実 pty で起動し、キー操作・`waitForText`・inline snapshot で検証する。代表シナリオは smoke / navigation / reactive / reset / colors / scar (a/c/x/e) / init (interactive + non-interactive + teardown)。ratatui の basic ANSI 色は tuistory の `foreground` フィルタでマッチしないので、色検証は Rust 単体テストに寄せ、e2e ではテキストレイアウトを pin する。詳細は ADR-0004。
 
 ## コミット / PR 規約
 
@@ -107,6 +108,17 @@ cd tests/e2e && bun install --frozen-lockfile && KIZU_BIN=../../target/release/k
 - session baseline は起動時の HEAD SHA。`R` (Shift+r) でリセット可能 (v0.1 仕様)。初回コミットがないリポでは empty tree SHA (`4b825dc642cb6eb9a060e54bf8d69288fbee4904`) を baseline にフォールバックする
 - `git diff` 失敗時は `App.last_error: Option<String>` に記録してフッタ右端に赤の `×` 表示。`files` は前回成功時の状態を保持し、次の watcher イベントで自動リトライする (panic させない)
 - バイナリファイルは `DiffContent::Binary` バリアントとしてリストに `bin` 表示、右ペインは `[binary file - diff suppressed]` プレースホルダー
+
+## v0.2 実装上のメモ
+
+- **scar** (`@kizu[ask|reject|free]:` inline comment) は `src/scar.rs` で言語別コメント構文を判定し、`insert_scar(path, line, kind, body)` でファイルに直接書き込む。べき等 (同一 scar が前行にあれば no-op)
+- **hook 層** (`src/hook.rs`): `kizu hook-post-tool` (PostToolUse 用) と `kizu hook-stop` (Stop 用) サブコマンド。stdin JSON を `NormalizedHookInput` に正規化し、scar grep → JSON 出力。`scan_scars` は行頭コメント構文 (`//`, `#`, `--`, `/*`, `<!--`) に続く `@kizu[` のみマッチし、テスト文字列内の false positive を排除
+- **session baseline** (`src/session.rs`, `src/paths.rs`): kizu TUI 起動時に XDG state dir (`~/Library/Application Support/kizu/sessions/` on macOS) にセッションファイル (baseline SHA + PID) を書き出す。Stop hook はこれを読んで baseline 以降の変更ファイルだけをスキャン。TUI 終了時に削除
+- **init/teardown** (`src/init.rs`): 6 エージェント対応 (Claude Code / Cursor / Codex / Qwen / Cline / Gemini)。scope は `project-local` (settings.local.json, gitignored) / `project-shared` / `user` の 3 種。Claude Code の hook は `matcher` + `hooks` 配列のネスト構造。`kizu init` は git pre-commit hook も設置 (scar が staged にあれば commit をブロック)
+- **diff view の背景色** は delta 風 (`BG_ADDED = Rgb(10,50,10)`, `BG_DELETED = Rgb(60,10,10)`)。`+`/`-` prefix は廃止。ADR-0014
+- **file view** (Enter): worktree ファイル全体を表示、hunk 内の Added 行に BG_ADDED を適用。j/k = chunk scroll, J/K = 1 行移動
+- **検索** (`/`): smart case (全小文字 → case-insensitive)、`n`/`N` で match 間ジャンプ (wrap-around)
+- **入力フィールド** (scar comment `c`, search `/`): フッター上の独立行に描画、折り返し対応、unicode-width でカーソル位置計算 (CJK 対応)、bracketed paste で IME 入力対応
 
 ## ADR の運用
 
