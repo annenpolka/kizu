@@ -600,6 +600,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let (mode_text, mode_color) = if app.picker.is_some() {
         ("[picker]", Color::Magenta)
+    } else if app.scar_comment.is_some() {
+        ("[scar]", Color::Magenta)
     } else if app.follow_mode {
         ("[follow]", Color::Green)
     } else {
@@ -630,6 +632,27 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("jump", dim));
+        spans.push(Span::styled(" / ", dim));
+        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("cancel", dim));
+    } else if let Some(state) = app.scar_comment.as_ref() {
+        // Free-text scar composer. The body is rendered inline so
+        // the user sees their own typing directly in the footer.
+        spans.push(sep());
+        spans.push(Span::styled(
+            "> ",
+            Style::default().fg(Color::Magenta).add_modifier(bold),
+        ));
+        spans.push(Span::styled(
+            state.body.clone(),
+            Style::default().fg(Color::White),
+        ));
+        spans.push(Span::styled("_", Style::default().fg(Color::Magenta)));
+        spans.push(Span::styled(" / ", dim));
+        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("save", dim));
         spans.push(Span::styled(" / ", dim));
         spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
         spans.push(Span::raw(" "));
@@ -917,6 +940,7 @@ mod tests {
             cursor_placement: crate::app::CursorPlacement::Centered,
             anchor: None,
             picker: None,
+            scar_comment: None,
             follow_mode: true,
             last_error: None,
             input_health: None,

@@ -74,8 +74,11 @@ pub struct App {
     /// looking at. Lets `recompute_diff` slide `scroll` to the same hunk
     /// even when the row count has shifted.
     pub anchor: Option<HunkAnchor>,
-    /// Modal file picker. `Some` when the user has pressed Space.
+    /// Modal file picker. `Some` when the user has pressed `s`.
     pub picker: Option<PickerState>,
+    /// Free-text scar input overlay. `Some` when the user has pressed
+    /// `c` on a scar-able row and is composing the comment body.
+    pub scar_comment: Option<ScarCommentState>,
     pub follow_mode: bool,
     /// Set when the most recent `compute_diff` failed. Cleared on success.
     pub last_error: Option<String>,
@@ -428,6 +431,19 @@ pub struct PickerState {
     pub cursor: usize,
 }
 
+/// Free-text scar input overlay. The `c` key enters this mode when the
+/// cursor is on a scar-able row; `Enter` commits the accumulated
+/// [`Self::body`] as a `@kizu[free]:` scar above the target line and
+/// `Esc` cancels without touching the file. The target is captured at
+/// entry time (not re-read on commit) so that a watcher-driven diff
+/// recompute during typing cannot silently retarget the write.
+#[derive(Debug, Clone)]
+pub struct ScarCommentState {
+    pub target_path: PathBuf,
+    pub target_line: usize,
+    pub body: String,
+}
+
 /// Single-shot easing state for the viewport's top-row tween.
 ///
 /// The tween sources its start point from `from` (captured at the moment
@@ -519,6 +535,7 @@ impl App {
             cursor_placement: CursorPlacement::Centered,
             anchor: None,
             picker: None,
+            scar_comment: None,
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -756,6 +773,9 @@ impl App {
         if self.picker.is_some() {
             self.handle_picker_key(key);
             KeyEffect::None
+        } else if self.scar_comment.is_some() {
+            self.handle_scar_comment_key(key);
+            KeyEffect::None
         } else {
             self.handle_normal_key(key)
         }
@@ -851,6 +871,9 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+            }
+            KeyCode::Char('c') => {
+                self.open_scar_comment();
             }
             KeyCode::Char('R') => {
                 return self.reset_baseline();
@@ -1442,6 +1465,73 @@ impl App {
         };
         if let Err(err) = crate::scar::insert_scar(&path, line, kind, body) {
             self.last_error = Some(format!("scar: {err:#}"));
+        }
+    }
+
+    /// Enter free-text scar input mode. Captures the current
+    /// cursor's target `(path, line)` so a watcher-driven recompute
+    /// while the user is typing cannot retarget the write. No-op
+    /// when the cursor is not on a scar-able row.
+    pub fn open_scar_comment(&mut self) {
+        let Some((target_path, target_line)) = self.scar_target_line() else {
+            return;
+        };
+        self.scar_comment = Some(ScarCommentState {
+            target_path,
+            target_line,
+            body: String::new(),
+        });
+    }
+
+    /// Abort free-text scar input without writing anything.
+    pub fn close_scar_comment(&mut self) {
+        self.scar_comment = None;
+    }
+
+    /// Commit the currently-composed free-text scar, if any. Empty
+    /// body is treated as a cancel (so double-`Enter` on an empty
+    /// input does not write a blank scar). Write failures land on
+    /// `last_error` with the same `scar:` prefix used by the canned
+    /// `a` / `r` dispatch.
+    pub fn commit_scar_comment(&mut self) {
+        let Some(state) = self.scar_comment.take() else {
+            return;
+        };
+        let body = state.body.trim();
+        if body.is_empty() {
+            return;
+        }
+        if let Err(err) =
+            crate::scar::insert_scar(&state.target_path, state.target_line, ScarKind::Free, body)
+        {
+            self.last_error = Some(format!("scar: {err:#}"));
+        }
+    }
+
+    /// Keystroke handler used while the scar-comment overlay is
+    /// active. Typing characters appends to the body, Backspace
+    /// deletes one char, Enter commits, Esc cancels.
+    fn handle_scar_comment_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(key.code, KeyCode::Char('c')) {
+                self.close_scar_comment();
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.close_scar_comment(),
+            KeyCode::Enter => self.commit_scar_comment(),
+            KeyCode::Backspace => {
+                if let Some(state) = self.scar_comment.as_mut() {
+                    state.body.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(state) = self.scar_comment.as_mut() {
+                    state.body.push(c);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2110,6 +2200,7 @@ mod tests {
             cursor_placement: CursorPlacement::Centered,
             anchor: None,
             picker: None,
+            scar_comment: None,
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -4500,6 +4591,206 @@ mod tests {
             after, "line_a\n// @kizu[ask]: explain this change\nline_b\n",
             "`a` on a hunk header must drop the scar above hunk.new_start",
         );
+    }
+
+    // ---- M4 slice 3: `c` free-text scar overlay --------------------
+
+    #[test]
+    fn handle_key_c_opens_scar_comment_overlay_with_captured_target() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/foo.rs",
+            "fn alpha() {}\nfn beta() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn beta() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('c')));
+
+        let state = app
+            .scar_comment
+            .as_ref()
+            .expect("`c` must open the comment overlay on a diff row");
+        assert_eq!(state.body, "", "body starts empty");
+        assert_eq!(state.target_line, 2, "captures current diff-row line");
+        assert_eq!(
+            state.target_path,
+            tmp.path().join("src/foo.rs"),
+            "captures absolute target path"
+        );
+        let after = std::fs::read_to_string(tmp.path().join("src/foo.rs")).expect("read");
+        assert_eq!(
+            after, "fn alpha() {}\nfn beta() {}\n",
+            "`c` must not touch the file until `Enter` commits"
+        );
+    }
+
+    #[test]
+    fn handle_key_c_is_noop_on_file_header_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let original = "fn one() {}\n";
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "lib.rs",
+            original,
+            1,
+            vec![diff_line(LineKind::Added, "fn one() {}")],
+        );
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("file header exists");
+        app.scroll_to(header_row);
+
+        app.handle_key(key(KeyCode::Char('c')));
+
+        assert!(
+            app.scar_comment.is_none(),
+            "file-header `c` must not open the overlay"
+        );
+    }
+
+    #[test]
+    fn scar_comment_typing_appends_characters_to_body() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "a.rs",
+            "x\ny\n",
+            2,
+            vec![diff_line(LineKind::Added, "y")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('!')));
+
+        let state = app.scar_comment.as_ref().expect("still open");
+        assert_eq!(state.body, "hi!");
+    }
+
+    #[test]
+    fn scar_comment_backspace_deletes_last_character() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "a.rs",
+            "x\ny\n",
+            2,
+            vec![diff_line(LineKind::Added, "y")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        for ch in "ab".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        app.handle_key(key(KeyCode::Backspace));
+        let state = app.scar_comment.as_ref().expect("still open");
+        assert_eq!(state.body, "a");
+    }
+
+    #[test]
+    fn scar_comment_esc_cancels_without_writing_to_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let original = "fn one() {}\nfn two() {}\n";
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "cancel.rs",
+            original,
+            2,
+            vec![diff_line(LineKind::Added, "fn two() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        for ch in "dont".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.scar_comment.is_none(), "Esc closes the overlay");
+        let after = std::fs::read_to_string(tmp.path().join("cancel.rs")).expect("read");
+        assert_eq!(after, original, "cancel must not touch the file");
+        assert!(app.last_error.is_none(), "cancel is not an error");
+    }
+
+    #[test]
+    fn scar_comment_enter_commits_free_scar_above_target_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "commit.rs",
+            "fn one() {}\nfn two() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn two() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        for ch in "why two?".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            app.scar_comment.is_none(),
+            "commit closes the overlay"
+        );
+        let after = std::fs::read_to_string(tmp.path().join("commit.rs")).expect("read");
+        assert_eq!(
+            after, "fn one() {}\n// @kizu[free]: why two?\nfn two() {}\n",
+            "Enter must write a free-scar above the captured target line"
+        );
+    }
+
+    #[test]
+    fn scar_comment_enter_on_empty_body_is_cancel() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let original = "fn one() {}\nfn two() {}\n";
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "empty.rs",
+            original,
+            2,
+            vec![diff_line(LineKind::Added, "fn two() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.scar_comment.is_none(), "empty commit closes the overlay");
+        let after = std::fs::read_to_string(tmp.path().join("empty.rs")).expect("read");
+        assert_eq!(after, original, "empty body must not write a blank scar");
+    }
+
+    #[test]
+    fn normal_keys_are_inert_while_scar_comment_overlay_is_open() {
+        // While the overlay is open, typing `q` must accumulate into
+        // the body instead of quitting the app. Proves the router
+        // correctly parks normal-mode dispatch behind the overlay.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "quit.rs",
+            "x\ny\n",
+            2,
+            vec![diff_line(LineKind::Added, "y")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+
+        app.handle_key(key(KeyCode::Char('q')));
+
+        assert!(!app.should_quit, "q while overlay open must not quit");
+        let state = app.scar_comment.as_ref().expect("still open");
+        assert_eq!(state.body, "q");
     }
 
     #[test]
