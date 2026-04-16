@@ -369,7 +369,7 @@ fn select_scope_interactive() -> Result<Scope> {
     ];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Install scope")
-        .items(&items)
+        .items(items)
         .default(0)
         .interact()
         .context("scope selection cancelled")?;
