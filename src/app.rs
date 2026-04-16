@@ -82,6 +82,13 @@ pub struct App {
     /// Hunk-revert confirmation overlay. `Some` when the user has
     /// pressed `x` on a hunk and is being asked `(y/N)`.
     pub revert_confirm: Option<RevertConfirmState>,
+    /// Transient `/` query composer. `Some` while the user is
+    /// typing the search query; cleared on Enter (confirm) or Esc.
+    pub search_input: Option<SearchInputState>,
+    /// Confirmed search state (query + matches + current index).
+    /// Survives across normal-mode navigation so `n` / `N` can
+    /// jump between hits.
+    pub search: Option<SearchState>,
     /// "Seen" marks for hunks the user has visually reviewed and
     /// wants to hide from the attention surface. Keyed by
     /// `(relative file path, hunk.old_start)` so the mark survives
@@ -500,6 +507,118 @@ pub struct ScarCommentState {
     pub body: String,
 }
 
+/// One hit inside the scroll layout. `row` is the logical layout
+/// row index (suitable for `scroll_to`); `byte_start` / `byte_end`
+/// delimit the match inside the row's diff-line content for inline
+/// highlighting in a later M4b slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchLocation {
+    pub row: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+}
+
+/// Active search query + the row hits it produced, plus a cursor
+/// into that hit list that `n` / `N` advance. Created by confirming
+/// the [`SearchInputState`] composer; lives until the next `/` or
+/// until a recompute invalidates the row indices.
+#[derive(Debug, Clone)]
+pub struct SearchState {
+    // Reserved for M4b UI slice (footer echo + recompute
+    // rehydration). Dead_code for now so clippy-as-error builds
+    // don't fail between slices.
+    #[allow(dead_code)]
+    pub query: String,
+    pub matches: Vec<MatchLocation>,
+    pub current: usize,
+}
+
+/// Transient query-composing overlay. `/` opens it, typing appends
+/// to `query`, Backspace deletes, Enter confirms into a
+/// [`SearchState`], Esc cancels without touching the confirmed state.
+#[derive(Debug, Clone, Default)]
+pub struct SearchInputState {
+    pub query: String,
+}
+
+/// Find every occurrence of `query` across the **DiffLine** rows of
+/// `layout`, in row order. Empty queries return an empty vector so
+/// callers can treat "no matches" and "no query" identically.
+///
+/// Case handling is **smart case** (vim-style): a query with no
+/// uppercase characters matches case-insensitively, anything with
+/// at least one uppercase character matches case-sensitively.
+/// `byte_end` is guaranteed to be a UTF-8 char boundary because
+/// `str::find` always returns a char-boundary-aligned index.
+pub fn find_matches(layout: &ScrollLayout, files: &[FileDiff], query: &str) -> Vec<MatchLocation> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let case_sensitive = query.chars().any(|c| c.is_uppercase());
+    let needle: String = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+
+    let mut out = Vec::new();
+    for (row_idx, row) in layout.rows.iter().enumerate() {
+        let RowKind::DiffLine {
+            file_idx,
+            hunk_idx,
+            line_idx,
+        } = row
+        else {
+            continue;
+        };
+        let Some(file) = files.get(*file_idx) else {
+            continue;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            continue;
+        };
+        let Some(hunk) = hunks.get(*hunk_idx) else {
+            continue;
+        };
+        let Some(line) = hunk.lines.get(*line_idx) else {
+            continue;
+        };
+
+        // For smart-case insensitive matching we lowercase the
+        // haystack too. `str::to_lowercase` can change byte length
+        // under Unicode (e.g. `İ` → `i̇`), so we fall back to
+        // ASCII-only needles for the insensitive path to keep
+        // byte offsets meaningful. Non-ASCII lowercase queries
+        // degrade to case-sensitive matching, which is a clean
+        // failure mode.
+        let ascii_only = needle.is_ascii() && line.content.is_ascii();
+        let (haystack, search_needle): (String, String) = if case_sensitive || !ascii_only {
+            (line.content.clone(), needle.clone())
+        } else {
+            (line.content.to_ascii_lowercase(), needle.clone())
+        };
+
+        let mut start = 0;
+        while let Some(idx) = haystack[start..].find(&search_needle) {
+            let byte_start = start + idx;
+            let byte_end = byte_start + search_needle.len();
+            out.push(MatchLocation {
+                row: row_idx,
+                byte_start,
+                byte_end,
+            });
+            if byte_end == start {
+                // Defensive: empty needles already bail at the
+                // top, but if a future code path sends an empty
+                // after normalization we must not spin forever.
+                break;
+            }
+            start = byte_end;
+        }
+    }
+    out
+}
+
 /// Confirmation overlay for hunk revert (`x` key). Holds the
 /// `(file_idx, hunk_idx)` captured the moment the user pressed `x`
 /// so a watcher-driven recompute while the dialog is open cannot
@@ -606,6 +725,8 @@ impl App {
             picker: None,
             scar_comment: None,
             revert_confirm: None,
+            search_input: None,
+            search: None,
             seen_hunks: BTreeSet::new(),
             follow_mode: true,
             last_error: None,
@@ -850,6 +971,9 @@ impl App {
         } else if self.revert_confirm.is_some() {
             self.handle_revert_confirm_key(key);
             KeyEffect::None
+        } else if self.search_input.is_some() {
+            self.handle_search_input_key(key);
+            KeyEffect::None
         } else {
             self.handle_normal_key(key)
         }
@@ -954,6 +1078,15 @@ impl App {
             }
             KeyCode::Char(' ') => {
                 self.toggle_seen_current_hunk();
+            }
+            KeyCode::Char('/') => {
+                self.open_search_input();
+            }
+            KeyCode::Char('n') => {
+                self.search_jump_next();
+            }
+            KeyCode::Char('N') => {
+                self.search_jump_prev();
             }
             KeyCode::Char('e') => {
                 // Read `$EDITOR` at dispatch time (not at bootstrap)
@@ -1619,6 +1752,107 @@ impl App {
         if !self.seen_hunks.remove(&key) {
             self.seen_hunks.insert(key);
         }
+    }
+
+    /// Enter the `/` search-query composer. Any previously
+    /// confirmed [`SearchState`] is left untouched until the user
+    /// actually commits the new query with Enter — Esc restores
+    /// everything, vim-style.
+    pub fn open_search_input(&mut self) {
+        self.search_input = Some(SearchInputState::default());
+    }
+
+    /// Abort the query composer without touching confirmed state.
+    pub fn close_search_input(&mut self) {
+        self.search_input = None;
+    }
+
+    /// Commit the composed query: run [`find_matches`] against the
+    /// current layout, install the resulting `SearchState`, and
+    /// jump the cursor to the first match (if any). Empty queries
+    /// close the composer without touching confirmed state so a
+    /// stray `/` + `Enter` does not wipe an existing search.
+    pub fn commit_search_input(&mut self) {
+        let Some(input) = self.search_input.take() else {
+            return;
+        };
+        let query = input.query;
+        if query.is_empty() {
+            return;
+        }
+        let matches = find_matches(&self.layout, &self.files, &query);
+        let first_row = matches.first().map(|m| m.row);
+        self.search = Some(SearchState {
+            query,
+            matches,
+            current: 0,
+        });
+        if let Some(row) = first_row {
+            self.follow_mode = false;
+            self.scroll_to(row);
+        }
+    }
+
+    /// `/`-composer keystroke handler. Typing appends, Backspace
+    /// deletes, Enter commits, Esc cancels. Ctrl-C also cancels
+    /// (matches the other modal overlays).
+    fn handle_search_input_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(key.code, KeyCode::Char('c')) {
+                self.close_search_input();
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.close_search_input(),
+            KeyCode::Enter => self.commit_search_input(),
+            KeyCode::Backspace => {
+                if let Some(state) = self.search_input.as_mut() {
+                    state.query.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(state) = self.search_input.as_mut() {
+                    state.query.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `n` — advance to the next confirmed search hit and jump the
+    /// cursor to its row. Wraps around at the end. No-op when
+    /// there is no confirmed search or it has zero matches.
+    pub fn search_jump_next(&mut self) {
+        let Some(state) = self.search.as_mut() else {
+            return;
+        };
+        if state.matches.is_empty() {
+            return;
+        }
+        state.current = (state.current + 1) % state.matches.len();
+        let row = state.matches[state.current].row;
+        self.follow_mode = false;
+        self.scroll_to(row);
+    }
+
+    /// `N` — step back to the previous confirmed search hit,
+    /// wrapping to the tail at the start.
+    pub fn search_jump_prev(&mut self) {
+        let Some(state) = self.search.as_mut() else {
+            return;
+        };
+        if state.matches.is_empty() {
+            return;
+        }
+        state.current = if state.current == 0 {
+            state.matches.len() - 1
+        } else {
+            state.current - 1
+        };
+        let row = state.matches[state.current].row;
+        self.follow_mode = false;
+        self.scroll_to(row);
     }
 
     /// Read helper: does `(file_idx, hunk_idx)` currently carry a
@@ -2481,6 +2715,8 @@ mod tests {
             picker: None,
             scar_comment: None,
             revert_confirm: None,
+            search_input: None,
+            search: None,
             seen_hunks: BTreeSet::new(),
             follow_mode: true,
             last_error: None,
@@ -5135,6 +5371,275 @@ mod tests {
         assert!(!app.should_quit, "q while overlay open must not quit");
         let state = app.scar_comment.as_ref().expect("still open");
         assert_eq!(state.body, "q");
+    }
+
+    // ---- M4b slice 1: `/` search + first-match jump ---------------
+
+    fn find_first_row_matching<F: Fn(&RowKind) -> bool>(app: &App, f: F) -> usize {
+        app.layout.rows.iter().position(f).expect("row exists")
+    }
+
+    #[test]
+    fn find_matches_returns_empty_for_empty_query() {
+        let app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "hello world")])],
+            100,
+        )]);
+        let m = find_matches(&app.layout, &app.files, "");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn find_matches_finds_substring_case_insensitive_when_query_is_lowercase() {
+        let app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "Hello WORLD"),
+                    diff_line(LineKind::Context, "no match here"),
+                    diff_line(LineKind::Added, "World wide"),
+                ],
+            )],
+            100,
+        )]);
+        let m = find_matches(&app.layout, &app.files, "world");
+        assert_eq!(m.len(), 2, "smart-case lowercase query matches both rows");
+        assert!(m.iter().all(|loc| loc.byte_start < loc.byte_end));
+    }
+
+    #[test]
+    fn find_matches_is_case_sensitive_when_query_has_uppercase() {
+        let app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "hello World"),
+                    diff_line(LineKind::Added, "hello world"),
+                ],
+            )],
+            100,
+        )]);
+        let m = find_matches(&app.layout, &app.files, "World");
+        assert_eq!(m.len(), 1, "uppercase query is case-sensitive");
+    }
+
+    #[test]
+    fn find_matches_captures_multiple_hits_on_one_row() {
+        let app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo foo foo")])],
+            100,
+        )]);
+        let m = find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0].byte_start, 0);
+        assert_eq!(m[1].byte_start, 4);
+        assert_eq!(m[2].byte_start, 8);
+    }
+
+    #[test]
+    fn slash_opens_search_input_composer() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+
+        app.handle_key(key(KeyCode::Char('/')));
+
+        assert!(app.search_input.is_some(), "/ must open the composer");
+        assert_eq!(app.search_input.as_ref().unwrap().query, "");
+    }
+
+    #[test]
+    fn search_input_typing_appends_to_query_and_backspace_deletes() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "foo".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.search_input.as_ref().unwrap().query, "foo");
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.search_input.as_ref().unwrap().query, "fo");
+    }
+
+    #[test]
+    fn search_input_esc_cancels_without_installing_search_state() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo")])],
+            100,
+        )]);
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('f')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.search_input.is_none());
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn search_input_enter_commits_and_jumps_cursor_to_first_match() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "alpha"),
+                    diff_line(LineKind::Added, "beta"),
+                    diff_line(LineKind::Added, "gamma"),
+                ],
+            )],
+            100,
+        )]);
+        // Park the cursor on the first diff row (alpha).
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "beta".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.search_input.is_none(), "composer closed on commit");
+        let state = app.search.as_ref().expect("search installed");
+        assert_eq!(state.matches.len(), 1);
+        assert_eq!(state.current, 0);
+        // Cursor landed on the "beta" row — not the first diff row.
+        let beta_row =
+            find_first_row_matching(&app, |r| matches!(r, RowKind::DiffLine { line_idx: 1, .. }));
+        assert_eq!(app.scroll, beta_row);
+        assert!(!app.follow_mode, "manual jump drops follow mode");
+    }
+
+    #[test]
+    fn search_input_enter_with_empty_query_does_not_wipe_existing_search() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "alpha")])],
+            100,
+        )]);
+        // Pre-install a fake confirmed search state.
+        app.search = Some(SearchState {
+            query: "alpha".into(),
+            matches: vec![MatchLocation {
+                row: 0,
+                byte_start: 0,
+                byte_end: 5,
+            }],
+            current: 0,
+        });
+
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Enter)); // empty body
+
+        assert!(
+            app.search.is_some(),
+            "empty-query commit must preserve prior search state"
+        );
+    }
+
+    // ---- M4b slice 2: n/N navigation ------------------------------
+
+    fn commit_search(app: &mut App, query: &str) {
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in query.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn search_jump_next_walks_matches_in_order() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "bar"),
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "foo"),
+                ],
+            )],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        commit_search(&mut app, "foo");
+
+        // After commit, current = 0 (first foo row). Advance twice.
+        app.handle_key(key(KeyCode::Char('n')));
+        let mid = app.search.as_ref().unwrap().current;
+        app.handle_key(key(KeyCode::Char('n')));
+        let tail = app.search.as_ref().unwrap().current;
+        assert_eq!(mid, 1);
+        assert_eq!(tail, 2);
+    }
+
+    #[test]
+    fn search_jump_next_wraps_around_at_end() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "foo"),
+                ],
+            )],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        commit_search(&mut app, "foo");
+
+        // current=0 → n → 1 → n → 0 (wrap)
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.search.as_ref().unwrap().current, 0);
+    }
+
+    #[test]
+    fn search_jump_prev_wraps_around_at_start() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "foo"),
+                    diff_line(LineKind::Added, "foo"),
+                ],
+            )],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        commit_search(&mut app, "foo");
+
+        // current=0 → N → 2 (wrap to tail)
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(app.search.as_ref().unwrap().current, 2);
+    }
+
+    #[test]
+    fn search_jump_next_is_noop_when_no_search_state() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo")])],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        let before = app.scroll;
+
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert!(app.search.is_none());
+        assert_eq!(app.scroll, before, "stray `n` must not move the cursor");
     }
 
     // ---- M4 slice 5: `e` external editor --------------------------

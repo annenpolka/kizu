@@ -624,6 +624,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("[scar]", Color::Magenta)
     } else if app.revert_confirm.is_some() {
         ("[revert?]", Color::Red)
+    } else if app.search_input.is_some() {
+        ("[search]", Color::Yellow)
     } else if app.follow_mode {
         ("[follow]", Color::Green)
     } else {
@@ -654,6 +656,26 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("jump", dim));
+        spans.push(Span::styled(" / ", dim));
+        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("cancel", dim));
+    } else if let Some(input) = app.search_input.as_ref() {
+        // `/`-composer footer: echo the query-so-far inline.
+        spans.push(sep());
+        spans.push(Span::styled(
+            "/",
+            Style::default().fg(Color::Yellow).add_modifier(bold),
+        ));
+        spans.push(Span::styled(
+            input.query.clone(),
+            Style::default().fg(Color::White),
+        ));
+        spans.push(Span::styled("_", Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(" / ", dim));
+        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("find", dim));
         spans.push(Span::styled(" / ", dim));
         spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
         spans.push(Span::raw(" "));
@@ -972,6 +994,8 @@ mod tests {
             picker: None,
             scar_comment: None,
             revert_confirm: None,
+            search_input: None,
+            search: None,
             seen_hunks: std::collections::BTreeSet::new(),
             follow_mode: true,
             last_error: None,
