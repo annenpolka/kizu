@@ -70,8 +70,9 @@ pub fn split_and_launch(terminal: TerminalKind, kizu_bin: &Path) -> Result<()> {
         TerminalKind::Ghostty => {
             #[cfg(target_os = "macos")]
             {
+                let bin_escaped = escape_applescript_string(&bin);
                 let script = format!(
-                    r#"tell application "Ghostty" to tell front window to split horizontally with command "{bin}""#,
+                    r#"tell application "Ghostty" to tell front window to split horizontally with command "{bin_escaped}""#,
                 );
                 Command::new("osascript")
                     .args(["-e", &script])
@@ -87,6 +88,30 @@ pub fn split_and_launch(terminal: TerminalKind, kizu_bin: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Escape a string for embedding inside an AppleScript double-quoted
+/// literal. Only `\` and `"` need escaping — every other character
+/// (including newlines, which break `osascript -e`, but those don't
+/// appear in a valid filesystem path we'd pass to `split horizontally
+/// with command "..."`) passes through unchanged.
+///
+/// Without this, a `kizu` binary installed at a path containing a `"`
+/// or `\` would break out of the command string and let AppleScript
+/// execute arbitrary appended text. In practice `current_exe()` on
+/// macOS produces well-formed absolute paths, but defending the
+/// boundary is free here.
+#[cfg(target_os = "macos")]
+fn escape_applescript_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Resolve which terminal to use: config override → auto-detect.
@@ -136,5 +161,14 @@ mod tests {
     fn resolve_terminal_rejects_invalid_config() {
         let err = resolve_terminal("invalid").unwrap_err();
         assert!(err.to_string().contains("unknown terminal"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn applescript_escape_handles_quote_and_backslash() {
+        assert_eq!(escape_applescript_string("/usr/bin/kizu"), "/usr/bin/kizu");
+        assert_eq!(escape_applescript_string(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_applescript_string(r"a\b"), r"a\\b");
+        assert_eq!(escape_applescript_string(r#"a\"b"#), r#"a\\\"b"#);
     }
 }

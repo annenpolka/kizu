@@ -553,11 +553,15 @@ impl VisualIndex {
         let Some(line) = hunk.lines.get(*line_idx) else {
             return 1;
         };
-        let chars = line.content.chars().count();
-        if chars == 0 {
+        // Visual row count = ceil(display-width(content) / body_width).
+        // CJK / emoji consume 2 cells each, so counting chars would
+        // under-estimate the height and ratatui's scroll math would
+        // push the cursor off-screen in wrap mode.
+        let cells = unicode_width::UnicodeWidthStr::width(line.content.as_str());
+        if cells == 0 {
             1
         } else {
-            chars.div_ceil(width.max(1))
+            cells.div_ceil(width.max(1))
         }
     }
 }
@@ -973,10 +977,24 @@ impl App {
             Err(_) => return,
         };
 
-        // Skip events where all file paths are outside the project root.
-        // Edits to ~/.config, /tmp, etc. can't produce a git diff and
-        // would appear as empty noise in the stream.
-        if !event.file_paths.iter().any(|p| p.starts_with(&self.root)) {
+        // Skip events where every file path resolves outside the
+        // project root. Edits to `~/.config`, `/tmp`, etc. can't
+        // produce a git diff and would appear as empty noise in the
+        // stream.
+        //
+        // `self.root` is canonicalized by `git::find_root`
+        // (`git rev-parse --show-toplevel`), so on macOS it lives on
+        // the `/private/...` side of the `/tmp` → `/private/tmp`
+        // symlink. Agent-provided file paths often follow the
+        // symlinked side instead. Run each candidate through
+        // `canonicalize` before comparing so both variants match —
+        // falling back to the raw path when the file no longer
+        // exists (deleted between the hook write and this handler).
+        let inside_root = event.file_paths.iter().any(|p| {
+            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            canon.starts_with(&self.root) || p.starts_with(&self.root)
+        });
+        if !inside_root {
             return;
         }
 
@@ -984,8 +1002,17 @@ impl App {
         let mut operation_diff = String::new();
 
         for file_path in &event.file_paths {
-            let current_diff = git::diff_single_file(&self.root, &self.baseline_sha, file_path)
-                .unwrap_or_default();
+            // Preserve prior snapshot on transient git failure. An
+            // `Err` here (e.g. the baseline object was pruned by a
+            // rebase, or the index is locked mid-operation) must not
+            // clobber `diff_snapshots[file_path]` — otherwise the
+            // *next* event for this file would diff against an empty
+            // baseline and spuriously emit the entire cumulative diff
+            // as the next operation's op_diff.
+            let Ok(current_diff) = git::diff_single_file(&self.root, &self.baseline_sha, file_path)
+            else {
+                continue;
+            };
 
             let op_diff = if let Some(prev) = self.diff_snapshots.get(file_path) {
                 // Previous snapshot exists — compute delta.
@@ -3074,19 +3101,33 @@ fn parse_stream_diff_to_hunk(diff_text: &str, old_start: usize) -> (Vec<git::Hun
     (vec![hunk], added, deleted)
 }
 
-/// Compute the "operation diff" — the lines in `current` that are
-/// not in `previous`. This is a simple set-difference on diff lines,
-/// not a true diff-of-diff. Good enough for showing what changed in
-/// one Write/Edit operation when we have cumulative diff snapshots
-/// before and after the operation.
+/// Compute the "operation diff" — the lines in `current` that were
+/// not already present in `previous`, counted as a **multiset** so
+/// duplicate lines (e.g. two blank `+` lines, or two identical
+/// closing-brace context rows) survive when `current` has more copies
+/// than `previous`.
+///
+/// This is not a true diff-of-diff — hunk boundaries, line numbers,
+/// and ordering drift are ignored. In practice the cumulative
+/// snapshots differ by the lines one Write/Edit operation added or
+/// re-shaped, so a multiset difference gives a readable approximation.
+/// Limitations and design rationale are documented in ADR-0016.
 fn compute_operation_diff(previous: &str, current: &str) -> String {
-    use std::collections::HashSet;
-    let prev_lines: HashSet<&str> = previous.lines().collect();
+    use std::collections::HashMap;
+    let mut prev_counts: HashMap<&str, usize> = HashMap::new();
+    for line in previous.lines() {
+        *prev_counts.entry(line).or_insert(0) += 1;
+    }
     let mut result = String::new();
     for line in current.lines() {
-        if !prev_lines.contains(line) {
-            result.push_str(line);
-            result.push('\n');
+        match prev_counts.get_mut(line) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+            }
+            _ => {
+                result.push_str(line);
+                result.push('\n');
+            }
         }
     }
     result
@@ -7158,5 +7199,136 @@ mod tests {
         let prev = "+line 1\n+line 2\n";
         let op = super::compute_operation_diff(prev, prev);
         assert!(op.is_empty());
+    }
+
+    #[test]
+    fn compute_operation_diff_preserves_duplicate_added_lines() {
+        // Edit adds another identical `}` line on top of an already-added `}`.
+        // A set-based diff would drop this because `+}` is already in prev;
+        // a multiset/count-based diff must preserve the second copy.
+        let prev = "+fn a() {}\n+}\n";
+        let curr = "+fn a() {}\n+}\n+}\n";
+        let op = super::compute_operation_diff(prev, curr);
+        assert_eq!(op, "+}\n", "second duplicate added line must survive");
+    }
+
+    #[test]
+    fn compute_operation_diff_preserves_duplicate_blank_lines() {
+        // Many real edits add blank lines. prev already has one blank,
+        // curr has two. The NEW blank line must appear in op_diff.
+        let prev = "+foo\n+\n bar\n";
+        let curr = "+foo\n+\n+\n bar\n";
+        let op = super::compute_operation_diff(prev, curr);
+        assert_eq!(op, "+\n", "second blank-line addition must survive");
+    }
+
+    #[test]
+    fn handle_event_log_accepts_path_with_symlink_variant() {
+        // On macOS `/tmp` is a symlink to `/private/tmp` (and similarly
+        // `/var/folders` → `/private/var/folders`). `git rev-parse
+        // --show-toplevel` canonicalizes, so `app.root` ends up on the
+        // `/private/...` side. But an agent hook that records the
+        // current working directory may still write file_paths on the
+        // symlinked side. A naive `starts_with` comparison silently
+        // drops those events — which is exactly what the e2e stream
+        // tests hit on macOS runners. `handle_event_log` must
+        // canonicalize before matching so symlink-variant paths are
+        // accepted.
+        let tmp = tempfile::tempdir().unwrap();
+        let Ok(canonical_root) = tmp.path().canonicalize() else {
+            return; // tempdir not canonicalizable; nothing to test.
+        };
+        if tmp.path() == canonical_root {
+            return; // No symlink divergence on this runner; skip.
+        }
+
+        let mut app = fake_app(vec![]);
+        app.root = canonical_root.clone();
+
+        let file_canonical = canonical_root.join("a.rs");
+        std::fs::write(&file_canonical, "").unwrap();
+        let symlinked_file = tmp.path().join("a.rs");
+
+        let events_dir = canonical_root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![symlinked_file],
+            cwd: canonical_root.clone(),
+            timestamp_ms: 3000,
+        };
+        let event_path = events_dir.join("3000-Write.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.handle_event_log(event_path);
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "event whose file_path resolves to a path inside the canonical root must be accepted"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_preserves_snapshot_on_git_error() {
+        // When `git diff` fails (e.g. baseline SHA is missing after a
+        // rebase that garbage-collected the old object), the previous
+        // file snapshot MUST NOT be clobbered — otherwise the next
+        // event for the same file will compute op_diff against an
+        // empty baseline and emit the entire cumulative diff as
+        // "what this operation changed", which is wrong.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut app = fake_app(vec![]);
+        app.root = root.to_path_buf();
+        // Bogus baseline — every `git diff <bogus> -- file` call will fail.
+        app.baseline_sha = "0000000000000000000000000000000000000000".to_string();
+
+        let file = root.join("foo.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        // Seed a realistic prior snapshot as if a previous event had
+        // captured the cumulative baseline → current diff.
+        let prev_diff = "@@ -1 +1 @@\n-fn main() {}\n+fn main() { 1 }\n".to_string();
+        app.diff_snapshots.insert(file.clone(), prev_diff.clone());
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![file.clone()],
+            cwd: root.to_path_buf(),
+            timestamp_ms: 1000,
+        };
+        let event_path = events_dir.join("1000-Edit.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.handle_event_log(event_path);
+
+        assert_eq!(
+            app.diff_snapshots.get(&file),
+            Some(&prev_diff),
+            "snapshot must survive a failing `git diff` so the next event is still accurate"
+        );
+    }
+
+    #[test]
+    fn compute_operation_diff_preserves_repeated_context_lines() {
+        // Two different hunks may share an identical context line
+        // (e.g. a closing brace). If prev has one hunk containing ` }`
+        // and curr adds a second hunk that also contains ` }`, the
+        // second occurrence in curr must appear in op_diff.
+        let prev = " }\n";
+        let curr = " }\n+new\n }\n";
+        let op = super::compute_operation_diff(prev, curr);
+        // op contains +new and the second occurrence of context ` }`.
+        assert!(op.contains("+new\n"));
+        assert!(
+            op.matches(" }\n").count() == 1,
+            "one of the two context ` }}` lines is new to curr; exactly one copy should appear"
+        );
     }
 }

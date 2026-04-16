@@ -478,25 +478,37 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
     }
 }
 
-/// Split `content` into chunks of at most `width` chars. Always
-/// returns at least one chunk; an empty input produces `[""]`. Char-
-/// based, not display-width-based — CJK wide characters count as
-/// 1 char, so wrap is approximate for those. Fine for the ASCII-
-/// heavy diffs kizu cares about.
+/// Split `content` into chunks whose **display width** is at most
+/// `width` cells. Always returns at least one chunk; an empty input
+/// produces `[""]`. CJK / emoji / other wide characters consume 2
+/// cells apiece, so a body width of 40 cells holds roughly 20 kanji —
+/// feeding char counts straight into ratatui overflowed the viewport
+/// and broke the wrap marker on CJK-heavy diffs.
+///
+/// Zero-width combining marks (`char.width()` returns `Some(0)`) and
+/// control chars (`None`) are folded into the current chunk without
+/// advancing the cell counter so they stick with their preceding
+/// base glyph instead of getting orphaned onto a new visual row.
 fn wrap_at_chars(content: &str, width: usize) -> Vec<&str> {
+    use unicode_width::UnicodeWidthChar;
     if content.is_empty() || width == 0 {
         return vec![content];
     }
     let mut chunks = Vec::new();
     let mut chunk_start = 0usize;
-    let mut chunk_chars = 0usize;
-    for (idx, _) in content.char_indices() {
-        if chunk_chars == width {
+    let mut chunk_cells = 0usize;
+    for (idx, ch) in content.char_indices() {
+        let ch_cells = ch.width().unwrap_or(0);
+        // Flush the current chunk before placing a char that would
+        // overshoot the cell budget. Requires `chunk_cells > 0` so
+        // that a single char wider than the whole width still lands
+        // in one chunk rather than looping forever on an empty one.
+        if chunk_cells > 0 && chunk_cells + ch_cells > width {
             chunks.push(&content[chunk_start..idx]);
             chunk_start = idx;
-            chunk_chars = 0;
+            chunk_cells = 0;
         }
-        chunk_chars += 1;
+        chunk_cells += ch_cells;
     }
     if chunk_start < content.len() {
         chunks.push(&content[chunk_start..]);
@@ -526,6 +538,7 @@ fn render_diff_line_wrapped(
     bg_added: Color,
     bg_deleted: Color,
 ) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
     // ADR-0014: background-color diff rendering. Focused hunks keep
     // full brightness; unfocused hunks wear `Modifier::DIM` so the
     // eye still flows to the cursor band. Context rows use the
@@ -611,7 +624,12 @@ fn render_diff_line_wrapped(
                 0
             };
             let chunk_char_count = chunk.chars().count();
-            let pad = body_width.saturating_sub(chunk_char_count + marker_reserve);
+            // Display width drives the trailing-space pad that extends
+            // the delta-style background to the viewport edge. Using
+            // char count would leave CJK rows short by one cell per
+            // wide char and the bg color would end mid-line.
+            let chunk_cell_count = UnicodeWidthStr::width(chunk);
+            let pad = body_width.saturating_sub(chunk_cell_count + marker_reserve);
 
             let mut spans = vec![bar];
 
@@ -1582,6 +1600,55 @@ mod tests {
         assert!(
             view.contains(&long_content[90..110]),
             "expected wrapped continuation to be visible:\n{view}"
+        );
+    }
+
+    #[test]
+    fn wrap_at_chars_respects_cjk_display_width() {
+        // Each kanji in `日本語テスト` has display width 2. At a body
+        // width of 4 cells we must emit 2 kanji per chunk — NOT 4
+        // kanji (which would overflow to 8 cells and let the chunk
+        // spill beyond the viewport in wrap mode).
+        let chunks = super::wrap_at_chars("日本語テスト", 4);
+        assert_eq!(chunks, vec!["日本", "語テ", "スト"]);
+    }
+
+    #[test]
+    fn wrap_at_chars_handles_mixed_ascii_and_cjk() {
+        // `ab漢字` = 1+1+2+2 = 6 cells. At width 4, the first chunk
+        // fits `ab漢` (1+1+2=4 cells exactly); `字` starts a new chunk.
+        let chunks = super::wrap_at_chars("ab漢字cd", 4);
+        assert_eq!(chunks, vec!["ab漢", "字cd"]);
+    }
+
+    #[test]
+    fn wrap_mode_cjk_line_wraps_within_viewport() {
+        // 40 kanji at width 40 (viewport cell width): the line must
+        // wrap to 2 rows since each kanji is 2 cells wide. Previously
+        // this rendered as a single over-wide row that ratatui
+        // silently truncated or that bled past the viewport.
+        let forty_kanji: String = "あいうえおかきくけこ".repeat(4);
+        assert_eq!(forty_kanji.chars().count(), 40);
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, &forty_kanji)])],
+            100,
+        )]);
+        app.wrap_lines = true;
+
+        // Viewport: 45 cols (5 for left bar + 40 for body).
+        let view = render_to_string(&app, 45, 10);
+        // Both the first kanji and a kanji past the 20th position
+        // must be visible: if wrap worked correctly, both halves of
+        // the content appear on separate visual rows.
+        assert!(view.contains("あ"), "first kanji must be visible:\n{view}");
+        // The 35th kanji (well past the 20-kanji midpoint) must also
+        // land in the viewport — only possible if the line actually
+        // wrapped rather than being truncated at column 40.
+        let late_kanji: char = forty_kanji.chars().nth(35).unwrap();
+        assert!(
+            view.contains(late_kanji),
+            "late CJK char {late_kanji:?} must survive wrap:\n{view}"
         );
     }
 

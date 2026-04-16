@@ -82,7 +82,9 @@ pub enum LineKind {
 /// The `--no-renames` flag (ADR-0001) keeps the parser simple and avoids
 /// rename detection diverging from the user's mental model.
 /// Get the unified diff for a single file against the baseline.
-/// Returns the raw diff output as a string, or an empty string on failure.
+/// Returns `Err` when `git diff` exits non-zero (missing baseline
+/// object, invalid path, broken index) so callers can preserve prior
+/// state rather than treating the empty-stdout case as "no diff".
 pub fn diff_single_file(root: &Path, baseline_sha: &str, file_path: &Path) -> Result<String> {
     let rel = file_path.strip_prefix(root).unwrap_or(file_path);
     let output = Command::new("git")
@@ -96,6 +98,10 @@ pub fn diff_single_file(root: &Path, baseline_sha: &str, file_path: &Path) -> Re
         .current_dir(root)
         .output()
         .context("git diff single file")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("git diff single file failed: {}", stderr.trim()));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
