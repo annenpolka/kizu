@@ -23,6 +23,10 @@ pub struct FileDiff {
     /// after `compute_diff` returns; the parser leaves this at
     /// [`SystemTime::UNIX_EPOCH`] so it is always defined.
     pub mtime: SystemTime,
+    /// Optional label prepended to the file header in the TUI.
+    /// Stream mode uses this for "HH:MM:SS Write" etc.
+    /// `None` for normal git diff entries.
+    pub header_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +356,7 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
             deleted: 0,
             content: DiffContent::Binary,
             mtime: SystemTime::UNIX_EPOCH,
+            header_prefix: None,
         });
     }
 
@@ -396,6 +401,7 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
             context: None,
         }]),
         mtime: SystemTime::UNIX_EPOCH,
+        header_prefix: None,
     })
 }
 
@@ -703,6 +709,7 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Result<Vec<FileDiff>> {
                 deleted: 0,
                 content: DiffContent::Text(Vec::new()),
                 mtime: SystemTime::UNIX_EPOCH,
+                header_prefix: None,
             });
             continue;
         }
@@ -1665,5 +1672,13 @@ index 1111111..2222222 100644
             msg.contains("git apply"),
             "error must name the failing command, got {msg}",
         );
+    }
+
+    #[test]
+    fn file_diff_header_prefix_defaults_to_none_in_parsed_diff() {
+        let raw = "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1,1 +1,2 @@\n line1\n+line2\n";
+        let files = parse_unified_diff(raw).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].header_prefix, None);
     }
 }

@@ -180,8 +180,6 @@ pub struct App {
     pub view_mode: ViewMode,
     /// Stream mode events, ordered by timestamp ascending.
     pub stream_events: Vec<StreamEvent>,
-    /// Cursor position in the stream events list.
-    pub stream_cursor: usize,
     /// Per-file diff snapshots used to compute per-operation diffs.
     /// Maps file path → most recent cumulative diff output.
     pub diff_snapshots: std::collections::HashMap<PathBuf, String>,
@@ -884,7 +882,6 @@ impl App {
             config,
             view_mode: ViewMode::default(),
             stream_events: Vec::new(),
-            stream_cursor: 0,
             diff_snapshots: std::collections::HashMap::new(),
         };
         app.apply_computed_files(initial);
@@ -929,12 +926,21 @@ impl App {
         self.cursor_sub_row = 0;
     }
 
-    /// Toggle between Diff and Stream view modes.
+    /// Toggle between Diff and Stream view modes. Rebuilds `files`
+    /// and `layout` from the appropriate data source so the existing
+    /// scroll/render infrastructure handles both modes identically.
     pub fn toggle_view_mode(&mut self) {
-        self.view_mode = match self.view_mode {
-            ViewMode::Diff => ViewMode::Stream,
-            ViewMode::Stream => ViewMode::Diff,
-        };
+        match self.view_mode {
+            ViewMode::Diff => {
+                self.view_mode = ViewMode::Stream;
+                let stream_files = build_stream_files(&self.stream_events);
+                self.apply_computed_files(stream_files);
+            }
+            ViewMode::Stream => {
+                self.view_mode = ViewMode::Diff;
+                self.recompute_diff();
+            }
+        }
     }
 
     /// Handle a new event-log file notification. Reads the event file,
@@ -1000,9 +1006,10 @@ impl App {
         };
         self.stream_events.push(stream_event);
 
-        // Auto-scroll to latest event if in stream mode.
+        // If in stream mode, rebuild files/layout to include the new event.
         if self.view_mode == ViewMode::Stream {
-            self.stream_cursor = self.stream_events.len().saturating_sub(1);
+            let stream_files = build_stream_files(&self.stream_events);
+            self.apply_computed_files(stream_files);
         }
     }
 
@@ -1258,27 +1265,6 @@ impl App {
                 }
                 _ => {}
             }
-        }
-
-        // In stream mode, j/k navigate the event list instead of the diff.
-        if self.view_mode == ViewMode::Stream {
-            match key.code {
-                KeyCode::Tab => self.toggle_view_mode(),
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if self.stream_cursor + 1 < self.stream_events.len() {
-                        self.stream_cursor += 1;
-                    }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.stream_cursor = self.stream_cursor.saturating_sub(1);
-                }
-                KeyCode::Char('g') => self.stream_cursor = 0,
-                KeyCode::Char('G') => {
-                    self.stream_cursor = self.stream_events.len().saturating_sub(1);
-                }
-                _ => {}
-            }
-            return KeyEffect::None;
         }
 
         match key.code {
@@ -2934,6 +2920,87 @@ impl App {
 }
 
 /// Async event loop. See ADR-0003 / ADR-0005.
+/// Convert stream events into virtual [`FileDiff`] entries so the
+/// existing scroll infrastructure can render them identically to
+/// git diff output. Each event becomes one `FileDiff` with:
+/// - `header_prefix`: "HH:MM:SS Tool" for display in the file header
+/// - `path`: the edited file path
+/// - `content`: parsed diff lines from the captured snapshot
+pub fn build_stream_files(events: &[StreamEvent]) -> Vec<FileDiff> {
+    events
+        .iter()
+        .map(|ev| {
+            let ts = ev.metadata.timestamp_ms;
+            let time_str = crate::ui::format_local_time(ts);
+            let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
+            let prefix = format!("{time_str} {tool}");
+            let path = ev.metadata.file_paths.first().cloned().unwrap_or_default();
+
+            let (hunks, added, deleted) = match &ev.diff_snapshot {
+                Some(diff_text) if !diff_text.is_empty() => parse_stream_diff_to_hunk(diff_text),
+                _ => (vec![], 0, 0),
+            };
+
+            FileDiff {
+                path,
+                status: git::FileStatus::Modified,
+                added,
+                deleted,
+                content: git::DiffContent::Text(hunks),
+                mtime: SystemTime::UNIX_EPOCH + Duration::from_millis(ev.metadata.timestamp_ms),
+                header_prefix: Some(prefix),
+            }
+        })
+        .collect()
+}
+
+/// Parse raw diff text (from a stream event snapshot) into a single
+/// `Hunk` with `DiffLine` entries. Hunk header lines (`@@`) are
+/// skipped; `+`/`-`/` ` prefix determines `LineKind`.
+fn parse_stream_diff_to_hunk(diff_text: &str) -> (Vec<git::Hunk>, usize, usize) {
+    let mut lines = Vec::new();
+    let mut added = 0usize;
+    let mut deleted = 0usize;
+    for raw in diff_text.lines() {
+        if raw.starts_with("@@")
+            || raw.starts_with("diff ")
+            || raw.starts_with("---")
+            || raw.starts_with("+++")
+            || raw.starts_with("index ")
+        {
+            continue;
+        }
+        let (kind, content) = if let Some(rest) = raw.strip_prefix('+') {
+            added += 1;
+            (LineKind::Added, rest.to_string())
+        } else if let Some(rest) = raw.strip_prefix('-') {
+            deleted += 1;
+            (LineKind::Deleted, rest.to_string())
+        } else if let Some(rest) = raw.strip_prefix(' ') {
+            (LineKind::Context, rest.to_string())
+        } else {
+            (LineKind::Context, raw.to_string())
+        };
+        lines.push(git::DiffLine {
+            kind,
+            content,
+            has_trailing_newline: true,
+        });
+    }
+    if lines.is_empty() {
+        return (vec![], 0, 0);
+    }
+    let hunk = git::Hunk {
+        old_start: 1,
+        old_count: deleted,
+        new_start: 1,
+        new_count: added,
+        lines,
+        context: None,
+    };
+    (vec![hunk], added, deleted)
+}
+
 /// Compute the "operation diff" — the lines in `current` that are
 /// not in `previous`. This is a simple set-difference on diff lines,
 /// not a true diff-of-diff. Good enough for showing what changed in
@@ -3281,6 +3348,7 @@ mod tests {
             deleted,
             content: DiffContent::Text(hunks),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 
@@ -3292,6 +3360,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Binary,
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 
@@ -3334,7 +3403,6 @@ mod tests {
             config: crate::config::KizuConfig::default(),
             view_mode: ViewMode::default(),
             stream_events: Vec::new(),
-            stream_cursor: 0,
             diff_snapshots: std::collections::HashMap::new(),
         };
         app.files = files;
@@ -4438,6 +4506,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "hi2")])]),
             mtime: SystemTime::UNIX_EPOCH,
+            header_prefix: None,
         };
         let gone = FileDiff {
             path: PathBuf::from("gone.rs"),
@@ -4446,6 +4515,7 @@ mod tests {
             deleted: 1,
             content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Deleted, "bye")])]),
             mtime: SystemTime::UNIX_EPOCH,
+            header_prefix: None,
         };
 
         let app = App::bootstrap_with_diff(
@@ -4628,6 +4698,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "fresh")])]),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(500),
+            header_prefix: None,
         };
         let new_sha = "feedfacefeedfacefeedfacefeedfacefeedface".to_string();
         // Same branch as the existing fake_app default — a successful
@@ -6890,6 +6961,66 @@ mod tests {
 
     // ---- stream mode tests ----
 
+    fn make_stream_event(tool: &str, path: &str, diff: Option<&str>, ts: u64) -> StreamEvent {
+        let add = diff
+            .unwrap_or("")
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .count();
+        let del = diff
+            .unwrap_or("")
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .count();
+        StreamEvent {
+            metadata: crate::hook::SanitizedEvent {
+                session_id: None,
+                hook_event_name: "PostToolUse".into(),
+                tool_name: Some(tool.into()),
+                file_paths: vec![PathBuf::from(path)],
+                cwd: PathBuf::from("/tmp"),
+                timestamp_ms: ts,
+            },
+            diff_snapshot: diff.map(String::from),
+            add_count: add,
+            del_count: del,
+        }
+    }
+
+    #[test]
+    fn build_stream_files_converts_events_to_file_diffs() {
+        let events = vec![
+            make_stream_event(
+                "Write",
+                "src/auth.rs",
+                Some("+fn verify() {}\n+  ok\n"),
+                1700000000000,
+            ),
+            make_stream_event("Edit", "src/main.rs", Some("+use auth;\n"), 1700000001000),
+        ];
+        let files = build_stream_files(&events);
+        assert_eq!(files.len(), 2);
+        // First event
+        assert_eq!(files[0].path, PathBuf::from("src/auth.rs"));
+        assert_eq!(files[0].added, 2);
+        assert!(files[0].header_prefix.as_ref().unwrap().contains("Write"));
+        // Second event
+        assert_eq!(files[1].path, PathBuf::from("src/main.rs"));
+        assert_eq!(files[1].added, 1);
+        assert!(files[1].header_prefix.as_ref().unwrap().contains("Edit"));
+    }
+
+    #[test]
+    fn build_stream_files_empty_diff_produces_empty_hunk() {
+        let events = vec![make_stream_event("Write", "a.rs", None, 1000)];
+        let files = build_stream_files(&events);
+        assert_eq!(files.len(), 1);
+        match &files[0].content {
+            DiffContent::Text(hunks) => assert!(hunks.is_empty()),
+            _ => panic!("expected Text"),
+        }
+    }
+
     #[test]
     fn toggle_view_mode_switches_between_diff_and_stream() {
         let mut app = fake_app(vec![]);
@@ -6908,69 +7039,6 @@ mod tests {
         assert_eq!(app.view_mode, ViewMode::Stream);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.view_mode, ViewMode::Diff);
-    }
-
-    #[test]
-    fn stream_mode_j_k_navigate_events() {
-        let mut app = fake_app(vec![]);
-        app.view_mode = ViewMode::Stream;
-
-        // Add some fake events.
-        for i in 0..5 {
-            app.stream_events.push(StreamEvent {
-                metadata: crate::hook::SanitizedEvent {
-                    session_id: None,
-                    hook_event_name: "PostToolUse".into(),
-                    tool_name: Some("Edit".into()),
-                    file_paths: vec![PathBuf::from(format!("file{i}.rs"))],
-                    cwd: PathBuf::from("/tmp"),
-                    timestamp_ms: 1000 + i as u64,
-                },
-                diff_snapshot: None,
-                add_count: 0,
-                del_count: 0,
-            });
-        }
-
-        assert_eq!(app.stream_cursor, 0);
-        app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.stream_cursor, 1);
-        app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.stream_cursor, 2);
-        app.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(app.stream_cursor, 1);
-        app.handle_key(key(KeyCode::Char('G')));
-        assert_eq!(app.stream_cursor, 4);
-        app.handle_key(key(KeyCode::Char('g')));
-        assert_eq!(app.stream_cursor, 0);
-    }
-
-    #[test]
-    fn stream_mode_j_k_clamp_at_bounds() {
-        let mut app = fake_app(vec![]);
-        app.view_mode = ViewMode::Stream;
-
-        app.stream_events.push(StreamEvent {
-            metadata: crate::hook::SanitizedEvent {
-                session_id: None,
-                hook_event_name: "PostToolUse".into(),
-                tool_name: Some("Write".into()),
-                file_paths: vec![],
-                cwd: PathBuf::from("/tmp"),
-                timestamp_ms: 1000,
-            },
-            diff_snapshot: None,
-            add_count: 0,
-            del_count: 0,
-        });
-
-        // Can't go below 0.
-        app.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(app.stream_cursor, 0);
-
-        // Can't go past the last event.
-        app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.stream_cursor, 0); // Only 1 event, already at 0
     }
 
     #[test]

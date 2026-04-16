@@ -70,8 +70,6 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             .highlighter
             .get_or_init(crate::highlight::Highlighter::new);
         render_file_view(frame, main, fv, Some(hl));
-    } else if app.view_mode == crate::app::ViewMode::Stream {
-        render_stream_view(frame, main, app);
     } else if app.files.is_empty() {
         render_empty(frame, main, app);
     } else {
@@ -664,17 +662,24 @@ fn render_file_header(_file_idx: usize, file: &FileDiff, is_cursor: bool) -> Lin
     };
     let mtime = format_mtime(file.mtime);
 
-    let mut spans = vec![
-        if is_cursor {
-            Span::styled(
-                "▶ ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw("  ")
-        },
+    let mut spans = vec![if is_cursor {
+        Span::styled(
+            "▶ ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    }];
+    // Stream mode prefix (e.g. "14:03:22 Write") before the file path.
+    if let Some(prefix) = &file.header_prefix {
+        spans.push(Span::styled(
+            format!("{prefix}  "),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans.extend([
         Span::styled(
             file.path.display().to_string(),
             Style::default().fg(path_color).add_modifier(Modifier::BOLD),
@@ -683,7 +688,7 @@ fn render_file_header(_file_idx: usize, file: &FileDiff, is_cursor: bool) -> Lin
         Span::styled(mtime, Style::default().fg(Color::DarkGray)),
         Span::raw("   "),
         Span::raw(counts),
-    ];
+    ]);
     // Spacing for a future scar indicator placeholder; M4v leaves it
     // dormant so the column stays stable when scar lands.
     spans.push(Span::raw(""));
@@ -918,7 +923,7 @@ fn render_file_view(
 /// Convert a Unix epoch millisecond timestamp to a local-time
 /// `HH:MM:SS` string. Uses `libc::localtime_r` on Unix for
 /// timezone-aware conversion; falls back to UTC on other platforms.
-fn format_local_time(timestamp_ms: u64) -> String {
+pub fn format_local_time(timestamp_ms: u64) -> String {
     let epoch_secs = (timestamp_ms / 1000) as i64;
 
     #[cfg(unix)]
@@ -937,183 +942,6 @@ fn format_local_time(timestamp_ms: u64) -> String {
         let s = secs % 60;
         format!("{hours:02}:{mins:02}:{s:02}")
     }
-}
-
-/// Render the stream mode view: a vertical scroll of operation
-/// entries, each with a header line (timestamp + tool + path +
-/// counts) followed by the operation's diff lines. Same layout
-/// as the main diff view but with operations as the section unit
-/// instead of files.
-fn render_stream_view(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    if app.stream_events.is_empty() {
-        let msg = Paragraph::new("No stream events yet. Waiting for hook-log-event...")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(msg, area);
-        return;
-    }
-
-    let height = area.height as usize;
-    let width = area.width as usize;
-    let bg_added = app.config.colors.bg_added_color();
-    let bg_deleted = app.config.colors.bg_deleted_color();
-    let hl = app
-        .highlighter
-        .get_or_init(crate::highlight::Highlighter::new);
-
-    // Build all lines: event headers + diff body for each event.
-    // Track which visual line each event header starts at so we can
-    // scroll to keep the cursor event visible.
-    let mut all_lines: Vec<Line<'static>> = Vec::new();
-    let mut event_header_positions: Vec<usize> = Vec::new();
-
-    for (i, ev) in app.stream_events.iter().enumerate() {
-        let is_focused = i == app.stream_cursor;
-        event_header_positions.push(all_lines.len());
-
-        // --- Event header line ---
-        let time_str = format_local_time(ev.metadata.timestamp_ms);
-        let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
-        let file_path = ev
-            .metadata
-            .file_paths
-            .first()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let counts = if ev.add_count > 0 || ev.del_count > 0 {
-            format!(" +{}/-{}", ev.add_count, ev.del_count)
-        } else {
-            String::new()
-        };
-
-        let marker = if is_focused { "  \u{25b8}  " } else { "     " };
-        let header_style = if is_focused {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Cyan)
-        };
-        all_lines.push(Line::from(vec![
-            Span::styled(marker, header_style),
-            Span::styled(format!("{time_str} "), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{tool:<6}"), Style::default().fg(Color::Cyan)),
-            Span::styled(file_path.clone(), header_style),
-            Span::styled(counts, Style::default().fg(Color::Green)),
-        ]));
-
-        // --- Diff body lines ---
-        let diff_text = ev.diff_snapshot.as_deref().unwrap_or("");
-        if diff_text.is_empty() && ev.diff_snapshot.is_none() {
-            // Pre-existing event with no captured diff — show hint
-            let dim = if is_focused {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM)
-            };
-            all_lines.push(Line::styled(
-                "       [diff not captured - event predates TUI]",
-                dim,
-            ));
-        } else {
-            let fp = ev.metadata.file_paths.first();
-            let body_width = width.saturating_sub(5).max(1);
-            for line in diff_text.lines() {
-                let style = if line.starts_with('+') && !line.starts_with("+++") {
-                    let base = Style::default().bg(bg_added);
-                    if is_focused {
-                        base
-                    } else {
-                        base.add_modifier(Modifier::DIM)
-                    }
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    let base = Style::default().bg(bg_deleted);
-                    if is_focused {
-                        base
-                    } else {
-                        base.add_modifier(Modifier::DIM)
-                    }
-                } else if line.starts_with("@@") {
-                    Style::default().fg(Color::Cyan)
-                } else if is_focused {
-                    Style::default()
-                } else {
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM)
-                };
-
-                // Syntax highlight where possible.
-                let content = line
-                    .strip_prefix('+')
-                    .or_else(|| line.strip_prefix('-'))
-                    .unwrap_or(line);
-                let rendered = if let Some(fp) = fp {
-                    let tokens = hl.highlight_line(content, fp);
-                    if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
-                        let mut spans: Vec<Span<'static>> = vec![Span::raw("     ")];
-                        let mut chars = 0;
-                        for t in &tokens {
-                            let remaining = body_width.saturating_sub(chars);
-                            if remaining == 0 {
-                                break;
-                            }
-                            let take: String = t.text.chars().take(remaining).collect();
-                            chars += take.chars().count();
-                            let mut s = Style::default().fg(t.fg);
-                            if let Some(bg) = style.bg {
-                                s = s.bg(bg);
-                            }
-                            if style.add_modifier.contains(Modifier::DIM) {
-                                s = s.add_modifier(Modifier::DIM);
-                            }
-                            spans.push(Span::styled(take, s));
-                        }
-                        // Pad to fill background
-                        if chars < body_width {
-                            let pad: String =
-                                std::iter::repeat_n(' ', body_width - chars).collect();
-                            spans.push(Span::styled(pad, style));
-                        }
-                        Some(Line::from(spans))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(hl_line) = rendered {
-                    all_lines.push(hl_line);
-                } else {
-                    let padded = format!("     {content:<body_width$}");
-                    all_lines.push(Line::styled(padded, style));
-                }
-            }
-        }
-
-        // Spacer between events.
-        all_lines.push(Line::raw(""));
-    }
-
-    // Scroll to keep the focused event visible.
-    let cursor_line = event_header_positions
-        .get(app.stream_cursor)
-        .copied()
-        .unwrap_or(0);
-    let scroll_top = cursor_line.saturating_sub(height / 3);
-
-    // Slice visible lines.
-    let visible: Vec<Line<'_>> = all_lines
-        .into_iter()
-        .skip(scroll_top)
-        .take(height)
-        .collect();
-
-    let paragraph = Paragraph::new(visible);
-    frame.render_widget(paragraph, area);
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1467,6 +1295,7 @@ mod tests {
             deleted,
             content: DiffContent::Text(hunks),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 
@@ -1478,6 +1307,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Binary,
             mtime: SystemTime::UNIX_EPOCH,
+            header_prefix: None,
         }
     }
 
@@ -1516,7 +1346,6 @@ mod tests {
             config: crate::config::KizuConfig::default(),
             view_mode: crate::app::ViewMode::default(),
             stream_events: Vec::new(),
-            stream_cursor: 0,
             diff_snapshots: std::collections::HashMap::new(),
         }
     }
@@ -1951,6 +1780,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "x")])]),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 
@@ -2001,6 +1831,32 @@ mod tests {
             }
             assert!(found, "{name} not found in buffer");
         }
+    }
+
+    #[test]
+    fn file_header_shows_prefix_when_set() {
+        let mut file = make_file(
+            "src/auth.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        );
+        file.header_prefix = Some("14:03:22 Write".to_string());
+        let mut app = populated_app(vec![file]);
+        app.scroll = 0;
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10))
+            .expect("test terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        // The prefix "14:03:22 Write" should appear in the header line.
+        let first_line: String = (0..buffer.area().width)
+            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            first_line.contains("14:03:22 Write"),
+            "header should contain prefix, got: {first_line:?}"
+        );
     }
 
     #[test]
@@ -2419,6 +2275,7 @@ mod tests {
                 context: Some(ctx.to_string()),
             }]),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 }
