@@ -2183,6 +2183,18 @@ impl App {
     /// Keystroke handler used while the scar-comment overlay is
     /// active. Typing characters appends to the body, Backspace
     /// deletes one char, Enter commits, Esc cancels.
+    /// Handle pasted text (from bracketed paste or IME commit).
+    /// Routes to whichever text-input overlay is currently active.
+    /// No-op when no text input is open — stray pastes in normal
+    /// mode are silently ignored.
+    pub fn handle_paste(&mut self, text: &str) {
+        if let Some(state) = self.scar_comment.as_mut() {
+            state.body.push_str(text);
+        } else if let Some(state) = self.search_input.as_mut() {
+            state.query.push_str(text);
+        }
+    }
+
     fn handle_scar_comment_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if matches!(key.code, KeyCode::Char('c')) {
@@ -2630,6 +2642,14 @@ pub async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     stage("current_dir", t_total);
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
+    // Enable bracketed paste so terminals send IME-committed text
+    // (e.g. Japanese kanji) as Event::Paste instead of individual
+    // keystrokes. Without this, IME composition is invisible in
+    // raw mode and committed text may arrive garbled.
+    {
+        use crossterm::ExecutableCommand;
+        let _ = std::io::stdout().execute(crossterm::event::EnableBracketedPaste);
+    }
     stage("ratatui::try_init", t_total);
     let result = async {
         // Show something immediately, even before the initial bootstrap
@@ -2673,6 +2693,10 @@ pub async fn run() -> Result<()> {
         run_loop(&mut terminal, &mut app, &mut watch).await
     }
     .await;
+    {
+        use crossterm::ExecutableCommand;
+        let _ = std::io::stdout().execute(crossterm::event::DisableBracketedPaste);
+    }
     let _ = ratatui::try_restore();
     result
 }
@@ -2730,6 +2754,10 @@ async fn run_loop(
                             }
                             other => apply_key_effect(other, app, watch),
                         }
+                    }
+                    Some(Ok(Event::Paste(text))) => {
+                        app.input_health = None;
+                        app.handle_paste(&text);
                     }
                     Some(Ok(_)) => {
                         app.input_health = None;

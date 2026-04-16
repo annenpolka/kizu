@@ -30,11 +30,41 @@ const BG_DELETED: Color = Color::Rgb(60, 10, 10);
 
 /// Render the entire kizu frame: scroll view (main) + footer (bottom),
 /// optionally with the modal file picker overlaid on top.
+///
+/// When a text-input overlay is active (scar comment `c` or search
+/// `/`), a dedicated input row is inserted between the main area
+/// and the footer. The input row wraps long text and the terminal
+/// cursor is placed at the text end so the IME composition window
+/// appears in the right spot.
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+
+    // Determine input-line content + prefix for height calculation.
+    let input_line: Option<(String, &str)> = if let Some(state) = app.scar_comment.as_ref() {
+        Some((state.body.clone(), "> "))
+    } else if let Some(input) = app.search_input.as_ref() {
+        Some((input.query.clone(), "/"))
+    } else {
+        None
+    };
+
+    let input_height: u16 = if let Some((ref text, prefix)) = input_line {
+        let total_chars = prefix.chars().count() + text.chars().count() + 1; // +1 for cursor
+        let w = (area.width as usize).max(1);
+        total_chars.div_ceil(w).max(1) as u16
+    } else {
+        0
+    };
+
+    let chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(input_height),
+        Constraint::Length(1),
+    ])
+    .split(area);
     let main = chunks[0];
-    let footer = chunks[1];
+    let input_area = chunks[1];
+    let footer = chunks[2];
 
     if let Some(fv) = app.file_view.as_ref() {
         render_file_view(frame, main, fv);
@@ -44,11 +74,48 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         render_scroll(frame, main, app);
     }
 
+    // Render the dedicated input row when a text overlay is active.
+    if let Some((text, prefix)) = input_line {
+        render_input_line(frame, input_area, prefix, &text);
+    }
+
     render_footer(frame, footer, app);
 
     if app.picker.is_some() {
         render_picker(frame, area, app);
     }
+}
+
+/// Render a text-input line with wrapping support and a blinking
+/// cursor block at the text end. Used for both scar-comment (`> `)
+/// and search (`/`) overlays.
+fn render_input_line(frame: &mut Frame<'_>, area: Rect, prefix: &str, text: &str) {
+    use ratatui::widgets::Wrap;
+
+    let display = format!("{prefix}{text}");
+    let paragraph = Paragraph::new(Line::from(vec![
+        Span::styled(
+            prefix.to_string(),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(text.to_string(), Style::default().fg(Color::White)),
+        Span::styled("_", Style::default().fg(Color::Magenta)),
+    ]))
+    .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
+
+    // Place the terminal cursor at the text end for IME.
+    let total_chars = display.chars().count() as u16;
+    let w = area.width.max(1);
+    let cursor_y = area.y + total_chars / w;
+    let cursor_x = area.x + total_chars % w;
+    frame.set_cursor_position((
+        cursor_x.min(area.right().saturating_sub(1)),
+        cursor_y.min(area.bottom().saturating_sub(1)),
+    ));
 }
 
 fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -729,19 +796,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("back", dim));
-    } else if let Some(input) = app.search_input.as_ref() {
-        // `/`-composer footer: echo the query-so-far inline.
+    } else if app.search_input.is_some() {
+        // Body is rendered in the dedicated input row above.
         spans.push(sep());
-        spans.push(Span::styled(
-            "/",
-            Style::default().fg(Color::Yellow).add_modifier(bold),
-        ));
-        spans.push(Span::styled(
-            input.query.clone(),
-            Style::default().fg(Color::White),
-        ));
-        spans.push(Span::styled("_", Style::default().fg(Color::Yellow)));
-        spans.push(Span::styled(" / ", dim));
         spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("find", dim));
@@ -757,20 +814,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("(y/N)", Style::default().fg(Color::Yellow)));
-    } else if let Some(state) = app.scar_comment.as_ref() {
-        // Free-text scar composer. The body is rendered inline so
-        // the user sees their own typing directly in the footer.
+    } else if app.scar_comment.is_some() {
+        // Body is rendered in the dedicated input row above.
         spans.push(sep());
-        spans.push(Span::styled(
-            "> ",
-            Style::default().fg(Color::Magenta).add_modifier(bold),
-        ));
-        spans.push(Span::styled(
-            state.body.clone(),
-            Style::default().fg(Color::White),
-        ));
-        spans.push(Span::styled("_", Style::default().fg(Color::Magenta)));
-        spans.push(Span::styled(" / ", dim));
         spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("save", dim));
