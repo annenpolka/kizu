@@ -932,8 +932,15 @@ impl App {
                 self.apply_computed_files(stream_files);
             }
             ViewMode::Stream => {
+                // Remember which file the stream cursor was on so we
+                // can jump to it after switching back to diff mode.
+                let target_path = self.current_file_path().map(|p| p.to_path_buf());
                 self.view_mode = ViewMode::Diff;
                 self.recompute_diff();
+                // Jump to the file that was focused in stream mode.
+                if let Some(path) = target_path {
+                    self.scroll_to_file(&path);
+                }
             }
         }
     }
@@ -958,19 +965,20 @@ impl App {
             let current_diff = git::diff_single_file(&self.root, &self.baseline_sha, file_path)
                 .unwrap_or_default();
 
-            let prev = self
-                .diff_snapshots
-                .get(file_path)
-                .cloned()
-                .unwrap_or_default();
-            let op_diff = compute_operation_diff(&prev, &current_diff);
-
-            if !op_diff.is_empty() {
-                if !operation_diff.is_empty() {
-                    operation_diff.push('\n');
+            if let Some(prev) = self.diff_snapshots.get(file_path) {
+                // We have a previous snapshot — compute the delta.
+                let op_diff = compute_operation_diff(prev, &current_diff);
+                if !op_diff.is_empty() {
+                    if !operation_diff.is_empty() {
+                        operation_diff.push('\n');
+                    }
+                    operation_diff.push_str(&op_diff);
                 }
-                operation_diff.push_str(&op_diff);
             }
+            // If no previous snapshot exists (new file or first edit),
+            // we record the current state as the baseline and produce
+            // no diff for this event. The next event on this file will
+            // correctly show only its delta.
 
             self.diff_snapshots.insert(file_path.clone(), current_diff);
         }
@@ -1936,6 +1944,19 @@ impl App {
         }
     }
 
+    /// Scroll to the first row of the file matching `path`. No-op if
+    /// the file is not in the current layout.
+    pub fn scroll_to_file(&mut self, path: &Path) {
+        for (i, row) in self.layout.rows.iter().enumerate() {
+            if let RowKind::FileHeader { file_idx } = row
+                && self.files.get(*file_idx).is_some_and(|f| f.path == path)
+            {
+                self.scroll_to(i);
+                return;
+            }
+        }
+    }
+
     /// Insert a scar of the given `kind` with `body` as the human
     /// text, at the cursor's current position. No-op when the
     /// cursor is not on a diff row (file header, hunk header,
@@ -1945,6 +1966,12 @@ impl App {
     /// picks up the resulting write on its next tick and re-runs
     /// `compute_diff`, which shows the new scar line in place.
     pub fn insert_canned_scar(&mut self, kind: ScarKind, body: &str) {
+        // Stream mode shows historical diffs with synthetic line numbers;
+        // scar insertion would target nonsensical positions. Switch to
+        // diff mode to scar the current file state.
+        if self.view_mode == ViewMode::Stream {
+            return;
+        }
         let Some((path, line)) = self.scar_target_line() else {
             return;
         };
@@ -1958,6 +1985,9 @@ impl App {
     /// while the user is typing cannot retarget the write. No-op
     /// when the cursor is not on a scar-able row.
     pub fn open_scar_comment(&mut self) {
+        if self.view_mode == ViewMode::Stream {
+            return;
+        }
         let Some((target_path, target_line)) = self.scar_target_line() else {
             return;
         };
@@ -2353,6 +2383,9 @@ impl App {
     /// editor configured — in either case the `e` key should be a
     /// silent no-op.
     pub fn open_in_editor(&self, editor_env: Option<&str>) -> Option<EditorInvocation> {
+        if self.view_mode == ViewMode::Stream {
+            return None;
+        }
         let (path, line) = self.scar_target_line()?;
         build_editor_invocation(editor_env, line, &path)
     }
@@ -2361,6 +2394,9 @@ impl App {
     /// cursor is not inside a diff hunk (file headers, spacers,
     /// binary notices) or when the enclosing file is not text.
     pub fn open_revert_confirm(&mut self) {
+        if self.view_mode == ViewMode::Stream {
+            return;
+        }
         let Some((file_idx, hunk_idx)) = self.current_hunk() else {
             return;
         };
