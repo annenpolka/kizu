@@ -973,6 +973,13 @@ impl App {
             Err(_) => return,
         };
 
+        // Skip events where all file paths are outside the project root.
+        // Edits to ~/.config, /tmp, etc. can't produce a git diff and
+        // would appear as empty noise in the stream.
+        if !event.file_paths.iter().any(|p| p.starts_with(&self.root)) {
+            return;
+        }
+
         // Capture per-operation diff for each affected file.
         let mut operation_diff = String::new();
 
@@ -7026,6 +7033,62 @@ mod tests {
             },
             diff_snapshot: diff.map(String::from),
         }
+    }
+
+    #[test]
+    fn handle_event_log_skips_files_outside_project_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = fake_app(vec![]);
+        app.root = tmp.path().to_path_buf();
+
+        // Write an event file whose file_path is outside the project root.
+        let events_dir = tmp.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![PathBuf::from("/home/user/.config/kizu/config.toml")],
+            cwd: tmp.path().to_path_buf(),
+            timestamp_ms: 1000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let event_path = events_dir.join("1000-Write.json");
+        std::fs::write(&event_path, &json).unwrap();
+
+        app.handle_event_log(event_path);
+        assert!(
+            app.stream_events.is_empty(),
+            "events for files outside project root should be ignored"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_accepts_files_inside_project_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = fake_app(vec![]);
+        app.root = tmp.path().to_path_buf();
+
+        let events_dir = tmp.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![tmp.path().join("src/main.rs")],
+            cwd: tmp.path().to_path_buf(),
+            timestamp_ms: 2000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let event_path = events_dir.join("2000-Write.json");
+        std::fs::write(&event_path, &json).unwrap();
+
+        app.handle_event_log(event_path);
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "events for files inside project root should be accepted"
+        );
     }
 
     #[test]
