@@ -1910,10 +1910,20 @@ impl App {
         }
         match key.code {
             KeyCode::Enter | KeyCode::Esc => self.close_file_view(),
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('J') => {
+            // j/k: chunk scroll (viewport/3), matching normal-mode
+            // adaptive-motion feel. J/K: exact 1-row move.
+            KeyCode::Char('j') | KeyCode::Down => {
+                let chunk = self.chunk_size() as isize;
+                self.file_view_scroll_by(chunk);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let chunk = self.chunk_size() as isize;
+                self.file_view_scroll_by(-chunk);
+            }
+            KeyCode::Char('J') => {
                 self.file_view_scroll_by(1);
             }
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('K') => {
+            KeyCode::Char('K') => {
                 self.file_view_scroll_by(-1);
             }
             KeyCode::Char('g') => {
@@ -5660,7 +5670,7 @@ mod tests {
     }
 
     #[test]
-    fn file_view_j_k_move_cursor() {
+    fn file_view_j_k_chunk_scroll_and_shift_j_k_single_row() {
         let tmp = tempfile::tempdir().expect("tmp");
         let (mut app, _abs) =
             revert_app_with_real_repo(&tmp, "foo.rs", "a\nb\nc\n", "a\nb\nc\nd\n");
@@ -5668,11 +5678,22 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         let start = app.file_view.as_ref().unwrap().cursor;
 
+        // j moves by chunk_size (viewport/3, at least 1)
+        let chunk = app.chunk_size();
         app.handle_key(key(KeyCode::Char('j')));
         let after_j = app.file_view.as_ref().unwrap().cursor;
-        assert_eq!(after_j, (start + 1).min(3));
+        assert_eq!(after_j, (start + chunk).min(3));
 
+        // k reverses it
         app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, start);
+
+        // J moves exactly 1 row
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, start + 1);
+
+        // K reverses 1 row
+        app.handle_key(key(KeyCode::Char('K')));
         assert_eq!(app.file_view.as_ref().unwrap().cursor, start);
     }
 
