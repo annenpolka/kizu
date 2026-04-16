@@ -164,34 +164,85 @@ pub fn format_stop_stderr(hits: &[ScarHit]) -> String {
     out
 }
 
-/// List all files that might contain scars: **all tracked files**
-/// plus untracked. The Stop hook must catch scars that rode along
-/// into a commit (the user marked a line, then an auto-commit
-/// included the scar), so limiting to `git diff --name-only HEAD`
-/// is insufficient — a committed scar would slip through.
-///
-/// Uses `git ls-files` (tracked) + `git status --porcelain`
-/// (untracked) to cover the full worktree.
-pub fn enumerate_all_files(root: &Path) -> Result<Vec<PathBuf>> {
+/// List files that might contain scars, scoped by the kizu session
+/// baseline. Checks for a session file; if found, scans only files
+/// changed since that baseline (committed + uncommitted + untracked).
+/// Falls back to all tracked + untracked if no session is active.
+pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
     use std::process::Command;
 
-    // All tracked files in the worktree.
-    let ls_output = Command::new("git")
-        .args(["ls-files", "-z"])
-        .current_dir(root)
-        .output()
-        .context("git ls-files")?;
+    let session = crate::session::read_session(root);
+    let baseline = session
+        .as_ref()
+        .filter(|s| crate::session::is_session_alive(s))
+        .map(|s| s.baseline_sha.as_str());
+
     let mut paths: Vec<PathBuf> = Vec::new();
-    if ls_output.status.success() {
-        for record in ls_output.stdout.split(|&b| b == 0) {
-            if !record.is_empty() {
-                let rel = String::from_utf8_lossy(record);
-                paths.push(root.join(rel.as_ref()));
+
+    if let Some(base) = baseline {
+        // Files changed since baseline (includes commits made during
+        // the session): `git diff <baseline>..HEAD --name-only`.
+        let diff_base = Command::new("git")
+            .args(["diff", "--name-only", &format!("{base}..HEAD"), "--"])
+            .current_dir(root)
+            .output()
+            .context("git diff baseline..HEAD")?;
+        if diff_base.status.success() {
+            for line in String::from_utf8_lossy(&diff_base.stdout).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    paths.push(root.join(trimmed));
+                }
+            }
+        }
+
+        // Uncommitted changes (staged + unstaged).
+        let diff_head = Command::new("git")
+            .args(["diff", "--name-only", "HEAD", "--"])
+            .current_dir(root)
+            .output()
+            .context("git diff HEAD")?;
+        if diff_head.status.success() {
+            for line in String::from_utf8_lossy(&diff_head.stdout).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    paths.push(root.join(trimmed));
+                }
+            }
+        }
+
+        // Staged but not yet in HEAD.
+        let diff_cached = Command::new("git")
+            .args(["diff", "--cached", "--name-only", "--"])
+            .current_dir(root)
+            .output()
+            .context("git diff --cached")?;
+        if diff_cached.status.success() {
+            for line in String::from_utf8_lossy(&diff_cached.stdout).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    paths.push(root.join(trimmed));
+                }
+            }
+        }
+    } else {
+        // No session → fallback to all tracked files.
+        let ls_output = Command::new("git")
+            .args(["ls-files", "-z"])
+            .current_dir(root)
+            .output()
+            .context("git ls-files")?;
+        if ls_output.status.success() {
+            for record in ls_output.stdout.split(|&b| b == 0) {
+                if !record.is_empty() {
+                    let rel = String::from_utf8_lossy(record);
+                    paths.push(root.join(rel.as_ref()));
+                }
             }
         }
     }
 
-    // Untracked files.
+    // Untracked files (always included).
     let status_output = Command::new("git")
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(root)

@@ -2792,6 +2792,13 @@ pub async fn run() -> Result<()> {
         let mut app = App::bootstrap(cwd)?;
         stage("App::bootstrap", t_bootstrap);
 
+        // Write session file so the Stop hook can scope its scan
+        // to files changed since this baseline. Best-effort: a
+        // failure here is not fatal to the TUI itself.
+        if let Err(e) = crate::session::write_session(&app.root, &app.baseline_sha) {
+            eprintln!("warning: failed to write kizu session file: {e}");
+        }
+
         // Draw one static frame before watcher startup. On macOS the
         // PollWatcher fallback may take noticeable time to arm because it
         // performs an initial scan; showing the bootstrap snapshot first
@@ -2811,7 +2818,9 @@ pub async fn run() -> Result<()> {
         )?;
         stage("watcher::start", t_watcher);
         stage("total before loop", t_total);
-        run_loop(&mut terminal, &mut app, &mut watch).await
+        let result = run_loop(&mut terminal, &mut app, &mut watch).await;
+        crate::session::remove_session(&app.root);
+        result
     }
     .await;
     {

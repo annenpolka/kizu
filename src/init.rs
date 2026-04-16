@@ -253,6 +253,9 @@ pub fn run_init(
         print_report(&report);
     }
 
+    // Install git pre-commit hook to block commits with unresolved scars.
+    install_git_pre_commit_hook(project_root)?;
+
     Ok(())
 }
 
@@ -323,6 +326,49 @@ fn print_report(report: &InstallReport) {
 }
 
 // ── Installer dispatch ──────────────────────────────────────────
+
+/// Install or append to `.git/hooks/pre-commit` so that
+/// `kizu hook-pre-commit` blocks commits containing scars.
+fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
+    let git_dir = crate::git::git_dir(project_root)?;
+    let hooks_dir = git_dir.join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+    let hook_path = hooks_dir.join("pre-commit");
+
+    let kizu_line = "kizu hook-pre-commit";
+
+    if hook_path.exists() {
+        let content = std::fs::read_to_string(&hook_path)?;
+        if content.contains(kizu_line) {
+            println!("  git pre-commit hook: already installed");
+            return Ok(());
+        }
+        // Append to existing hook.
+        let mut new = content;
+        if !new.ends_with('\n') {
+            new.push('\n');
+        }
+        new.push_str(&format!("\n# kizu scar guard\n{kizu_line}\n"));
+        std::fs::write(&hook_path, new)?;
+    } else {
+        std::fs::write(
+            &hook_path,
+            format!("#!/bin/sh\n\n# kizu scar guard\n{kizu_line}\n"),
+        )?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    println!(
+        "  git pre-commit hook: installed at {}",
+        hook_path.display()
+    );
+    Ok(())
+}
 
 fn install_agent(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<InstallReport> {
     match kind {

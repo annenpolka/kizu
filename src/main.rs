@@ -5,7 +5,9 @@ mod app;
 mod git;
 mod hook;
 mod init;
+mod paths;
 mod scar;
+mod session;
 mod ui;
 mod watcher;
 
@@ -41,6 +43,8 @@ enum Command {
         #[arg(long, default_value = "claude-code")]
         agent: String,
     },
+    /// Git pre-commit hook: block commit if staged files contain scars
+    HookPreCommit,
     /// PostToolUse hook: async event log writer for stream mode (v0.2)
     HookLogEvent,
     /// Stop hook: block if unresolved @kizu scars remain
@@ -71,6 +75,7 @@ async fn main() -> Result<()> {
             init::run_teardown(&root)
         }
         Some(Command::HookPostTool { agent }) => run_hook_post_tool(&agent),
+        Some(Command::HookPreCommit) => run_hook_pre_commit(),
         Some(Command::HookLogEvent) => unimplemented!("v0.2: kizu hook-log-event"),
         Some(Command::HookStop { agent }) => run_hook_stop(&agent),
     }
@@ -105,12 +110,58 @@ fn run_hook_stop(agent_str: &str) -> Result<()> {
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let root = git::find_root(&cwd)?;
-    let changed = hook::enumerate_all_files(&root)?;
+    let changed = hook::enumerate_session_files(&root)?;
     let hits = hook::scan_scars(&changed);
 
     if !hits.is_empty() {
         eprint!("{}", hook::format_stop_stderr(&hits));
         std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn run_hook_pre_commit() -> Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let cwd = std::env::current_dir()?;
+    let root = git::find_root(&cwd)?;
+
+    // Get staged files.
+    let output = Command::new("git")
+        .args(["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+        .current_dir(&root)
+        .output()
+        .context("git diff --cached")?;
+
+    if !output.status.success() {
+        return Ok(()); // Can't determine staged files; don't block.
+    }
+
+    let staged: Vec<std::path::PathBuf> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| root.join(l.trim()))
+        .collect();
+
+    if staged.is_empty() {
+        return Ok(());
+    }
+
+    let hits = hook::scan_scars(&staged);
+    if !hits.is_empty() {
+        eprintln!("kizu: commit blocked — unresolved scars in staged files:");
+        for hit in &hits {
+            eprintln!(
+                "  {}:{} @kizu[{}]: {}",
+                hit.path.display(),
+                hit.line_number,
+                hit.kind,
+                hit.message,
+            );
+        }
+        eprintln!("\nResolve or unstage the scars before committing.");
+        std::process::exit(1);
     }
     Ok(())
 }
