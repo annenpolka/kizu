@@ -22,11 +22,11 @@ test("non-interactive init creates claude-code hooks in project scope", async ()
   execFileSync(KIZU_BIN, [
     "init",
     "--agent", "claude-code",
-    "--scope", "project",
+    "--scope", "project-local",
     "--non-interactive",
   ], { cwd: repo.path, encoding: "utf8" });
 
-  const settingsPath = join(repo.path, ".claude", "settings.json");
+  const settingsPath = join(repo.path, ".claude", "settings.local.json");
   expect(existsSync(settingsPath)).toBe(true);
 
   const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
@@ -49,14 +49,14 @@ test("non-interactive init is idempotent (skips on second run)", async () => {
   repo = createTempRepo();
 
   const run = () => execFileSync(KIZU_BIN, [
-    "init", "--agent", "claude-code", "--scope", "project", "--non-interactive",
+    "init", "--agent", "claude-code", "--scope", "project-local", "--non-interactive",
   ], { cwd: repo.path, encoding: "utf8" });
 
   run(); // first
   run(); // second — should not duplicate
 
   const settings = JSON.parse(
-    readFileSync(join(repo.path, ".claude", "settings.json"), "utf8")
+    readFileSync(join(repo.path, ".claude", "settings.local.json"), "utf8")
   );
   expect(settings.hooks.PostToolUse).toHaveLength(1);
   expect(settings.hooks.Stop).toHaveLength(1);

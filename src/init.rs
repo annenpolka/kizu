@@ -174,14 +174,19 @@ pub fn detect_agents(project_root: &Path) -> Vec<DetectedAgent> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    Project,
+    /// `.claude/settings.local.json` etc. — gitignored, personal.
+    ProjectLocal,
+    /// `.claude/settings.json` etc. — committed, team-shared.
+    ProjectShared,
+    /// `~/.claude/settings.json` etc. — global user config.
     User,
 }
 
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Project => write!(f, "project"),
+            Self::ProjectLocal => write!(f, "project-local"),
+            Self::ProjectShared => write!(f, "project-shared"),
             Self::User => write!(f, "user"),
         }
     }
@@ -230,12 +235,15 @@ pub fn run_init(
 
     let scope = if let Some(s) = scope_flag {
         match s {
-            "project" => Scope::Project,
+            "project-local" | "local" => Scope::ProjectLocal,
+            "project-shared" | "project" | "shared" => Scope::ProjectShared,
             "user" => Scope::User,
-            other => anyhow::bail!("unknown scope: {other} (expected: project, user)"),
+            other => anyhow::bail!(
+                "unknown scope: {other} (expected: project-local, project-shared, user)"
+            ),
         }
     } else if non_interactive {
-        Scope::Project
+        Scope::ProjectLocal
     } else {
         select_scope_interactive()?
     };
@@ -281,8 +289,9 @@ fn select_scope_interactive() -> Result<Scope> {
     use dialoguer::Select;
 
     let items = [
-        "project (hooks in .claude/, .cursor/, etc.)",
-        "user (hooks in ~/.<agent>/)",
+        "project-local (gitignored, e.g. .claude/settings.local.json) ← recommended",
+        "project-shared (committed, e.g. .claude/settings.json)",
+        "user (global, e.g. ~/.claude/settings.json)",
     ];
     let selection = Select::new()
         .with_prompt("Install scope")
@@ -292,7 +301,9 @@ fn select_scope_interactive() -> Result<Scope> {
         .context("scope selection cancelled")?;
 
     Ok(if selection == 0 {
-        Scope::Project
+        Scope::ProjectLocal
+    } else if selection == 1 {
+        Scope::ProjectShared
     } else {
         Scope::User
     })
@@ -327,7 +338,13 @@ fn install_agent(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<I
 /// Resolve the config file path for the given agent + scope.
 fn config_path(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<PathBuf> {
     match scope {
-        Scope::Project => {
+        Scope::ProjectLocal => {
+            let dir = kind
+                .project_config_dir()
+                .ok_or_else(|| anyhow::anyhow!("{kind} has no project-level config"))?;
+            Ok(project_root.join(dir).join("settings.local.json"))
+        }
+        Scope::ProjectShared => {
             let dir = kind
                 .project_config_dir()
                 .ok_or_else(|| anyhow::anyhow!("{kind} has no project-level config"))?;
@@ -464,7 +481,7 @@ fn install_claude_code(scope: Scope, project_root: &Path) -> Result<InstallRepor
 fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     // Cursor uses .cursor/hooks.json (not settings.json).
     let dir = match scope {
-        Scope::Project => project_root.join(".cursor"),
+        Scope::ProjectLocal | Scope::ProjectShared => project_root.join(".cursor"),
         Scope::User => anyhow::bail!("Cursor only supports project-level hooks"),
     };
     let path = dir.join("hooks.json");
@@ -521,7 +538,9 @@ fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
 
 fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = match scope {
-        Scope::Project => project_root.join(".codex").join("hooks.json"),
+        Scope::ProjectLocal | Scope::ProjectShared => {
+            project_root.join(".codex").join("hooks.json")
+        }
         Scope::User => dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?
             .join(".codex")
@@ -624,14 +643,13 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
 
     for agent in &detected {
         if let Some(dir) = agent.kind.project_config_dir() {
-            let path = project_root.join(dir).join("settings.json");
-            if remove_kizu_hooks_from_json(&path)? {
-                println!(
-                    "  {} project hooks removed from {}",
-                    agent.kind,
-                    path.display()
-                );
-                any_removed = true;
+            // Check both settings.json and settings.local.json.
+            for filename in ["settings.json", "settings.local.json"] {
+                let path = project_root.join(dir).join(filename);
+                if remove_kizu_hooks_from_json(&path)? {
+                    println!("  {} hooks removed from {}", agent.kind, path.display());
+                    any_removed = true;
+                }
             }
         }
         if let Some(dir) = agent.kind.user_config_dir() {
