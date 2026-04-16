@@ -118,6 +118,58 @@ test("Tab back from stream lands on the file from the stream event", async () =>
   expect(view).toContain("zzz.rs");
 });
 
+test("stream j navigates events and Tab back lands on selected file", async () => {
+  repo = createTempRepo();
+  repo.write("a.rs", "fn a() {}\n");
+  repo.write("b.rs", "fn b() {}\n");
+  repo.git("add", ".");
+  repo.git("commit", "-q", "-m", "seed");
+
+  session = await launchKizu({ cwd: repo.path });
+  await session.waitForText("No changes since baseline", { timeout: 10_000 });
+
+  // Create edits and events for both files.
+  repo.write("a.rs", "fn a() { 1 }\n");
+  sendHookLogEvent(repo.path, "Write", `${repo.path}/a.rs`);
+  await session.waitForText("a.rs", { timeout: 10_000 });
+
+  repo.write("b.rs", "fn b() { 2 }\n");
+  sendHookLogEvent(repo.path, "Edit", `${repo.path}/b.rs`);
+  await new Promise((r) => setTimeout(r, 500));
+
+  // Tab to stream — should show both events.
+  await session.press("tab");
+  await session.waitForText("[stream]", { timeout: 5_000 });
+  let view = await session.text({ trimEnd: true });
+  expect(view).toContain("Write");
+  expect(view).toContain("Edit");
+
+  // Navigate to the second event (b.rs) with j.
+  await session.press("j");
+  await new Promise((r) => setTimeout(r, 300));
+
+  // Tab back — should land near b.rs.
+  await session.press("tab");
+  await session.waitForText("b.rs", { timeout: 10_000 });
+  view = await session.text({ trimEnd: true });
+  expect(view).toContain("b.rs");
+});
+
+test("Tab to stream with no events shows empty message", async () => {
+  repo = createTempRepo();
+  session = await launchKizu({ cwd: repo.path });
+  await session.waitForText("No changes since baseline", { timeout: 10_000 });
+
+  // Tab to stream with zero events.
+  await session.press("tab");
+  await session.waitForText("[stream]", { timeout: 5_000 });
+  const view = await session.text({ trimEnd: true });
+  // Empty stream: no files in layout, should show the empty state.
+  expect(view).toContain("[stream]");
+  // Should NOT show diff-mode content.
+  expect(view).not.toContain("[follow]");
+});
+
 test("stream mode is not disrupted by worktree changes", async () => {
   repo = createTempRepo();
   repo.write("a.rs", "fn a() {}\n");
