@@ -1890,39 +1890,26 @@ impl App {
         }
     }
 
-    /// Row that "follow mode" parks the scroll cursor on: the **last
-    /// visible content row** of the newest file (files are sorted
-    /// mtime-ascending, so the last file is the most recently touched
-    /// one). Walks `layout.rows` from the end and returns the first
-    /// non-Spacer row whose `file_of_row` matches the newest file.
-    /// This lands on the actual last diff line of the last hunk, the
-    /// place a `tail -f`-style monitor expects to see.
-    ///
-    /// ADR-0009 fix: the previous implementation returned the newest
-    /// hunk's **header** row (`layout.hunk_starts.last()`), which for
-    /// any hunk taller than the viewport pinned follow mode to the
-    /// top of the hunk and hid the newest added / deleted lines. That
-    /// broke the core monitoring contract exactly when large edits
-    /// were landing.
+    /// Row that "follow mode" parks the scroll cursor on: the
+    /// **file header** of the newest file (files are sorted
+    /// mtime-ascending, so the last file is the most recently
+    /// touched one). Landing on the header lets the user see the
+    /// file name, hunk headers, and diff body all in one viewport
+    /// — more useful than pinning to the last diff line which may
+    /// push the context above the fold.
     fn follow_target_row(&self) -> Option<usize> {
         if self.files.is_empty() {
             return None;
         }
         let newest = self.files.len() - 1;
-        // Walk from the end of the layout to find the last content
-        // row belonging to the newest file. `file_of_row[i]` carries
-        // the owning file for every row type; Spacer rows are
-        // excluded because they are cosmetic inter-file padding and
-        // do not belong to any file's change set.
-        for (i, &file_idx) in self.layout.file_of_row.iter().enumerate().rev() {
-            if file_idx == newest && !matches!(self.layout.rows.get(i), Some(RowKind::Spacer)) {
+        // Find the FileHeader row for the newest file.
+        for (i, row) in self.layout.rows.iter().enumerate() {
+            if matches!(row, RowKind::FileHeader { file_idx } if *file_idx == newest) {
                 return Some(i);
             }
         }
-        // Fallbacks mirror the legacy behaviour: if the walk above
-        // turns up nothing (file has no diffable content — binary,
-        // empty, …), try the file's first-hunk entry, then the
-        // absolute last row. Either is preferable to returning None.
+        // Fallback: if no FileHeader exists (shouldn't happen in
+        // practice), try the file's first hunk, then the last row.
         self.layout
             .file_first_hunk
             .last()
@@ -3659,17 +3646,11 @@ mod tests {
     }
 
     #[test]
-    fn follow_target_row_is_last_diff_row_of_newest_file() {
-        // ADR-0009 fix: follow must park on the **last content row**
-        // of the newest file, not on the newest hunk's header. With
-        // the old behaviour a tall last hunk would pin the viewport
-        // to the top of the hunk and hide the newest added/deleted
-        // lines — the opposite of what `tail -f`-style monitoring
-        // should do.
-        //
-        // newest.rs has the largest mtime → ends up at the bottom of
-        // the mtime-ascending layout. Its second hunk's DiffLine is
-        // the very last row; follow should land there.
+    fn follow_target_row_is_file_header_of_newest_file() {
+        // Follow mode should park on the **file header** of the
+        // newest file so the user sees the full context of the
+        // latest change — file name, hunk headers, and diff body
+        // all visible below the cursor.
         let app = fake_app(vec![
             make_file(
                 "older.rs",
@@ -3686,35 +3667,28 @@ mod tests {
             ),
         ]);
         assert!(
-            matches!(app.layout.rows[app.scroll], RowKind::DiffLine { .. }),
-            "follow target must be an actual DiffLine row, got {:?}",
+            matches!(app.layout.rows[app.scroll], RowKind::FileHeader { .. }),
+            "follow target must be a FileHeader row, got {:?}",
             app.layout.rows[app.scroll]
         );
-        // The last DiffLine of the newest file is the target. Trailing
-        // Spacer rows are cosmetic padding and must be skipped by
-        // `follow_target_row`.
         let newest_idx = app.files.len() - 1;
-        let last_diff_in_newest = app
+        let header_of_newest = app
             .layout
             .rows
             .iter()
             .enumerate()
-            .rev()
             .find_map(|(i, r)| match r {
-                RowKind::DiffLine { file_idx, .. } if *file_idx == newest_idx => Some(i),
+                RowKind::FileHeader { file_idx } if *file_idx == newest_idx => Some(i),
                 _ => None,
             })
-            .expect("newest file must contain at least one DiffLine");
-        assert_eq!(app.scroll, last_diff_in_newest);
+            .expect("newest file must have a FileHeader");
+        assert_eq!(app.scroll, header_of_newest);
     }
 
     #[test]
-    fn follow_target_row_reveals_tail_of_tall_last_hunk() {
-        // Regression for Codex round-4 finding: under the old design
-        // a tall final hunk would pin follow to its header row, so
-        // the newest ~hunk_size - viewport lines of the edit were
-        // always off-screen. A 20-line hunk is the minimal reproducer:
-        // follow must park on the 20th DiffLine, not the hunk header.
+    fn follow_target_row_lands_on_header_even_for_tall_hunk() {
+        // Even with a 20-line hunk, follow should park on the file
+        // header so the user sees the full change from the top.
         let huge_hunk = hunk(
             1,
             (0..20)
@@ -3722,10 +3696,11 @@ mod tests {
                 .collect(),
         );
         let app = fake_app(vec![make_file("big.rs", vec![huge_hunk], 500)]);
-        assert!(matches!(
-            app.layout.rows[app.scroll],
-            RowKind::DiffLine { line_idx: 19, .. }
-        ));
+        assert!(
+            matches!(app.layout.rows[app.scroll], RowKind::FileHeader { .. }),
+            "follow should land on FileHeader, got {:?}",
+            app.layout.rows[app.scroll]
+        );
     }
 
     #[test]
@@ -4422,26 +4397,12 @@ mod tests {
         assert!(!app.follow_mode);
         app.handle_key(key(KeyCode::Char('f')));
         assert!(app.follow_mode);
-        // ADR-0009 fix: follow target = last **DiffLine** of the
-        // newest file's last hunk, not the hunk header. This is the
-        // row that actually shows the newest edit.
+        // Follow target = FileHeader of the newest file so the user
+        // sees the full change from the top.
         assert!(matches!(
             app.layout.rows[app.scroll],
-            RowKind::DiffLine { .. }
+            RowKind::FileHeader { .. }
         ));
-        let newest = app.files.len() - 1;
-        let last_diff = app
-            .layout
-            .rows
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, r)| match r {
-                RowKind::DiffLine { file_idx, .. } if *file_idx == newest => Some(i),
-                _ => None,
-            })
-            .expect("newest file has a DiffLine");
-        assert_eq!(app.scroll, last_diff);
     }
 
     #[test]
