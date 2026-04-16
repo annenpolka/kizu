@@ -4,12 +4,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use notify::RecursiveMode;
-use notify_debouncer_full::{
-    DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt,
-    notify::{Config as NotifyConfig, PollWatcher},
-};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache};
 #[cfg(not(target_os = "macos"))]
 use notify_debouncer_full::{new_debouncer, notify::RecommendedWatcher};
+#[cfg(target_os = "macos")]
+use notify_debouncer_full::{
+    new_debouncer_opt,
+    notify::{Config as NotifyConfig, PollWatcher},
+};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Worktree debounce window (SPEC.md).
