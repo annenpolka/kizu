@@ -1194,6 +1194,17 @@ impl App {
                 self.current_branch_ref = new_branch;
                 self.head_dirty = false;
                 self.apply_computed_files(files);
+                // Drop stream-mode snapshots captured against the
+                // previous baseline. Every entry in `diff_snapshots`
+                // was `git diff <old_baseline> -- <path>` output;
+                // comparing the next hook-log-event against that
+                // would misattribute lines that belong to the change
+                // between baselines (not to the agent's edit).
+                // Re-seeding against the new baseline restores the
+                // "prev" reference so subsequent op-diffs stay
+                // accurate.
+                self.diff_snapshots.clear();
+                self.seed_diff_snapshots();
                 if branch_changed {
                     KeyEffect::ReconfigureWatcher
                 } else {
@@ -1203,11 +1214,11 @@ impl App {
             Err(e) => {
                 self.last_error = Some(format!("R: {e:#}"));
                 // baseline_sha / current_branch_ref / head_dirty /
-                // files intentionally untouched: the HEAD* warning
-                // stays visible and the user keeps seeing the same
-                // diff they had before R. Watcher also stays pinned
-                // to the old branch, which is the correct behavior
-                // for an aborted reset.
+                // files / diff_snapshots intentionally untouched:
+                // the HEAD* warning stays visible and the user keeps
+                // seeing the same diff they had before R. Watcher
+                // also stays pinned to the old branch, which is the
+                // correct behavior for an aborted reset.
                 KeyEffect::None
             }
         }
@@ -7220,6 +7231,51 @@ mod tests {
         let curr = "+foo\n+\n+\n bar\n";
         let op = super::compute_operation_diff(prev, curr);
         assert_eq!(op, "+\n", "second blank-line addition must survive");
+    }
+
+    #[test]
+    fn apply_reset_clears_stale_diff_snapshots() {
+        // Previously, `R` would rewrite `baseline_sha` + `files` but
+        // leave `diff_snapshots` pinned to the OLD baseline. The next
+        // hook-log-event for a file in the map would then compute
+        // op_diff against an outdated snapshot — semantic garbage.
+        // The fix: clear the map on every successful reset so the
+        // next event rebuilds from the new baseline.
+        let mut app = fake_app(vec![]);
+        app.diff_snapshots
+            .insert(PathBuf::from("stale.rs"), "OLD\n".to_string());
+        assert!(!app.diff_snapshots.is_empty());
+
+        // Simulate a successful reset to a new baseline + branch.
+        let effect = app.apply_reset(
+            "new-sha-xxx".to_string(),
+            Some("refs/heads/main".to_string()),
+            Ok(Vec::new()),
+        );
+        assert_eq!(effect, super::KeyEffect::None);
+        assert!(
+            app.diff_snapshots.is_empty(),
+            "stale diff snapshots must be dropped after a baseline reset"
+        );
+    }
+
+    #[test]
+    fn apply_reset_failure_preserves_diff_snapshots() {
+        // If the reset transaction fails (new SHA unresolvable, etc.)
+        // the app keeps showing the old diff — and must therefore
+        // keep the snapshots that were valid against the OLD baseline,
+        // otherwise the very next event would misattribute lines.
+        let mut app = fake_app(vec![]);
+        app.diff_snapshots
+            .insert(PathBuf::from("keep.rs"), "content\n".to_string());
+
+        let effect = app.apply_reset("new-sha".to_string(), None, Err(anyhow::anyhow!("boom")));
+        assert_eq!(effect, super::KeyEffect::None);
+        assert_eq!(
+            app.diff_snapshots.get(&PathBuf::from("keep.rs")),
+            Some(&"content\n".to_string()),
+            "failed reset must not touch snapshot state",
+        );
     }
 
     #[test]
