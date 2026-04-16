@@ -208,6 +208,10 @@ pub fn run_init(
     scope_flag: Option<&str>,
     non_interactive: bool,
 ) -> Result<()> {
+    if !non_interactive {
+        print_banner();
+    }
+
     let detected = detect_agents(project_root);
 
     let selected_agents: Vec<AgentKind> = if let Some(names) = agents_flag {
@@ -256,30 +260,91 @@ pub fn run_init(
     // Install git pre-commit hook to block commits with unresolved scars.
     install_git_pre_commit_hook(project_root)?;
 
+    println!();
+    println!("  {}  {}", c_green("✓"), c_bold("kizu hooks installed"),);
+    println!("  {}", c_dim("Run `kizu teardown` to remove all hooks"),);
+    println!();
+
     Ok(())
 }
 
+// ── ANSI helpers ────────────────────────────────────────────────
+
+fn c_bold(s: &str) -> String {
+    format!("\x1b[1m{s}\x1b[0m")
+}
+fn c_cyan(s: &str) -> String {
+    format!("\x1b[36m{s}\x1b[0m")
+}
+fn c_green(s: &str) -> String {
+    format!("\x1b[32m{s}\x1b[0m")
+}
+fn c_yellow(s: &str) -> String {
+    format!("\x1b[33m{s}\x1b[0m")
+}
+#[allow(dead_code)]
+fn c_red(s: &str) -> String {
+    format!("\x1b[31m{s}\x1b[0m")
+}
+fn c_dim(s: &str) -> String {
+    format!("\x1b[2m{s}\x1b[0m")
+}
+fn c_magenta(s: &str) -> String {
+    format!("\x1b[35m{s}\x1b[0m")
+}
+
+fn print_banner() {
+    println!();
+    println!("  {}  {}", c_bold(&c_magenta("傷")), c_bold("kizu init"),);
+    println!(
+        "  {}",
+        c_dim("Hook installer for AI coding agent scar review")
+    );
+    println!();
+}
+
+fn support_level_colored(sl: SupportLevel) -> String {
+    match sl {
+        SupportLevel::Full => c_green(&format!("● {sl}")),
+        SupportLevel::StopOnly => c_yellow(&format!("◐ {sl}")),
+        SupportLevel::PostToolOnlyBestEffort => c_yellow(&format!("◐ {sl}")),
+        SupportLevel::WriteSideOnly => c_dim(&format!("○ {sl}")),
+    }
+}
+
+fn detection_status_colored(d: &DetectedAgent) -> String {
+    if d.binary_found && d.config_dir_found {
+        c_green("✓ detected")
+    } else if d.binary_found {
+        c_yellow("~ bin only")
+    } else {
+        c_dim("✗ not found")
+    }
+}
+
 fn select_agents_interactive(detected: &[DetectedAgent]) -> Result<Vec<AgentKind>> {
-    use dialoguer::MultiSelect;
+    use dialoguer::{MultiSelect, theme::ColorfulTheme};
 
     let items: Vec<String> = detected
         .iter()
         .map(|d| {
-            let status = if d.binary_found && d.config_dir_found {
-                "✓"
-            } else if d.binary_found {
-                "bin only"
-            } else {
-                "not found"
-            };
-            format!("{} [{}] ({})", d.kind, d.support_level, status)
+            format!(
+                "{}  {}  {}",
+                c_bold(&format!("{:<12}", d.kind.to_string())),
+                support_level_colored(d.support_level),
+                detection_status_colored(d),
+            )
         })
         .collect();
 
     let defaults: Vec<bool> = detected.iter().map(|d| d.recommended).collect();
 
-    let selections = MultiSelect::new()
-        .with_prompt("Select agents to install hooks for")
+    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "{}  {}",
+            c_cyan("?"),
+            c_bold("Select agents to install hooks for"),
+        ))
         .items(&items)
         .defaults(&defaults)
         .interact()
@@ -289,15 +354,27 @@ fn select_agents_interactive(detected: &[DetectedAgent]) -> Result<Vec<AgentKind
 }
 
 fn select_scope_interactive() -> Result<Scope> {
-    use dialoguer::Select;
+    use dialoguer::{Select, theme::ColorfulTheme};
 
     let items = [
-        "project-local (gitignored, e.g. .claude/settings.local.json) ← recommended",
-        "project-shared (committed, e.g. .claude/settings.json)",
-        "user (global, e.g. ~/.claude/settings.json)",
+        format!(
+            "{}  {}",
+            c_bold("project-local"),
+            c_dim("(gitignored · .claude/settings.local.json) ← recommended"),
+        ),
+        format!(
+            "{}  {}",
+            c_bold("project-shared"),
+            c_dim("(committed · .claude/settings.json)"),
+        ),
+        format!(
+            "{}  {}",
+            c_bold("user"),
+            c_dim("(global · ~/.claude/settings.json)"),
+        ),
     ];
-    let selection = Select::new()
-        .with_prompt("Install scope")
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!("{}  {}", c_cyan("?"), c_bold("Install scope"),))
         .items(&items)
         .default(0)
         .interact()
@@ -313,15 +390,28 @@ fn select_scope_interactive() -> Result<Scope> {
 }
 
 fn print_report(report: &InstallReport) {
+    let status = if report.entries_added > 0 {
+        c_green(&format!("✓ {} entries added", report.entries_added))
+    } else {
+        c_dim(&format!(
+            "– {} skipped (already installed)",
+            report.entries_skipped
+        ))
+    };
     println!(
-        "  {} — {} entries added, {} skipped",
-        report.agent, report.entries_added, report.entries_skipped
+        "  {}  {}",
+        c_bold(&format!("{:<12}", report.agent.to_string())),
+        status,
     );
     for path in &report.files_modified {
-        println!("    modified: {}", path.display());
+        println!(
+            "  {}  {}",
+            c_dim("             "),
+            c_dim(&format!("→ {}", path.display())),
+        );
     }
     for warning in &report.warnings {
-        eprintln!("    ⚠ {warning}");
+        eprintln!("  {}  {} {warning}", c_dim("             "), c_yellow("⚠"),);
     }
 }
 
