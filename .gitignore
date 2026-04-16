@@ -5,3 +5,7 @@
 .idea/
 .vscode/
 *.swp
+
+# Claude Code runtime state (per-machine, non-portable)
+.claude/*.lock
+.claude/settings.local.json
