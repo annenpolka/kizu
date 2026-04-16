@@ -232,9 +232,10 @@ pub struct EditorInvocation {
 /// `$EDITOR` is split on whitespace (no shell quoting — matching
 /// `git`'s `GIT_EDITOR` conventions for MVP). The first token is
 /// the program; any remaining tokens are kept as leading args.
-/// The trailing two args are always `+<line>` and the absolute
-/// file path, so common editors (`vim`, `nvim`, `nano`, `emacs`,
-/// `code --wait`) land the cursor on the correct line.
+///
+/// Line-number format depends on the editor:
+/// - vim/nvim/vi/nano/emacs/kak use `+<line> <file>`
+/// - zed/code/subl/hx/cursor and others use `<file>:<line>`
 ///
 /// Returns `None` when `editor_env` is `None` or empty / all
 /// whitespace, so callers get a single consistent "no editor
@@ -251,9 +252,29 @@ pub fn build_editor_invocation(
     let mut parts = env.split_whitespace().map(String::from);
     let program = parts.next()?;
     let mut args: Vec<String> = parts.collect();
-    args.push(format!("+{line}"));
-    args.push(file.display().to_string());
+
+    let basename = Path::new(&program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if uses_plus_line_format(basename) {
+        args.push(format!("+{line}"));
+        args.push(file.display().to_string());
+    } else {
+        args.push(format!("{}:{line}", file.display()));
+    }
+
     Some(EditorInvocation { program, args })
+}
+
+/// Editors that accept `+<line> <file>` for line-jump. All others
+/// default to the `<file>:<line>` convention (VS Code, Zed,
+/// Sublime, Helix, Cursor, etc.).
+fn uses_plus_line_format(basename: &str) -> bool {
+    matches!(
+        basename,
+        "vim" | "nvim" | "vi" | "nano" | "emacs" | "emacsclient" | "kak" | "mg" | "nvi"
+    )
 }
 
 /// Two ways the renderer can park the cursor inside the viewport.
@@ -1905,6 +1926,20 @@ impl App {
                     .map(|fv| fv.lines.len().saturating_sub(1))
                     .unwrap_or(0);
                 self.file_view_goto(last);
+            }
+            KeyCode::Char('e') => {
+                // Open external editor at the file-view cursor's
+                // 1-indexed line. Uses the same path stored in
+                // FileViewState so the editor opens the exact file.
+                let env = std::env::var("EDITOR").ok();
+                if let Some(fv) = self.file_view.as_ref() {
+                    let line_1indexed = fv.cursor + 1;
+                    let abs = self.root.join(&fv.path);
+                    if let Some(inv) = build_editor_invocation(env.as_deref(), line_1indexed, &abs)
+                    {
+                        return KeyEffect::OpenEditor(inv);
+                    }
+                }
             }
             _ => {}
         }
@@ -5950,7 +5985,7 @@ mod tests {
     // ---- M4 slice 5: `e` external editor --------------------------
 
     #[test]
-    fn build_editor_invocation_parses_bare_editor_name() {
+    fn build_editor_invocation_vim_uses_plus_line_format() {
         let inv = build_editor_invocation(Some("vim"), 42, Path::new("/tmp/foo.rs"))
             .expect("some invocation");
         assert_eq!(inv.program, "vim");
@@ -5958,23 +5993,39 @@ mod tests {
     }
 
     #[test]
-    fn build_editor_invocation_preserves_leading_editor_args() {
-        // `$EDITOR=nvim -f` (used to run nvim non-detached from
-        // `git commit` etc.) must keep `-f` on the front of the
-        // args list.
+    fn build_editor_invocation_nvim_preserves_leading_args_and_plus_line() {
         let inv = build_editor_invocation(Some("nvim -f"), 7, Path::new("x.rs")).unwrap();
         assert_eq!(inv.program, "nvim");
         assert_eq!(inv.args, vec!["-f", "+7", "x.rs"]);
     }
 
     #[test]
-    fn build_editor_invocation_passes_multi_flag_editors() {
-        // `code --wait --new-window` → first token is program,
-        // the two flags + line + file follow.
+    fn build_editor_invocation_zed_uses_colon_line_format() {
+        let inv = build_editor_invocation(Some("zed"), 10, Path::new("a.rs")).unwrap();
+        assert_eq!(inv.program, "zed");
+        assert_eq!(inv.args, vec!["a.rs:10"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_code_with_flags_uses_colon_format() {
         let inv = build_editor_invocation(Some("code --wait --new-window"), 1, Path::new("a.rs"))
             .unwrap();
         assert_eq!(inv.program, "code");
-        assert_eq!(inv.args, vec!["--wait", "--new-window", "+1", "a.rs"]);
+        assert_eq!(inv.args, vec!["--wait", "--new-window", "a.rs:1"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_helix_uses_colon_format() {
+        let inv = build_editor_invocation(Some("hx"), 5, Path::new("b.rs")).unwrap();
+        assert_eq!(inv.program, "hx");
+        assert_eq!(inv.args, vec!["b.rs:5"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_nano_uses_plus_line_format() {
+        let inv = build_editor_invocation(Some("nano"), 3, Path::new("c.py")).unwrap();
+        assert_eq!(inv.program, "nano");
+        assert_eq!(inv.args, vec!["+3", "c.py"]);
     }
 
     #[test]
