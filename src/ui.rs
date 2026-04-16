@@ -298,16 +298,16 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let hl = app
             .highlighter
             .get_or_init(crate::highlight::Highlighter::new);
-        let row_lines = render_row(
-            &app.layout.rows[row_idx],
-            &app.files,
-            selected,
+        let ctx = RowRenderCtx {
+            files: &app.files,
+            selected_hunk: selected,
             cursor_sub,
             wrap_body_width,
             nowrap_body_width,
-            &app.seen_hunks,
-            Some(hl),
-        );
+            seen_hunks: &app.seen_hunks,
+            hl: Some(hl),
+        };
+        let row_lines = render_row(&app.layout.rows[row_idx], &ctx);
         let mut take = row_lines.into_iter();
         // Discard any leading visual lines requested by the
         // placement layer (only the first logical row ever carries
@@ -368,6 +368,19 @@ fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> O
     })
 }
 
+/// Per-frame rendering context passed to [`render_row`]. Bundles
+/// the shared state that every row type needs without inflating
+/// the function signature.
+struct RowRenderCtx<'a> {
+    files: &'a [FileDiff],
+    selected_hunk: Option<(usize, usize)>,
+    cursor_sub: Option<usize>,
+    wrap_body_width: Option<usize>,
+    nowrap_body_width: usize,
+    seen_hunks: &'a std::collections::BTreeSet<(std::path::PathBuf, usize)>,
+    hl: Option<&'a crate::highlight::Highlighter>,
+}
+
 /// Build the styled visual `Line`s for a single logical layout row.
 /// Most row types produce exactly one `Line`; a `DiffLine` in wrap
 /// mode (`wrap_body_width.is_some()`) can produce multiple lines
@@ -382,17 +395,18 @@ fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> O
 /// middle of a long wrapped line via Ctrl-d / J). The arrow marker
 /// lands on that visual sub-row instead of always on the first
 /// (ADR-0009 fix). `None` for non-cursor rows.
-#[allow(clippy::too_many_arguments)]
-fn render_row(
-    row: &RowKind,
-    files: &[FileDiff],
-    selected_hunk: Option<(usize, usize)>,
-    cursor_sub: Option<usize>,
-    wrap_body_width: Option<usize>,
-    nowrap_body_width: usize,
-    seen_hunks: &std::collections::BTreeSet<(std::path::PathBuf, usize)>,
-    hl: Option<&crate::highlight::Highlighter>,
-) -> Vec<Line<'static>> {
+///
+/// Rendering context is bundled into [`RowRenderCtx`] to keep the
+/// signature manageable as we add more per-frame state (seen marks,
+/// highlighter, etc.).
+fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
+    let files = ctx.files;
+    let selected_hunk = ctx.selected_hunk;
+    let cursor_sub = ctx.cursor_sub;
+    let wrap_body_width = ctx.wrap_body_width;
+    let nowrap_body_width = ctx.nowrap_body_width;
+    let seen_hunks = ctx.seen_hunks;
+    let hl = ctx.hl;
     match row {
         RowKind::FileHeader { file_idx } => {
             vec![render_file_header(
