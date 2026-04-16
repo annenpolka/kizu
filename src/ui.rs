@@ -915,8 +915,11 @@ fn render_file_view(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Render the stream mode view: a time-ordered list of operations
-/// in the left pane, and the selected operation's diff in the right pane.
+/// Render the stream mode view: a vertical scroll of operation
+/// entries, each with a header line (timestamp + tool + path +
+/// counts) followed by the operation's diff lines. Same layout
+/// as the main diff view but with operations as the section unit
+/// instead of files.
 fn render_stream_view(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.stream_events.is_empty() {
         let msg = Paragraph::new("No stream events yet. Waiting for hook-log-event...")
@@ -926,142 +929,172 @@ fn render_stream_view(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    // Split into left (event list) and right (diff detail).
-    let chunks =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
-    let list_area = chunks[0];
-    let detail_area = chunks[1];
+    let height = area.height as usize;
+    let width = area.width as usize;
+    let bg_added = app.config.colors.bg_added_color();
+    let bg_deleted = app.config.colors.bg_deleted_color();
+    let hl = app
+        .highlighter
+        .get_or_init(crate::highlight::Highlighter::new);
 
-    // Build event list items.
-    let items: Vec<ListItem<'_>> = app
-        .stream_events
-        .iter()
-        .enumerate()
-        .map(|(i, ev)| {
-            let ts = ev.metadata.timestamp_ms;
-            let secs = ts / 1000;
-            let hours = (secs / 3600) % 24;
-            let mins = (secs / 60) % 60;
-            let s = secs % 60;
-            let time_str = format!("{hours:02}:{mins:02}:{s:02}");
+    // Build all lines: event headers + diff body for each event.
+    // Track which visual line each event header starts at so we can
+    // scroll to keep the cursor event visible.
+    let mut all_lines: Vec<Line<'static>> = Vec::new();
+    let mut event_header_positions: Vec<usize> = Vec::new();
 
-            let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
-            let file = ev
-                .metadata
-                .file_paths
-                .first()
-                .map(|p| {
-                    p.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .unwrap_or_default();
+    for (i, ev) in app.stream_events.iter().enumerate() {
+        let is_focused = i == app.stream_cursor;
+        event_header_positions.push(all_lines.len());
 
-            let counts = if ev.add_count > 0 || ev.del_count > 0 {
-                format!(" +{}/-{}", ev.add_count, ev.del_count)
-            } else {
-                String::new()
-            };
+        // --- Event header line ---
+        let ts = ev.metadata.timestamp_ms;
+        let secs = ts / 1000;
+        let hours = (secs / 3600) % 24;
+        let mins = (secs / 60) % 60;
+        let s = secs % 60;
+        let time_str = format!("{hours:02}:{mins:02}:{s:02}");
+        let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
+        let file_path = ev
+            .metadata
+            .file_paths
+            .first()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let counts = if ev.add_count > 0 || ev.del_count > 0 {
+            format!(" +{}/-{}", ev.add_count, ev.del_count)
+        } else {
+            String::new()
+        };
 
-            let style = if i == app.stream_cursor {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{time_str} "), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{tool:<6}"), Style::default().fg(Color::Cyan)),
-                Span::styled(file, style),
-                Span::styled(counts, Style::default().fg(Color::Green)),
-            ]))
-        })
-        .collect();
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(app.stream_cursor));
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::RIGHT)
-                .title(" Stream ")
-                .title_style(
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
-        )
-        .highlight_style(
+        let marker = if is_focused { "  \u{25b8}  " } else { "     " };
+        let header_style = if is_focused {
             Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        all_lines.push(Line::from(vec![
+            Span::styled(marker, header_style),
+            Span::styled(format!("{time_str} "), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{tool:<6}"), Style::default().fg(Color::Cyan)),
+            Span::styled(file_path.clone(), header_style),
+            Span::styled(counts, Style::default().fg(Color::Green)),
+        ]));
 
-    frame.render_stateful_widget(list, list_area, &mut list_state);
-
-    // Render selected event's diff.
-    if let Some(ev) = app.stream_events.get(app.stream_cursor) {
-        let diff_text = ev
-            .diff_snapshot
-            .as_deref()
-            .unwrap_or("[diff not captured — event occurred before TUI started]");
-
-        let hl = app
-            .highlighter
-            .get_or_init(crate::highlight::Highlighter::new);
-
-        let lines: Vec<Line<'_>> = diff_text
-            .lines()
-            .map(|line| {
-                let bg_added = app.config.colors.bg_added_color();
-                let bg_deleted = app.config.colors.bg_deleted_color();
+        // --- Diff body lines ---
+        let diff_text = ev.diff_snapshot.as_deref().unwrap_or("");
+        if diff_text.is_empty() && ev.diff_snapshot.is_none() {
+            // Pre-existing event with no captured diff — show hint
+            let dim = if is_focused {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
+            };
+            all_lines.push(Line::styled(
+                "       [diff not captured - event predates TUI]",
+                dim,
+            ));
+        } else {
+            let fp = ev.metadata.file_paths.first();
+            let body_width = width.saturating_sub(5).max(1);
+            for line in diff_text.lines() {
                 let style = if line.starts_with('+') && !line.starts_with("+++") {
-                    Style::default().bg(bg_added)
+                    let base = Style::default().bg(bg_added);
+                    if is_focused {
+                        base
+                    } else {
+                        base.add_modifier(Modifier::DIM)
+                    }
                 } else if line.starts_with('-') && !line.starts_with("---") {
-                    Style::default().bg(bg_deleted)
+                    let base = Style::default().bg(bg_deleted);
+                    if is_focused {
+                        base
+                    } else {
+                        base.add_modifier(Modifier::DIM)
+                    }
                 } else if line.starts_with("@@") {
                     Style::default().fg(Color::Cyan)
+                } else if is_focused {
+                    Style::default()
                 } else {
                     Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM)
                 };
-                // Try syntax highlight for the content.
-                let file_path = ev.metadata.file_paths.first();
-                if let Some(fp) = file_path {
-                    let content = line
-                        .strip_prefix('+')
-                        .or_else(|| line.strip_prefix('-'))
-                        .unwrap_or(line);
+
+                // Syntax highlight where possible.
+                let content = line
+                    .strip_prefix('+')
+                    .or_else(|| line.strip_prefix('-'))
+                    .unwrap_or(line);
+                let rendered = if let Some(fp) = fp {
                     let tokens = hl.highlight_line(content, fp);
                     if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
-                        let spans: Vec<Span<'_>> = tokens
-                            .iter()
-                            .map(|t| {
-                                let mut s = Style::default().fg(t.fg);
-                                if let Some(bg) = style.bg {
-                                    s = s.bg(bg);
-                                }
-                                Span::styled(t.text.to_string(), s)
-                            })
-                            .collect();
-                        return Line::from(spans);
+                        let mut spans: Vec<Span<'static>> = vec![Span::raw("     ")];
+                        let mut chars = 0;
+                        for t in &tokens {
+                            let remaining = body_width.saturating_sub(chars);
+                            if remaining == 0 {
+                                break;
+                            }
+                            let take: String = t.text.chars().take(remaining).collect();
+                            chars += take.chars().count();
+                            let mut s = Style::default().fg(t.fg);
+                            if let Some(bg) = style.bg {
+                                s = s.bg(bg);
+                            }
+                            if style.add_modifier.contains(Modifier::DIM) {
+                                s = s.add_modifier(Modifier::DIM);
+                            }
+                            spans.push(Span::styled(take, s));
+                        }
+                        // Pad to fill background
+                        if chars < body_width {
+                            let pad: String =
+                                std::iter::repeat_n(' ', body_width - chars).collect();
+                            spans.push(Span::styled(pad, style));
+                        }
+                        Some(Line::from(spans))
+                    } else {
+                        None
                     }
-                }
-                let _ = hl; // suppress unused
-                Line::styled(line.to_string(), style)
-            })
-            .collect();
+                } else {
+                    None
+                };
 
-        let detail = Paragraph::new(lines).block(
-            Block::default()
-                .title(" Diff ")
-                .title_style(Style::default().fg(Color::Cyan)),
-        );
-        frame.render_widget(detail, detail_area);
+                if let Some(hl_line) = rendered {
+                    all_lines.push(hl_line);
+                } else {
+                    let padded = format!("     {content:<body_width$}");
+                    all_lines.push(Line::styled(padded, style));
+                }
+            }
+        }
+
+        // Spacer between events.
+        all_lines.push(Line::raw(""));
     }
+
+    // Scroll to keep the focused event visible.
+    let cursor_line = event_header_positions
+        .get(app.stream_cursor)
+        .copied()
+        .unwrap_or(0);
+    let scroll_top = cursor_line.saturating_sub(height / 3);
+
+    // Slice visible lines.
+    let visible: Vec<Line<'_>> = all_lines
+        .into_iter()
+        .skip(scroll_top)
+        .take(height)
+        .collect();
+
+    let paragraph = Paragraph::new(visible);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
