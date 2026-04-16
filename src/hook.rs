@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Supported AI coding agent kinds. Determines how stdin JSON is
 /// parsed and how stdout feedback is formatted.
@@ -264,6 +265,137 @@ pub fn scan_scars_from_index(root: &Path, paths: &[PathBuf]) -> Vec<ScarHit> {
         hits.extend(scan_content_for_scars(&re, &content, path, fence_aware));
     }
     hits
+}
+
+/// Sanitized event metadata for the stream mode event log.
+/// Contains only non-sensitive metadata — code content, prompts,
+/// and agent responses are stripped during sanitization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SanitizedEvent {
+    pub session_id: Option<String>,
+    pub hook_event_name: String,
+    pub tool_name: Option<String>,
+    pub file_paths: Vec<PathBuf>,
+    pub cwd: PathBuf,
+    pub timestamp_ms: u64,
+}
+
+/// Convert a [`NormalizedHookInput`] into a [`SanitizedEvent`],
+/// stripping all code content and adding a timestamp.
+pub fn sanitize_event(input: &NormalizedHookInput) -> SanitizedEvent {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    SanitizedEvent {
+        session_id: input.session_id.clone(),
+        hook_event_name: input.hook_event_name.clone(),
+        tool_name: input.tool_name.clone(),
+        file_paths: input.file_paths.clone(),
+        cwd: input.cwd.clone().unwrap_or_default(),
+        timestamp_ms,
+    }
+}
+
+/// Write a [`SanitizedEvent`] to the events directory as an atomic
+/// JSON file. Returns the path of the written file. The events
+/// directory is created with `0700` permissions if it doesn't exist.
+/// Individual event files are written with `0600` permissions.
+pub fn write_event(event: &SanitizedEvent) -> Result<PathBuf> {
+    let dir = crate::paths::events_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve kizu events directory"))?;
+    crate::paths::ensure_private_dir(&dir)?;
+
+    let tool = event.tool_name.as_deref().unwrap_or("unknown");
+    let filename = format!("{}-{}.json", event.timestamp_ms, tool);
+    let dest = dir.join(&filename);
+
+    let json = serde_json::to_string(event).context("serializing event")?;
+
+    // Atomic write: write to temp file then rename.
+    let tmp_path = dir.join(format!(".{filename}.tmp"));
+    std::fs::write(&tmp_path, &json)
+        .with_context(|| format!("writing temp event file {}", tmp_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    std::fs::rename(&tmp_path, &dest)
+        .with_context(|| format!("renaming event file to {}", dest.display()))?;
+
+    Ok(dest)
+}
+
+/// Prune the events directory: remove entries older than `ttl` and
+/// enforce a maximum entry count. Returns the number of files removed.
+/// Uses the default events directory from [`crate::paths::events_dir`].
+pub fn prune_event_log(ttl: Duration, max_entries: usize) -> Result<usize> {
+    let dir = match crate::paths::events_dir() {
+        Some(d) if d.is_dir() => d,
+        _ => return Ok(0),
+    };
+    prune_event_log_in(&dir, ttl, max_entries)
+}
+
+/// Prune events in the given directory. Testable variant of
+/// [`prune_event_log`] that accepts an explicit path.
+pub fn prune_event_log_in(dir: &Path, ttl: Duration, max_entries: usize) -> Result<usize> {
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+
+    let mut entries: Vec<(PathBuf, u64)> = Vec::new();
+    for entry in std::fs::read_dir(dir).context("reading events dir")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip temp files.
+        if name_str.starts_with('.') {
+            continue;
+        }
+        // Parse timestamp from filename: <timestamp_ms>-<tool>.json
+        if let Some(ts_str) = name_str.split('-').next()
+            && let Ok(ts) = ts_str.parse::<u64>()
+        {
+            entries.push((entry.path(), ts));
+        }
+    }
+
+    // Sort oldest first.
+    entries.sort_by_key(|(_, ts)| *ts);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let ttl_ms = ttl.as_millis() as u64;
+
+    let mut removed = 0;
+
+    // Pass 1: remove entries older than TTL.
+    entries.retain(|(path, ts)| {
+        if now_ms.saturating_sub(*ts) > ttl_ms {
+            let _ = std::fs::remove_file(path);
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+
+    // Pass 2: enforce max entries (remove oldest first).
+    if entries.len() > max_entries {
+        let excess = entries.len() - max_entries;
+        for (path, _) in entries.iter().take(excess) {
+            let _ = std::fs::remove_file(path);
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
 }
 
 /// List files that might contain scars, scoped by the kizu session
@@ -713,6 +845,161 @@ mod tests {
         assert_eq!(AgentKind::from_str("qwen"), Some(AgentKind::QwenCode));
         assert_eq!(AgentKind::from_str("cline"), Some(AgentKind::Cline));
         assert_eq!(AgentKind::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn sanitize_event_strips_content_and_adds_timestamp() {
+        let input = NormalizedHookInput {
+            session_id: Some("sess-1".to_string()),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Edit".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/foo.rs")],
+            cwd: Some(PathBuf::from("/tmp/project")),
+            stop_hook_active: false,
+        };
+        let event = sanitize_event(&input);
+        assert_eq!(event.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(event.hook_event_name, "PostToolUse");
+        assert_eq!(event.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(event.file_paths, vec![PathBuf::from("/tmp/foo.rs")]);
+        assert_eq!(event.cwd, PathBuf::from("/tmp/project"));
+        assert!(event.timestamp_ms > 0);
+    }
+
+    #[test]
+    fn sanitize_event_serialized_json_has_no_content_fields() {
+        let input = NormalizedHookInput {
+            session_id: Some("sess-2".to_string()),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Write".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/bar.rs")],
+            cwd: Some(PathBuf::from("/tmp")),
+            stop_hook_active: false,
+        };
+        let event = sanitize_event(&input);
+        let json = serde_json::to_string(&event).unwrap();
+        // Verify no content/response/prompt fields leak through.
+        assert!(!json.contains("\"content\""));
+        assert!(!json.contains("\"new_string\""));
+        assert!(!json.contains("\"old_string\""));
+        assert!(!json.contains("\"output\""));
+        assert!(!json.contains("\"prompt\""));
+        // Verify expected fields are present.
+        assert!(json.contains("\"session_id\""));
+        assert!(json.contains("\"tool_name\""));
+        assert!(json.contains("\"file_paths\""));
+        assert!(json.contains("\"timestamp_ms\""));
+    }
+
+    #[test]
+    fn write_event_creates_file_with_correct_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("KIZU_STATE_DIR", tmp.path().to_str().unwrap()) };
+
+        let event = SanitizedEvent {
+            session_id: Some("test-sess".to_string()),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Edit".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/foo.rs")],
+            cwd: PathBuf::from("/tmp"),
+            timestamp_ms: 1700000000000,
+        };
+        let path = write_event(&event).unwrap();
+
+        unsafe { std::env::remove_var("KIZU_STATE_DIR") };
+
+        assert!(path.exists());
+        assert!(path.to_str().unwrap().contains("1700000000000-Edit.json"));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: SanitizedEvent = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn write_event_sets_0600_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("KIZU_STATE_DIR", tmp.path().to_str().unwrap()) };
+
+        let event = SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Write".to_string()),
+            file_paths: vec![],
+            cwd: PathBuf::from("/tmp"),
+            timestamp_ms: 1700000000001,
+        };
+        let path = write_event(&event).unwrap();
+
+        unsafe { std::env::remove_var("KIZU_STATE_DIR") };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn prune_removes_old_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_dir = tmp.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+
+        // Write an "old" event (timestamp 1000, effectively ancient).
+        let old_file = events_dir.join("1000-Edit.json");
+        std::fs::write(&old_file, "{}").unwrap();
+
+        // Write a "recent" event.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let new_file = events_dir.join(format!("{now_ms}-Write.json"));
+        std::fs::write(&new_file, "{}").unwrap();
+
+        let removed = prune_event_log_in(&events_dir, Duration::from_secs(3600), 1000).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!old_file.exists());
+        assert!(new_file.exists());
+    }
+
+    #[test]
+    fn prune_enforces_max_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_dir = tmp.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Create 5 recent events.
+        for i in 0..5 {
+            let file = events_dir.join(format!("{}-Edit.json", now_ms + i));
+            std::fs::write(&file, "{}").unwrap();
+        }
+
+        // Prune with max_entries = 3.
+        let removed = prune_event_log_in(&events_dir, Duration::from_secs(86400), 3).unwrap();
+
+        assert_eq!(removed, 2);
+        let remaining: Vec<_> = std::fs::read_dir(&events_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(remaining.len(), 3);
+    }
+
+    #[test]
+    fn prune_returns_zero_when_events_dir_missing() {
+        let removed =
+            prune_event_log_in(Path::new("/nonexistent/path"), Duration::from_secs(3600), 1000)
+                .unwrap();
+        assert_eq!(removed, 0);
     }
 
     #[test]

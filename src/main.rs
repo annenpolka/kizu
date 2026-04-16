@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod app;
+mod config;
 mod git;
 mod highlight;
 mod hook;
@@ -77,7 +78,7 @@ async fn main() -> Result<()> {
         }
         Some(Command::HookPostTool { agent }) => run_hook_post_tool(&agent),
         Some(Command::HookPreCommit) => run_hook_pre_commit(),
-        Some(Command::HookLogEvent) => unimplemented!("v0.2: kizu hook-log-event"),
+        Some(Command::HookLogEvent) => run_hook_log_event(),
         Some(Command::HookStop { agent }) => run_hook_stop(&agent),
     }
 }
@@ -118,6 +119,21 @@ fn run_hook_stop(agent_str: &str) -> Result<()> {
         eprint!("{}", hook::format_stop_stderr(&hits));
         std::process::exit(2);
     }
+    Ok(())
+}
+
+fn run_hook_log_event() -> Result<()> {
+    let input = hook::parse_hook_input(hook::AgentKind::ClaudeCode, std::io::stdin().lock())?;
+    let event = hook::sanitize_event(&input);
+    hook::write_event(&event)?;
+
+    // Prune old entries. TTL defaults to 24h, overridable via env var.
+    let ttl_secs: u64 = std::env::var("KIZU_EVENT_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(86400);
+    hook::prune_event_log(std::time::Duration::from_secs(ttl_secs), 1000)?;
+
     Ok(())
 }
 

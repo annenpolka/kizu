@@ -18,14 +18,12 @@ use crate::git::{DiffContent, FileDiff, FileStatus, Hunk, LineKind};
 /// every modified file.
 const SCROLL_ROW_LIMIT: usize = 2000;
 
-/// Delta-style background color for added lines. Dim enough to stay
-/// legible against a standard terminal text color but saturated enough
-/// that the eye distinguishes add vs. delete without a `+`/`-` prefix.
-/// See ADR-0014.
+/// Delta-style background color defaults. Production code reads these
+/// from [`crate::config::ColorConfig`]; the constants remain for tests
+/// that assert on default-config rendering (ADR-0014).
+#[cfg(test)]
 const BG_ADDED: Color = Color::Rgb(10, 50, 10);
-
-/// Delta-style background color for deleted lines. Paired with
-/// [`BG_ADDED`] so the two form a clear contrast.
+#[cfg(test)]
 const BG_DELETED: Color = Color::Rgb(60, 10, 10);
 
 /// Render the entire kizu frame: scroll view (main) + footer (bottom),
@@ -306,6 +304,8 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             nowrap_body_width,
             seen_hunks: &app.seen_hunks,
             hl: Some(hl),
+            bg_added: app.config.colors.bg_added_color(),
+            bg_deleted: app.config.colors.bg_deleted_color(),
         };
         let row_lines = render_row(&app.layout.rows[row_idx], &ctx);
         let mut take = row_lines.into_iter();
@@ -379,6 +379,8 @@ struct RowRenderCtx<'a> {
     nowrap_body_width: usize,
     seen_hunks: &'a std::collections::BTreeSet<(std::path::PathBuf, usize)>,
     hl: Option<&'a crate::highlight::Highlighter>,
+    bg_added: Color,
+    bg_deleted: Color,
 }
 
 /// Build the styled visual `Line`s for a single logical layout row.
@@ -446,6 +448,8 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                     width,
                     hl,
                     Some(&files[*file_idx].path),
+                    ctx.bg_added,
+                    ctx.bg_deleted,
                 ),
                 None => vec![render_diff_line(
                     line,
@@ -454,6 +458,8 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                     nowrap_body_width,
                     hl,
                     Some(&files[*file_idx].path),
+                    ctx.bg_added,
+                    ctx.bg_deleted,
                 )],
             }
         }
@@ -506,6 +512,7 @@ fn wrap_at_chars(content: &str, width: usize) -> Vec<&str> {
 /// Each visual row is padded out to `body_width` with trailing spaces
 /// so the background color extends uniformly to the right margin
 /// instead of stopping at the last content character.
+#[allow(clippy::too_many_arguments)]
 fn render_diff_line_wrapped(
     line: &crate::git::DiffLine,
     is_selected: bool,
@@ -513,14 +520,16 @@ fn render_diff_line_wrapped(
     body_width: usize,
     hl: Option<&crate::highlight::Highlighter>,
     file_path: Option<&std::path::Path>,
+    bg_added: Color,
+    bg_deleted: Color,
 ) -> Vec<Line<'static>> {
     // ADR-0014: background-color diff rendering. Focused hunks keep
     // full brightness; unfocused hunks wear `Modifier::DIM` so the
     // eye still flows to the cursor band. Context rows use the
     // terminal default inside the focus and dark-gray + DIM outside.
     let bg = match line.kind {
-        LineKind::Added => Some(BG_ADDED),
-        LineKind::Deleted => Some(BG_DELETED),
+        LineKind::Added => Some(bg_added),
+        LineKind::Deleted => Some(bg_deleted),
         LineKind::Context => None,
     };
     let base_style = match (bg, is_selected) {
@@ -710,6 +719,7 @@ fn render_hunk_header(
     Line::from(Span::styled(body, style))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_diff_line(
     line: &crate::git::DiffLine,
     is_selected: bool,
@@ -717,10 +727,12 @@ fn render_diff_line(
     body_width: usize,
     hl: Option<&crate::highlight::Highlighter>,
     file_path: Option<&std::path::Path>,
+    bg_added: Color,
+    bg_deleted: Color,
 ) -> Line<'static> {
     let bg = match line.kind {
-        LineKind::Added => Some(BG_ADDED),
-        LineKind::Deleted => Some(BG_DELETED),
+        LineKind::Added => Some(bg_added),
+        LineKind::Deleted => Some(bg_deleted),
         LineKind::Context => None,
     };
     let bar = if is_cursor {
@@ -1296,6 +1308,7 @@ mod tests {
             wrap_lines: false,
             watcher_health: crate::app::WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
+            config: crate::config::KizuConfig::default(),
         }
     }
 

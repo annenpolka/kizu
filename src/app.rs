@@ -145,6 +145,10 @@ pub struct App {
     /// Lazy-initialized syntax highlighter. Loaded on first render
     /// to avoid paying syntect's SyntaxSet load cost at startup.
     pub highlighter: std::cell::OnceCell<crate::highlight::Highlighter>,
+    /// User configuration loaded from `~/.config/kizu/config.toml`.
+    /// Controls keybindings, colors, debounce timing, editor command,
+    /// and terminal auto-split preferences.
+    pub config: crate::config::KizuConfig,
 }
 
 /// Tracks whether the underlying notify debouncers are still pushing
@@ -809,6 +813,7 @@ impl App {
     ) -> Result<Self> {
         let initial =
             diff.with_context(|| format!("initial git diff against baseline {baseline_sha}"))?;
+        let config = crate::config::load_config();
         let mut app = Self {
             root,
             git_dir,
@@ -840,6 +845,7 @@ impl App {
             wrap_lines: false,
             watcher_health: WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
+            config,
         };
         app.apply_computed_files(initial);
         Ok(app)
@@ -1162,61 +1168,54 @@ impl App {
                 self.scroll_to(self.last_row_index());
                 self.follow_mode = false;
             }
-            KeyCode::Char('f') => {
-                self.follow_restore();
-            }
-            KeyCode::Char('s') => {
-                self.open_picker();
-            }
-            // v0.2 M4 scar dispatch. `a` and `r` insert the two
-            // canned scars; the free-text `c`, hunk-revert `x`,
-            // external-editor `e`, and "seen" Space will land in
-            // later M4 slices. Picker mode is already handled
-            // upstream so these arms only fire in normal mode.
-            KeyCode::Char('a') => {
-                self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
-            }
-            KeyCode::Char('r') => {
-                self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
-            }
-            KeyCode::Char('c') => {
-                self.open_scar_comment();
-            }
-            KeyCode::Char('x') => {
-                self.open_revert_confirm();
-            }
-            KeyCode::Char(' ') => {
-                self.toggle_seen_current_hunk();
-            }
-            KeyCode::Char('/') => {
-                self.open_search_input();
-            }
-            KeyCode::Char('n') => {
-                self.search_jump_next();
-            }
-            KeyCode::Char('N') => {
-                self.search_jump_prev();
-            }
             KeyCode::Enter => {
                 self.open_file_view();
             }
-            KeyCode::Char('e') => {
-                // Read `$EDITOR` at dispatch time (not at bootstrap)
-                // so users who `export EDITOR=` mid-session pick up
-                // the new value without restarting kizu.
-                let env = std::env::var("EDITOR").ok();
-                if let Some(inv) = self.open_in_editor(env.as_deref()) {
-                    return KeyEffect::OpenEditor(inv);
+            KeyCode::Char(ch) => {
+                // Remappable keys resolved via config. Navigation
+                // keys (j/k/J/K/h/l/g/G) are handled above; these
+                // are the action keys that users can remap in
+                // ~/.config/kizu/config.toml.
+                let k = &self.config.keys;
+                if ch == k.follow {
+                    self.follow_restore();
+                } else if ch == k.picker {
+                    self.open_picker();
+                } else if ch == k.ask {
+                    self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+                } else if ch == k.reject {
+                    self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+                } else if ch == k.comment {
+                    self.open_scar_comment();
+                } else if ch == k.revert {
+                    self.open_revert_confirm();
+                } else if ch == k.seen {
+                    self.toggle_seen_current_hunk();
+                } else if ch == k.search {
+                    self.open_search_input();
+                } else if ch == k.search_next {
+                    self.search_jump_next();
+                } else if ch == k.search_prev {
+                    self.search_jump_prev();
+                } else if ch == k.editor {
+                    // Read `$EDITOR` at dispatch time (not at bootstrap)
+                    // so users who `export EDITOR=` mid-session pick up
+                    // the new value without restarting kizu.
+                    let editor_cmd = if self.config.editor.command.is_empty() {
+                        std::env::var("EDITOR").ok()
+                    } else {
+                        Some(self.config.editor.command.clone())
+                    };
+                    if let Some(inv) = self.open_in_editor(editor_cmd.as_deref()) {
+                        return KeyEffect::OpenEditor(inv);
+                    }
+                } else if ch == k.reset_baseline {
+                    return self.reset_baseline();
+                } else if ch == k.cursor_placement {
+                    self.toggle_cursor_placement();
+                } else if ch == k.wrap_toggle {
+                    self.toggle_wrap_lines();
                 }
-            }
-            KeyCode::Char('R') => {
-                return self.reset_baseline();
-            }
-            KeyCode::Char('z') => {
-                self.toggle_cursor_placement();
-            }
-            KeyCode::Char('w') => {
-                self.toggle_wrap_lines();
             }
             _ => {}
         }
@@ -1903,7 +1902,7 @@ impl App {
                 match dl.kind {
                     LineKind::Added => {
                         if new_line >= 1 && (new_line - 1) < lines.len() {
-                            line_bg.insert(new_line - 1, Color::Rgb(10, 50, 10));
+                            line_bg.insert(new_line - 1, self.config.colors.bg_added_color());
                         }
                         new_line += 1;
                     }
@@ -3142,6 +3141,7 @@ mod tests {
             wrap_lines: false,
             watcher_health: WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
+            config: crate::config::KizuConfig::default(),
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));

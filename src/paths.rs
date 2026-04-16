@@ -1,5 +1,22 @@
 use std::path::{Path, PathBuf};
 
+/// Resolve the kizu config file path.
+///
+/// - `$KIZU_CONFIG` override (for tests)
+/// - `$XDG_CONFIG_HOME/kizu/config.toml`
+/// - `~/.config/kizu/config.toml` (fallback)
+#[allow(dead_code)] // Used in M2 (config file)
+pub fn config_file() -> Option<PathBuf> {
+    if let Ok(override_path) = std::env::var("KIZU_CONFIG") {
+        return Some(PathBuf::from(override_path));
+    }
+    std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .map(|d| d.join("kizu").join("config.toml"))
+}
+
 /// Resolve the kizu state directory for session/event data.
 ///
 /// - macOS: `~/Library/Application Support/kizu/`
@@ -45,6 +62,34 @@ pub fn session_file(root: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Full path to the events directory for stream mode data.
+/// Returns `None` if the state directory cannot be resolved.
+pub fn events_dir() -> Option<PathBuf> {
+    state_dir().map(|d| d.join("events"))
+}
+
+/// Create a directory with `0700` permissions (owner-only access).
+/// Creates parent directories as needed. No-op if the directory
+/// already exists with correct permissions.
+#[cfg(unix)]
+pub fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("creating directory {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting permissions on {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("creating directory {}", path.display()))?;
+    Ok(())
+}
+
+use anyhow::Context;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +117,45 @@ mod tests {
         unsafe { std::env::remove_var("KIZU_STATE_DIR") };
         assert!(path.starts_with("/tmp/kizu-test-state/sessions/"));
         assert!(path.to_str().unwrap().ends_with(".json"));
+    }
+
+    #[test]
+    fn events_dir_with_override() {
+        unsafe { std::env::set_var("KIZU_STATE_DIR", "/tmp/kizu-test-state") };
+        let path = events_dir().unwrap();
+        unsafe { std::env::remove_var("KIZU_STATE_DIR") };
+        assert_eq!(path, PathBuf::from("/tmp/kizu-test-state/events"));
+    }
+
+    #[test]
+    fn config_file_with_override() {
+        unsafe { std::env::set_var("KIZU_CONFIG", "/tmp/kizu-test.toml") };
+        let path = config_file().unwrap();
+        unsafe { std::env::remove_var("KIZU_CONFIG") };
+        assert_eq!(path, PathBuf::from("/tmp/kizu-test.toml"));
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_with_correct_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("private_test");
+        ensure_private_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn ensure_private_dir_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("idem_test");
+        ensure_private_dir(&dir).unwrap();
+        ensure_private_dir(&dir).unwrap(); // second call should not fail
+        assert!(dir.is_dir());
     }
 }
