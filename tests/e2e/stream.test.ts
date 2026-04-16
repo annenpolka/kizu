@@ -82,6 +82,42 @@ test("stream mode shows events from hook-log-event", async () => {
   expect(view).toContain("a.rs");
 });
 
+test("Tab back from stream lands on the file from the stream event", async () => {
+  repo = createTempRepo();
+  // Two files — we want to verify that Tab back from stream mode
+  // lands on the file the stream cursor was pointing at, not just
+  // the first file.
+  repo.write("aaa.rs", "fn a() {}\n");
+  repo.write("zzz.rs", "fn z() {}\n");
+  repo.git("add", ".");
+  repo.git("commit", "-q", "-m", "seed");
+
+  session = await launchKizu({ cwd: repo.path });
+  await session.waitForText("No changes since baseline", { timeout: 10_000 });
+
+  // Edit both files to create diffs.
+  repo.write("aaa.rs", "fn a() { 1 }\n");
+  repo.write("zzz.rs", "fn z() { 2 }\n");
+
+  // Send a hook-log-event only for zzz.rs.
+  sendHookLogEvent(repo.path, "Edit", `${repo.path}/zzz.rs`);
+
+  // Wait for diff view to pick up changes.
+  await session.waitForText("zzz.rs", { timeout: 10_000 });
+
+  // Tab to stream mode — the event for zzz.rs should be visible.
+  await session.press("tab");
+  await session.waitForText("[stream]", { timeout: 5_000 });
+  await session.waitForText("zzz.rs", { timeout: 5_000 });
+
+  // Tab back to diff mode — cursor should land near zzz.rs.
+  await session.press("tab");
+  await session.waitForText("[follow]", { timeout: 5_000 });
+  const view = await session.text({ trimEnd: true });
+  // The viewport should contain zzz.rs (the file from the stream event).
+  expect(view).toContain("zzz.rs");
+});
+
 test("stream mode is not disrupted by worktree changes", async () => {
   repo = createTempRepo();
   repo.write("a.rs", "fn a() {}\n");
