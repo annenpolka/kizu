@@ -801,26 +801,32 @@ fn render_diff_line(
 
     // Try syntax highlighting. If available, produce per-token spans
     // with the token fg color + the diff bg style overlay.
+    //
+    // Widths are counted in display cells (via `unicode-width`), not
+    // chars — each kanji is 2 cells, and char-based truncation would
+    // push CJK rows past the viewport edge and smear the delta-style
+    // background color past the right margin.
     if let (Some(hl), Some(path)) = (hl, file_path) {
         let tokens = hl.highlight_line(&line.content, path);
         if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
             let mut spans = vec![bar];
-            let mut chars_emitted = 0;
+            let mut cells_emitted = 0usize;
             for token in &tokens {
-                let token_chars = token.text.chars().count();
-                let remaining = body_width.saturating_sub(chars_emitted);
+                let remaining = body_width.saturating_sub(cells_emitted);
                 if remaining == 0 {
                     break;
                 }
-                let take = token_chars.min(remaining);
-                let text: String = token.text.chars().take(take).collect();
+                let (text, token_cells) = take_cells(&token.text, remaining);
+                if text.is_empty() {
+                    break;
+                }
                 spans.push(Span::styled(text, base_style.fg(token.fg)));
-                chars_emitted += take;
+                cells_emitted += token_cells;
             }
             // Pad to body_width.
-            if chars_emitted < body_width {
+            if cells_emitted < body_width {
                 spans.push(Span::styled(
-                    " ".repeat(body_width - chars_emitted),
+                    " ".repeat(body_width - cells_emitted),
                     base_style,
                 ));
             }
@@ -829,17 +835,37 @@ fn render_diff_line(
     }
 
     // Fallback: single-span body (no highlighting or unknown extension).
-    let chunk_len = line.content.chars().count();
-    let padded_body: String = if chunk_len >= body_width {
-        line.content.chars().take(body_width).collect()
+    use unicode_width::UnicodeWidthStr;
+    let content_cells = UnicodeWidthStr::width(line.content.as_str());
+    let padded_body: String = if content_cells >= body_width {
+        let (truncated, _) = take_cells(&line.content, body_width);
+        truncated
     } else {
-        let pad = body_width - chunk_len;
+        let pad = body_width - content_cells;
         line.content
             .chars()
             .chain(std::iter::repeat_n(' ', pad))
             .collect()
     };
     Line::from(vec![bar, Span::styled(padded_body, base_style)])
+}
+
+/// Take as many leading chars from `s` as fit into `max_cells` display
+/// cells, without splitting a wide char. Returns the prefix and the
+/// number of cells actually consumed.
+fn take_cells(s: &str, max_cells: usize) -> (String, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut cells = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if cells + w > max_cells {
+            break;
+        }
+        out.push(ch);
+        cells += w;
+    }
+    (out, cells)
 }
 
 /// `HH:MM` formatted local time. Returns `--:--` when the metadata read
@@ -1600,6 +1626,37 @@ mod tests {
         assert!(
             view.contains(&long_content[90..110]),
             "expected wrapped continuation to be visible:\n{view}"
+        );
+    }
+
+    #[test]
+    fn render_diff_line_nowrap_cjk_pads_to_cell_width_not_char_count() {
+        // Fallback (no highlighter) path: 5 kanji = 5 chars = 10 cells.
+        // At body_width=20 cells the padded body must be exactly 20
+        // cells wide — not 20-5=15 pad chars tacked on (which would
+        // produce a 25-cell body and bleed past the viewport).
+        use unicode_width::UnicodeWidthStr;
+        let line = diff_line(LineKind::Added, "あいうえお");
+        let rendered = super::render_diff_line(
+            &line,
+            false,
+            false,
+            20,
+            None,
+            None,
+            Color::Rgb(10, 50, 10),
+            Color::Rgb(60, 10, 10),
+        );
+        // Skip the 5-cell left bar; the remaining spans make up the body.
+        let body_cells: usize = rendered
+            .spans
+            .iter()
+            .skip(1)
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        assert_eq!(
+            body_cells, 20,
+            "nowrap CJK body must pad to body_width in cells, got {body_cells} cells",
         );
     }
 
