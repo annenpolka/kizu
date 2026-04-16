@@ -131,6 +131,9 @@ pub fn scan_scars(paths: &[PathBuf]) -> Vec<ScarHit> {
         .expect("scar regex");
     let mut hits = Vec::new();
     for path in paths {
+        if is_documentation_file(path) {
+            continue;
+        }
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -205,6 +208,14 @@ pub fn format_stop_stderr(hits: &[ScarHit]) -> String {
     out
 }
 
+/// Returns `true` for documentation file extensions that may contain
+/// scar-like examples but should never be treated as live scars.
+fn is_documentation_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| matches!(ext, "md" | "txt" | "rst" | "adoc"))
+}
+
 /// Grep staged (index) contents of `paths` for `@kizu[...]` scars.
 /// Unlike [`scan_scars`] which reads the worktree, this reads the
 /// staged blob via `git show :<path>` so that worktree edits after
@@ -214,6 +225,9 @@ pub fn scan_scars_from_index(root: &Path, paths: &[PathBuf]) -> Vec<ScarHit> {
         .expect("scar regex");
     let mut hits = Vec::new();
     for path in paths {
+        if is_documentation_file(path) {
+            continue;
+        }
         let rel = match path.strip_prefix(root) {
             Ok(r) => r,
             Err(_) => path.as_path(),

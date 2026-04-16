@@ -516,6 +516,12 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
 fn scope_incompatible(kind: AgentKind, scope: Scope) -> Option<&'static str> {
     match (kind, scope) {
         (AgentKind::Cursor, Scope::User) => Some("Cursor only supports project-level hooks"),
+        (AgentKind::Cursor, Scope::ProjectLocal) => {
+            Some("Cursor has no local-only config; hooks.json is always committable")
+        }
+        (AgentKind::Codex, Scope::ProjectLocal) => {
+            Some("Codex has no local-only config; .codex/hooks.json is always committable")
+        }
         (AgentKind::Cline, Scope::User | Scope::ProjectLocal) => {
             Some("Cline uses file-based project hooks only")
         }
@@ -840,7 +846,7 @@ fn install_cline(project_root: &Path) -> Result<InstallReport> {
 
 fn install_gemini() -> Result<InstallReport> {
     println!("  Gemini CLI has no hook mechanism.");
-    println!("  Use: gemini --output-format stream-json -p \"...\" | kizu consume-gemini-stream");
+    println!("  Stream integration (kizu consume-gemini-stream) is planned for a future release.");
     Ok(InstallReport {
         agent: AgentKind::Gemini,
         files_modified: vec![],
