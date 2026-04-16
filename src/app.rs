@@ -1016,6 +1016,20 @@ impl App {
         }
     }
 
+    /// Seed `diff_snapshots` with the current cumulative diff for every
+    /// file in `self.files`. Called once at startup so the first stream
+    /// event correctly shows only the per-operation delta, not the
+    /// entire session's cumulative diff.
+    pub fn seed_diff_snapshots(&mut self) {
+        for file in &self.files {
+            let diff = git::diff_single_file(&self.root, &self.baseline_sha, &file.path)
+                .unwrap_or_default();
+            if !diff.is_empty() {
+                self.diff_snapshots.insert(file.path.clone(), diff);
+            }
+        }
+    }
+
     /// Re-run `git diff`, populate per-file mtimes, sort files by mtime
     /// **ascending** (oldest first → newest last), rebuild the row layout,
     /// and restore the anchor. The ascending order is intentional so that
@@ -3054,6 +3068,9 @@ pub async fn run() -> Result<()> {
         // Clean stale events from before this session so stream
         // mode starts fresh — old events can't carry diffs.
         app.clean_stale_events();
+        // Seed diff snapshots so the first stream event shows only
+        // the per-operation delta, not the entire cumulative diff.
+        app.seed_diff_snapshots();
 
         // Draw one static frame before watcher startup. On macOS the
         // PollWatcher fallback may take noticeable time to arm because it
