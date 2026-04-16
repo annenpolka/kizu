@@ -49,9 +49,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     };
 
     let input_height: u16 = if let Some((ref text, prefix)) = input_line {
-        let total_chars = prefix.chars().count() + text.chars().count() + 1; // +1 for cursor
+        use unicode_width::UnicodeWidthStr;
+        let total_width = prefix.width() + text.width() + 1; // +1 for cursor block
         let w = (area.width as usize).max(1);
-        total_chars.div_ceil(w).max(1) as u16
+        total_width.div_ceil(w).max(1) as u16
     } else {
         0
     };
@@ -108,10 +109,13 @@ fn render_input_line(frame: &mut Frame<'_>, area: Rect, prefix: &str, text: &str
     frame.render_widget(paragraph, area);
 
     // Place the terminal cursor at the text end for IME.
-    let total_chars = display.chars().count() as u16;
+    // Use display width (not char count) so CJK characters
+    // (2 cells each) don't shift the cursor to the left.
+    use unicode_width::UnicodeWidthStr;
+    let total_width = display.width() as u16;
     let w = area.width.max(1);
-    let cursor_y = area.y + total_chars / w;
-    let cursor_x = area.x + total_chars % w;
+    let cursor_y = area.y + total_width / w;
+    let cursor_x = area.x + total_width % w;
     frame.set_cursor_position((
         cursor_x.min(area.right().saturating_sub(1)),
         cursor_y.min(area.bottom().saturating_sub(1)),
