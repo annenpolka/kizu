@@ -1891,31 +1891,28 @@ impl App {
     }
 
     /// Row that "follow mode" parks the scroll cursor on: the
-    /// **file header** of the newest file (files are sorted
+    /// **last hunk header** of the newest file (files are sorted
     /// mtime-ascending, so the last file is the most recently
-    /// touched one). Landing on the header lets the user see the
-    /// file name, hunk headers, and diff body all in one viewport
-    /// — more useful than pinning to the last diff line which may
-    /// push the context above the fold.
+    /// touched one). Landing on the last @@ header lets the user
+    /// see the most recent change's context and diff body below.
     fn follow_target_row(&self) -> Option<usize> {
         if self.files.is_empty() {
             return None;
         }
         let newest = self.files.len() - 1;
-        // Find the FileHeader row for the newest file.
+        // Walk from the end to find the last HunkHeader of the newest file.
+        for (i, row) in self.layout.rows.iter().enumerate().rev() {
+            if matches!(row, RowKind::HunkHeader { file_idx, .. } if *file_idx == newest) {
+                return Some(i);
+            }
+        }
+        // Fallback: try file header, then the absolute last row.
         for (i, row) in self.layout.rows.iter().enumerate() {
             if matches!(row, RowKind::FileHeader { file_idx } if *file_idx == newest) {
                 return Some(i);
             }
         }
-        // Fallback: if no FileHeader exists (shouldn't happen in
-        // practice), try the file's first hunk, then the last row.
-        self.layout
-            .file_first_hunk
-            .last()
-            .copied()
-            .flatten()
-            .or_else(|| self.layout.rows.len().checked_sub(1))
+        self.layout.rows.len().checked_sub(1)
     }
 
     /// File index that the row at `self.scroll` belongs to.
@@ -3646,11 +3643,10 @@ mod tests {
     }
 
     #[test]
-    fn follow_target_row_is_file_header_of_newest_file() {
-        // Follow mode should park on the **file header** of the
-        // newest file so the user sees the full context of the
-        // latest change — file name, hunk headers, and diff body
-        // all visible below the cursor.
+    fn follow_target_row_is_last_hunk_header_of_newest_file() {
+        // Follow mode should park on the **last hunk header** of
+        // the newest file so the user sees the most recent @@
+        // context and the diff body below it.
         let app = fake_app(vec![
             make_file(
                 "older.rs",
@@ -3667,28 +3663,30 @@ mod tests {
             ),
         ]);
         assert!(
-            matches!(app.layout.rows[app.scroll], RowKind::FileHeader { .. }),
-            "follow target must be a FileHeader row, got {:?}",
+            matches!(app.layout.rows[app.scroll], RowKind::HunkHeader { .. }),
+            "follow target must be a HunkHeader row, got {:?}",
             app.layout.rows[app.scroll]
         );
+        // Should be the LAST hunk header (hunk at line 20), not the first.
         let newest_idx = app.files.len() - 1;
-        let header_of_newest = app
+        let last_hunk_header = app
             .layout
             .rows
             .iter()
             .enumerate()
+            .rev()
             .find_map(|(i, r)| match r {
-                RowKind::FileHeader { file_idx } if *file_idx == newest_idx => Some(i),
+                RowKind::HunkHeader { file_idx, .. } if *file_idx == newest_idx => Some(i),
                 _ => None,
             })
-            .expect("newest file must have a FileHeader");
-        assert_eq!(app.scroll, header_of_newest);
+            .expect("newest file must have a HunkHeader");
+        assert_eq!(app.scroll, last_hunk_header);
     }
 
     #[test]
-    fn follow_target_row_lands_on_header_even_for_tall_hunk() {
-        // Even with a 20-line hunk, follow should park on the file
-        // header so the user sees the full change from the top.
+    fn follow_target_row_lands_on_hunk_header_even_for_tall_hunk() {
+        // Even with a 20-line hunk, follow parks on the hunk header
+        // so the user sees the @@ context and diff body from the top.
         let huge_hunk = hunk(
             1,
             (0..20)
@@ -3697,8 +3695,8 @@ mod tests {
         );
         let app = fake_app(vec![make_file("big.rs", vec![huge_hunk], 500)]);
         assert!(
-            matches!(app.layout.rows[app.scroll], RowKind::FileHeader { .. }),
-            "follow should land on FileHeader, got {:?}",
+            matches!(app.layout.rows[app.scroll], RowKind::HunkHeader { .. }),
+            "follow should land on HunkHeader, got {:?}",
             app.layout.rows[app.scroll]
         );
     }
@@ -4397,11 +4395,10 @@ mod tests {
         assert!(!app.follow_mode);
         app.handle_key(key(KeyCode::Char('f')));
         assert!(app.follow_mode);
-        // Follow target = FileHeader of the newest file so the user
-        // sees the full change from the top.
+        // Follow target = last HunkHeader of the newest file.
         assert!(matches!(
             app.layout.rows[app.scroll],
-            RowKind::FileHeader { .. }
+            RowKind::HunkHeader { .. }
         ));
     }
 

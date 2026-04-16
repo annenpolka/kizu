@@ -697,24 +697,39 @@ fn render_hunk_header(
     is_cursor: bool,
     is_seen: bool,
 ) -> Line<'static> {
-    // Seen-mark indicator sits in front of the `@@` body. It only
-    // takes one cell and keeps the existing 5-cell left bar so
-    // diff-line alignment below the header is unchanged.
     let seen_mark = if is_seen { "• " } else { "  " };
-    let body = match &hunk.context {
-        Some(ctx) => format!(
-            "{}{seen_mark}@@ {ctx}",
-            if is_cursor { "  ▶  " } else { "     " }
-        ),
-        None => format!(
-            "{}{seen_mark}@@ -{},{} +{},{} @@",
-            if is_cursor { "  ▶  " } else { "     " },
-            hunk.old_start,
-            hunk.old_count,
+    let cursor_mark = if is_cursor { "  ▶  " } else { "     " };
+
+    // Count added/deleted lines from the actual hunk content.
+    let added: usize = hunk
+        .lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Added)
+        .count();
+    let deleted: usize = hunk
+        .lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Deleted)
+        .count();
+    let counts = format!("+{added}/-{deleted}");
+
+    // Line range: show new_start (where the change lands in the
+    // current file). For multi-line hunks, show the range end.
+    let line_range = if hunk.new_count > 1 {
+        format!(
+            "L{}-{}",
             hunk.new_start,
-            hunk.new_count
-        ),
+            hunk.new_start + hunk.new_count - 1
+        )
+    } else {
+        format!("L{}", hunk.new_start)
     };
+
+    let body = match &hunk.context {
+        Some(ctx) => format!("{cursor_mark}{seen_mark}@@ {ctx}  {line_range} {counts}"),
+        None => format!("{cursor_mark}{seen_mark}@@ {line_range} {counts}"),
+    };
+
     let mut style = Style::default().fg(Color::Cyan);
     if !is_selected {
         style = style.add_modifier(Modifier::DIM);
@@ -1399,9 +1414,14 @@ mod tests {
         )]);
         let view = render_to_string(&app, 80, 12);
         assert!(view.contains("src/foo.rs"), "missing file header:\n{view}");
+        // New hunk header format: @@ L<range> +N/-M
         assert!(
-            view.contains("@@ -10,1 +10,1 @@"),
-            "missing hunk header:\n{view}"
+            view.contains("@@ L10"),
+            "missing hunk header line range:\n{view}"
+        );
+        assert!(
+            view.contains("+1/-1"),
+            "missing hunk header counts:\n{view}"
         );
         // ADR-0014: no `+`/`-` prefix; the body text appears bare on
         // the row and the add/delete signal lives in the background.
@@ -1876,6 +1896,69 @@ mod tests {
         assert!(
             !view.contains("@@ -10,0 +10,1 @@"),
             "old hunk-range header leaked through:\n{view}"
+        );
+    }
+
+    #[test]
+    fn hunk_header_shows_line_range_and_counts() {
+        // Hunk header should display line number range and +/-
+        // counts alongside the function context.
+        let app = populated_app(vec![make_file(
+            "a.rs",
+            vec![Hunk {
+                old_start: 10,
+                old_count: 2,
+                new_start: 10,
+                new_count: 5,
+                lines: vec![
+                    diff_line(LineKind::Context, "ok"),
+                    diff_line(LineKind::Added, "new1"),
+                    diff_line(LineKind::Added, "new2"),
+                    diff_line(LineKind::Added, "new3"),
+                    diff_line(LineKind::Deleted, "old1"),
+                ],
+                context: Some("fn example()".to_string()),
+            }],
+            100,
+        )]);
+        let view = render_to_string(&app, 100, 14);
+        // Should contain the line range.
+        assert!(
+            view.contains("L10"),
+            "expected line range L10, got:\n{view}"
+        );
+        // Should contain the change counts.
+        assert!(
+            view.contains("+3/-1"),
+            "expected +3/-1 counts, got:\n{view}"
+        );
+    }
+
+    #[test]
+    fn hunk_header_shows_range_in_fallback_format() {
+        // When no function context is available, the header should
+        // still show line range and counts.
+        let app = populated_app(vec![make_file(
+            "a.rs",
+            vec![Hunk {
+                old_start: 5,
+                old_count: 1,
+                new_start: 5,
+                new_count: 3,
+                lines: vec![
+                    diff_line(LineKind::Added, "x"),
+                    diff_line(LineKind::Added, "y"),
+                    diff_line(LineKind::Deleted, "z"),
+                ],
+                context: None,
+            }],
+            100,
+        )]);
+        let view = render_to_string(&app, 100, 14);
+        assert!(view.contains("L5"), "expected line range L5, got:\n{view}");
+        assert!(
+            view.contains("+2/-1"),
+            "expected +2/-1 counts, got:\n{view}"
         );
     }
 
