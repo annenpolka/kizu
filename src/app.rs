@@ -1080,10 +1080,16 @@ impl App {
             }
             KeyCode::Char('J') => {
                 self.scroll_by(1);
+                // Snap for 1-row moves: the 150ms ease-out tween
+                // restarts on every key-repeat tick, causing visible
+                // jitter when holding J/K. Clearing the animation
+                // makes rapid single-row scrolling buttery smooth.
+                self.anim = None;
                 self.follow_mode = false;
             }
             KeyCode::Char('K') => {
                 self.scroll_by(-1);
+                self.anim = None;
                 self.follow_mode = false;
             }
             KeyCode::Char('l') => {
