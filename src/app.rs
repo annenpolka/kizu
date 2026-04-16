@@ -85,6 +85,9 @@ pub struct App {
     /// Transient `/` query composer. `Some` while the user is
     /// typing the search query; cleared on Enter (confirm) or Esc.
     pub search_input: Option<SearchInputState>,
+    /// File-view zoom state. `Some` when the user has pressed
+    /// `Enter` on a hunk and is looking at the whole file.
+    pub file_view: Option<FileViewState>,
     /// Confirmed search state (query + matches + current index).
     /// Survives across normal-mode navigation so `n` / `N` can
     /// jump between hits.
@@ -619,6 +622,28 @@ pub fn find_matches(layout: &ScrollLayout, files: &[FileDiff], query: &str) -> V
     out
 }
 
+/// Full-file zoom view entered via `Enter` on a hunk. The user
+/// sees the entire worktree file with diff-touched lines
+/// highlighted in `BG_ADDED` / `BG_DELETED`. `Esc` or `Enter`
+/// returns to the normal scroll view at the cursor position
+/// captured at entry time.
+///
+/// Navigation uses the same keys as normal mode (`j`/`k`/`J`/`K`/
+/// `g`/`G`/`Ctrl-d`/`Ctrl-u`) but addresses 1-indexed file lines
+/// instead of layout rows. Scar keys are deferred to a later
+/// slice.
+#[derive(Debug, Clone)]
+pub struct FileViewState {
+    #[allow(dead_code)]
+    pub file_idx: usize,
+    pub path: PathBuf,
+    pub return_scroll: usize,
+    pub lines: Vec<String>,
+    pub line_bg: std::collections::HashMap<usize, ratatui::style::Color>,
+    pub cursor: usize,
+    pub scroll_top: usize,
+}
+
 /// Confirmation overlay for hunk revert (`x` key). Holds the
 /// `(file_idx, hunk_idx)` captured the moment the user pressed `x`
 /// so a watcher-driven recompute while the dialog is open cannot
@@ -725,6 +750,7 @@ impl App {
             picker: None,
             scar_comment: None,
             revert_confirm: None,
+            file_view: None,
             search_input: None,
             search: None,
             seen_hunks: BTreeSet::new(),
@@ -974,6 +1000,8 @@ impl App {
         } else if self.search_input.is_some() {
             self.handle_search_input_key(key);
             KeyEffect::None
+        } else if self.file_view.is_some() {
+            self.handle_file_view_key(key)
         } else {
             self.handle_normal_key(key)
         }
@@ -1087,6 +1115,9 @@ impl App {
             }
             KeyCode::Char('N') => {
                 self.search_jump_prev();
+            }
+            KeyCode::Enter => {
+                self.open_file_view();
             }
             KeyCode::Char('e') => {
                 // Read `$EDITOR` at dispatch time (not at bootstrap)
@@ -1751,6 +1782,161 @@ impl App {
         let key = (file.path.clone(), hunk.old_start);
         if !self.seen_hunks.remove(&key) {
             self.seen_hunks.insert(key);
+        }
+    }
+
+    /// Open the full-file zoom view for the cursor's current hunk.
+    /// Reads the worktree file, builds a line_bg map from diff
+    /// hunks, and parks the viewport so the hunk's first line is
+    /// visible. No-op when the cursor is not on a text hunk, or
+    /// the file cannot be read.
+    pub fn open_file_view(&mut self) {
+        use ratatui::style::Color;
+        use std::collections::HashMap;
+
+        let Some((file_idx, _hunk_idx)) = self.current_hunk() else {
+            return;
+        };
+        let Some(file) = self.files.get(file_idx) else {
+            return;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return;
+        };
+
+        let abs = self.root.join(&file.path);
+        let content = match std::fs::read_to_string(&abs) {
+            Ok(c) => c,
+            Err(e) => {
+                self.last_error = Some(format!("file view: {e}"));
+                return;
+            }
+        };
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+
+        let mut line_bg: HashMap<usize, Color> = HashMap::new();
+        for hunk in hunks {
+            let mut new_line = hunk.new_start; // 1-indexed
+            for dl in &hunk.lines {
+                match dl.kind {
+                    LineKind::Added => {
+                        if new_line >= 1 && (new_line - 1) < lines.len() {
+                            line_bg.insert(new_line - 1, Color::Rgb(10, 50, 10));
+                        }
+                        new_line += 1;
+                    }
+                    LineKind::Context => {
+                        new_line += 1;
+                    }
+                    LineKind::Deleted => {
+                        // Deleted lines don't exist in the worktree;
+                        // they're not rendered in file view.
+                    }
+                }
+            }
+        }
+
+        // Find cursor's hunk new_start to center the initial viewport.
+        let initial_cursor = self
+            .current_hunk()
+            .and_then(|(_, hi)| hunks.get(hi))
+            .map(|h| h.new_start.saturating_sub(1))
+            .unwrap_or(0)
+            .min(lines.len().saturating_sub(1));
+
+        self.file_view = Some(FileViewState {
+            file_idx,
+            path: file.path.clone(),
+            return_scroll: self.scroll,
+            lines,
+            line_bg,
+            cursor: initial_cursor,
+            scroll_top: initial_cursor.saturating_sub(self.last_body_height.get() / 2),
+        });
+    }
+
+    /// Close the file view and restore the normal-mode cursor to
+    /// the position it was at when the user entered.
+    pub fn close_file_view(&mut self) {
+        if let Some(state) = self.file_view.take() {
+            self.scroll_to(state.return_scroll);
+        }
+    }
+
+    /// Keystroke handler for the file-view zoom mode. Supports
+    /// `Enter`/`Esc` to exit, `j`/`k`/`J`/`K` for cursor
+    /// movement, `g`/`G` for top/bottom, and `q` to quit.
+    fn handle_file_view_key(&mut self, key: KeyEvent) -> KeyEffect {
+        if matches!(key.code, KeyCode::Char('q'))
+            || (matches!(key.code, KeyCode::Char('c'))
+                && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.should_quit = true;
+            return KeyEffect::None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => {
+                    self.file_view_scroll_by(HALF_PAGE as isize);
+                    return KeyEffect::None;
+                }
+                KeyCode::Char('u') => {
+                    self.file_view_scroll_by(-(HALF_PAGE as isize));
+                    return KeyEffect::None;
+                }
+                _ => {}
+            }
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc => self.close_file_view(),
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('J') => {
+                self.file_view_scroll_by(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('K') => {
+                self.file_view_scroll_by(-1);
+            }
+            KeyCode::Char('g') => {
+                self.file_view_goto(0);
+            }
+            KeyCode::Char('G') => {
+                let last = self
+                    .file_view
+                    .as_ref()
+                    .map(|fv| fv.lines.len().saturating_sub(1))
+                    .unwrap_or(0);
+                self.file_view_goto(last);
+            }
+            _ => {}
+        }
+        KeyEffect::None
+    }
+
+    fn file_view_scroll_by(&mut self, delta: isize) {
+        let Some(fv) = self.file_view.as_mut() else {
+            return;
+        };
+        let max = fv.lines.len().saturating_sub(1);
+        let new = (fv.cursor as isize + delta).clamp(0, max as isize) as usize;
+        fv.cursor = new;
+        let vh = self.last_body_height.get();
+        if fv.cursor < fv.scroll_top {
+            fv.scroll_top = fv.cursor;
+        } else if fv.cursor >= fv.scroll_top + vh {
+            fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
+        }
+    }
+
+    fn file_view_goto(&mut self, line: usize) {
+        let Some(fv) = self.file_view.as_mut() else {
+            return;
+        };
+        let max = fv.lines.len().saturating_sub(1);
+        fv.cursor = line.min(max);
+        let vh = self.last_body_height.get();
+        if fv.cursor < fv.scroll_top {
+            fv.scroll_top = fv.cursor;
+        } else if fv.cursor >= fv.scroll_top + vh {
+            fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
         }
     }
 
@@ -2715,6 +2901,7 @@ mod tests {
             picker: None,
             scar_comment: None,
             revert_confirm: None,
+            file_view: None,
             search_input: None,
             search: None,
             seen_hunks: BTreeSet::new(),
@@ -5371,6 +5558,124 @@ mod tests {
         assert!(!app.should_quit, "q while overlay open must not quit");
         let state = app.scar_comment.as_ref().expect("still open");
         assert_eq!(state.body, "q");
+    }
+
+    // ---- M4c: Enter file-view zoom ---------------------------------
+
+    #[test]
+    fn enter_transitions_to_file_view_from_hunk() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        let before_scroll = app.scroll;
+
+        app.handle_key(key(KeyCode::Enter));
+
+        let fv = app.file_view.as_ref().expect("file view opened");
+        assert_eq!(fv.path, PathBuf::from("foo.rs"));
+        assert_eq!(fv.return_scroll, before_scroll);
+        assert_eq!(fv.lines.len(), 2, "file has 2 lines");
+        assert_eq!(fv.lines[0], "fn one() {}");
+        assert_eq!(fv.lines[1], "fn two() {}");
+        assert!(
+            fv.line_bg.contains_key(&1),
+            "line 1 (fn two) should have added bg"
+        );
+        assert!(!fv.line_bg.contains_key(&0), "line 0 is context — no bg");
+    }
+
+    #[test]
+    fn file_view_esc_returns_to_scroll_and_restores_cursor() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        let saved = app.scroll;
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.file_view.is_some());
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.file_view.is_none(), "Esc closes file view");
+        assert_eq!(app.scroll, saved, "cursor restored");
+    }
+
+    #[test]
+    fn file_view_enter_also_exits() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter)); // open
+        app.handle_key(key(KeyCode::Enter)); // close
+        assert!(app.file_view.is_none());
+    }
+
+    #[test]
+    fn file_view_j_k_move_cursor() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) =
+            revert_app_with_real_repo(&tmp, "foo.rs", "a\nb\nc\n", "a\nb\nc\nd\n");
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter));
+        let start = app.file_view.as_ref().unwrap().cursor;
+
+        app.handle_key(key(KeyCode::Char('j')));
+        let after_j = app.file_view.as_ref().unwrap().cursor;
+        assert_eq!(after_j, (start + 1).min(3));
+
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, start);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn file_view_g_goes_to_top_and_G_to_bottom() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) =
+            revert_app_with_real_repo(&tmp, "foo.rs", "a\nb\nc\n", "a\nb\nc\nd\n");
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, 3); // 4 lines, 0-indexed last = 3
+
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.file_view.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn enter_is_noop_on_file_header_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("header");
+        app.scroll_to(header_row);
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.file_view.is_none());
     }
 
     // ---- M4b slice 1: `/` search + first-match jump ---------------

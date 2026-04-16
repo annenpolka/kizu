@@ -36,7 +36,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     let main = chunks[0];
     let footer = chunks[1];
 
-    if app.files.is_empty() {
+    if let Some(fv) = app.file_view.as_ref() {
+        render_file_view(frame, main, fv);
+    } else if app.files.is_empty() {
         render_empty(frame, main, app);
     } else {
         render_scroll(frame, main, app);
@@ -612,6 +614,52 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(p, mid);
 }
 
+fn render_file_view(frame: &mut Frame<'_>, area: Rect, fv: &crate::app::FileViewState) {
+    let height = area.height as usize;
+    let width = area.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+
+    for i in 0..height {
+        let line_idx = fv.scroll_top + i;
+        if line_idx >= fv.lines.len() {
+            lines.push(Line::from(Span::styled(
+                "~",
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+        let is_cursor = line_idx == fv.cursor;
+        let bar = if is_cursor {
+            Span::styled(
+                "  ▶  ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("     ")
+        };
+
+        let content = &fv.lines[line_idx];
+        let body_width = width.saturating_sub(5).max(1);
+        let padded: String = if content.len() >= body_width {
+            content[..body_width].to_string()
+        } else {
+            let pad = body_width - content.len();
+            format!("{content}{}", " ".repeat(pad))
+        };
+
+        let body_style = if let Some(&bg) = fv.line_bg.get(&line_idx) {
+            Style::default().bg(bg)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![bar, Span::styled(padded, body_style)]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Pre-styled spans for the four "static" pieces of the status bar.
     let dim = Style::default().fg(Color::DarkGray);
@@ -626,6 +674,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("[revert?]", Color::Red)
     } else if app.search_input.is_some() {
         ("[search]", Color::Yellow)
+    } else if app.file_view.is_some() {
+        ("[file view]", Color::Cyan)
     } else if app.follow_mode {
         ("[follow]", Color::Green)
     } else {
@@ -660,6 +710,22 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("cancel", dim));
+    } else if let Some(fv) = app.file_view.as_ref() {
+        spans.push(sep());
+        spans.push(Span::styled(
+            fv.path.display().to_string(),
+            Style::default().fg(Color::Cyan).add_modifier(bold),
+        ));
+        spans.push(Span::styled(
+            format!(" [{}/{}]", fv.cursor + 1, fv.lines.len()),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(sep());
+        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
+        spans.push(Span::styled("/", dim));
+        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("back", dim));
     } else if let Some(input) = app.search_input.as_ref() {
         // `/`-composer footer: echo the query-so-far inline.
         spans.push(sep());
@@ -994,6 +1060,7 @@ mod tests {
             picker: None,
             scar_comment: None,
             revert_confirm: None,
+            file_view: None,
             search_input: None,
             search: None,
             seen_hunks: std::collections::BTreeSet::new(),
