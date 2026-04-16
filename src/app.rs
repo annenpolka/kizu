@@ -79,6 +79,9 @@ pub struct App {
     /// Free-text scar input overlay. `Some` when the user has pressed
     /// `c` on a scar-able row and is composing the comment body.
     pub scar_comment: Option<ScarCommentState>,
+    /// Hunk-revert confirmation overlay. `Some` when the user has
+    /// pressed `x` on a hunk and is being asked `(y/N)`.
+    pub revert_confirm: Option<RevertConfirmState>,
     pub follow_mode: bool,
     /// Set when the most recent `compute_diff` failed. Cleared on success.
     pub last_error: Option<String>,
@@ -444,6 +447,19 @@ pub struct ScarCommentState {
     pub body: String,
 }
 
+/// Confirmation overlay for hunk revert (`x` key). Holds the
+/// `(file_idx, hunk_idx)` captured the moment the user pressed `x`
+/// so a watcher-driven recompute while the dialog is open cannot
+/// re-target the operation. `y`/`Y`/`Enter` confirms and runs
+/// `git apply --reverse`; any other key closes the overlay without
+/// touching the worktree. See plans/v0.2.md M4 Decision Log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertConfirmState {
+    pub file_idx: usize,
+    pub hunk_idx: usize,
+    pub file_path: PathBuf,
+}
+
 /// Single-shot easing state for the viewport's top-row tween.
 ///
 /// The tween sources its start point from `from` (captured at the moment
@@ -536,6 +552,7 @@ impl App {
             anchor: None,
             picker: None,
             scar_comment: None,
+            revert_confirm: None,
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -776,6 +793,9 @@ impl App {
         } else if self.scar_comment.is_some() {
             self.handle_scar_comment_key(key);
             KeyEffect::None
+        } else if self.revert_confirm.is_some() {
+            self.handle_revert_confirm_key(key);
+            KeyEffect::None
         } else {
             self.handle_normal_key(key)
         }
@@ -874,6 +894,9 @@ impl App {
             }
             KeyCode::Char('c') => {
                 self.open_scar_comment();
+            }
+            KeyCode::Char('x') => {
+                self.open_revert_confirm();
             }
             KeyCode::Char('R') => {
                 return self.reset_baseline();
@@ -1505,6 +1528,72 @@ impl App {
             crate::scar::insert_scar(&state.target_path, state.target_line, ScarKind::Free, body)
         {
             self.last_error = Some(format!("scar: {err:#}"));
+        }
+    }
+
+    /// Enter the hunk-revert confirmation overlay. No-op when the
+    /// cursor is not inside a diff hunk (file headers, spacers,
+    /// binary notices) or when the enclosing file is not text.
+    pub fn open_revert_confirm(&mut self) {
+        let Some((file_idx, hunk_idx)) = self.current_hunk() else {
+            return;
+        };
+        let Some(file) = self.files.get(file_idx) else {
+            return;
+        };
+        if !matches!(file.content, DiffContent::Text(_)) {
+            return;
+        }
+        self.revert_confirm = Some(RevertConfirmState {
+            file_idx,
+            hunk_idx,
+            file_path: file.path.clone(),
+        });
+    }
+
+    /// Abort the revert overlay without touching the worktree.
+    pub fn close_revert_confirm(&mut self) {
+        self.revert_confirm = None;
+    }
+
+    /// Commit the revert: build a single-hunk patch from the
+    /// captured `(file_idx, hunk_idx)` and run
+    /// `git apply --reverse`. Closes the overlay unconditionally;
+    /// write failures surface on `last_error` with the `revert:`
+    /// prefix so the footer flags them.
+    pub fn confirm_revert(&mut self) {
+        let Some(state) = self.revert_confirm.take() else {
+            return;
+        };
+        let Some(file) = self.files.get(state.file_idx) else {
+            return;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return;
+        };
+        let Some(hunk) = hunks.get(state.hunk_idx) else {
+            return;
+        };
+        let patch = git::build_hunk_patch(&state.file_path, hunk);
+        if let Err(err) = git::revert_hunk(&self.root, &patch) {
+            self.last_error = Some(format!("revert: {err:#}"));
+        }
+    }
+
+    /// Keystroke handler for the revert confirmation overlay.
+    /// `y` / `Y` / `Enter` confirms; every other key (including
+    /// `n` / `N` / `Esc` and stray navigation keys) cancels. This
+    /// is intentional — the overlay is a hard "did you mean to do
+    /// this?" gate, and any ambiguous input should bias toward
+    /// "no" so the user's work is preserved.
+    fn handle_revert_confirm_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.close_revert_confirm();
+            return;
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_revert(),
+            _ => self.close_revert_confirm(),
         }
     }
 
@@ -2201,6 +2290,7 @@ mod tests {
             anchor: None,
             picker: None,
             scar_comment: None,
+            revert_confirm: None,
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -4739,10 +4829,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Enter));
 
-        assert!(
-            app.scar_comment.is_none(),
-            "commit closes the overlay"
-        );
+        assert!(app.scar_comment.is_none(), "commit closes the overlay");
         let after = std::fs::read_to_string(tmp.path().join("commit.rs")).expect("read");
         assert_eq!(
             after, "fn one() {}\n// @kizu[free]: why two?\nfn two() {}\n",
@@ -4765,7 +4852,10 @@ mod tests {
         app.handle_key(key(KeyCode::Char('c')));
         app.handle_key(key(KeyCode::Enter));
 
-        assert!(app.scar_comment.is_none(), "empty commit closes the overlay");
+        assert!(
+            app.scar_comment.is_none(),
+            "empty commit closes the overlay"
+        );
         let after = std::fs::read_to_string(tmp.path().join("empty.rs")).expect("read");
         assert_eq!(after, original, "empty body must not write a blank scar");
     }
@@ -4791,6 +4881,211 @@ mod tests {
         assert!(!app.should_quit, "q while overlay open must not quit");
         let state = app.scar_comment.as_ref().expect("still open");
         assert_eq!(state.body, "q");
+    }
+
+    // ---- M4 slice 4: `x` hunk revert confirmation dialog ----------
+
+    /// Build a real git repo in `tmp` with a single committed file,
+    /// modify it so there's a one-line diff, bootstrap an App
+    /// against it, and return both the App and the worktree file
+    /// path. Lets `x`-key tests exercise the real `git apply
+    /// --reverse` path end-to-end.
+    fn revert_app_with_real_repo(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        committed: &str,
+        modified: &str,
+    ) -> (App, PathBuf) {
+        use std::process::Command;
+        let repo = tmp.path();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "--quiet", "--initial-branch=main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "kizu test"]);
+
+        let abs = repo.join(rel_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
+        }
+        std::fs::write(&abs, committed).expect("seed");
+        run(&["add", rel_path]);
+        run(&["commit", "--quiet", "-m", "seed"]);
+        std::fs::write(&abs, modified).expect("modify");
+
+        let app = App::bootstrap(repo.to_path_buf()).expect("bootstrap");
+        (app, abs)
+    }
+
+    #[test]
+    fn handle_key_x_opens_revert_confirm_overlay_without_touching_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('x')));
+
+        let state = app
+            .revert_confirm
+            .as_ref()
+            .expect("x must open the confirmation overlay");
+        assert_eq!(state.file_path, PathBuf::from("foo.rs"));
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\nfn two() {}\n",
+            "opening the overlay must not touch the file"
+        );
+    }
+
+    #[test]
+    fn revert_confirm_n_cancels_without_reverting() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert!(app.revert_confirm.is_none(), "`n` must close the overlay");
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\nfn two() {}\n",
+            "`n` must not touch the worktree"
+        );
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn revert_confirm_esc_cancels_without_reverting() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.revert_confirm.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\nfn two() {}\n",
+            "Esc must not touch the worktree"
+        );
+    }
+
+    #[test]
+    fn revert_confirm_y_reverts_hunk_on_disk() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert!(
+            app.revert_confirm.is_none(),
+            "confirm must close the overlay"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\n",
+            "`y` must run git apply --reverse on the target hunk"
+        );
+        assert!(
+            app.last_error.is_none(),
+            "successful revert leaves last_error clean"
+        );
+    }
+
+    #[test]
+    fn revert_confirm_enter_also_confirms() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.revert_confirm.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&abs).expect("read"),
+            "fn one() {}\n"
+        );
+    }
+
+    #[test]
+    fn handle_key_x_on_file_header_row_is_noop() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        let file_header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("file header exists");
+        app.scroll_to(file_header_row);
+
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert!(
+            app.revert_confirm.is_none(),
+            "x on the file header must not open the overlay"
+        );
+    }
+
+    #[test]
+    fn normal_keys_are_inert_while_revert_confirm_overlay_is_open() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('x')));
+
+        // `q` while the overlay is open must CANCEL the dialog, not quit.
+        app.handle_key(key(KeyCode::Char('q')));
+
+        assert!(!app.should_quit, "q while overlay open must not quit");
+        assert!(
+            app.revert_confirm.is_none(),
+            "any key other than y/Y/Enter closes the dialog"
+        );
     }
 
     #[test]

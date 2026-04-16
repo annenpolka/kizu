@@ -602,6 +602,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("[picker]", Color::Magenta)
     } else if app.scar_comment.is_some() {
         ("[scar]", Color::Magenta)
+    } else if app.revert_confirm.is_some() {
+        ("[revert?]", Color::Red)
     } else if app.follow_mode {
         ("[follow]", Color::Green)
     } else {
@@ -636,6 +638,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("cancel", dim));
+    } else if let Some(state) = app.revert_confirm.as_ref() {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("revert hunk in {} ?", state.file_path.display()),
+            Style::default().fg(Color::Red).add_modifier(bold),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("(y/N)", Style::default().fg(Color::Yellow)));
     } else if let Some(state) = app.scar_comment.as_ref() {
         // Free-text scar composer. The body is rendered inline so
         // the user sees their own typing directly in the footer.
@@ -941,6 +951,7 @@ mod tests {
             anchor: None,
             picker: None,
             scar_comment: None,
+            revert_confirm: None,
             follow_mode: true,
             last_error: None,
             input_health: None,
