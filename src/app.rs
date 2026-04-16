@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -191,6 +191,51 @@ pub enum KeyEffect {
     /// the watcher would stay pinned to the session's startup
     /// branch after `R`.
     ReconfigureWatcher,
+    /// The user pressed `e` on a scar-able row — the event loop
+    /// must suspend the ratatui terminal, spawn the resolved
+    /// editor, wait for it, and then re-enter the alternate screen.
+    /// The `EditorInvocation` carries a fully-resolved
+    /// `(program, args)` pair so the event loop does not need to
+    /// re-read `$EDITOR`.
+    OpenEditor(EditorInvocation),
+}
+
+/// Fully-resolved external-editor invocation. Produced inside
+/// [`App::open_in_editor`] via [`build_editor_invocation`] so the
+/// event loop can spawn the editor with no further parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorInvocation {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// Build an [`EditorInvocation`] from the user's `$EDITOR` value.
+///
+/// `$EDITOR` is split on whitespace (no shell quoting — matching
+/// `git`'s `GIT_EDITOR` conventions for MVP). The first token is
+/// the program; any remaining tokens are kept as leading args.
+/// The trailing two args are always `+<line>` and the absolute
+/// file path, so common editors (`vim`, `nvim`, `nano`, `emacs`,
+/// `code --wait`) land the cursor on the correct line.
+///
+/// Returns `None` when `editor_env` is `None` or empty / all
+/// whitespace, so callers get a single consistent "no editor
+/// configured → no-op" path.
+pub fn build_editor_invocation(
+    editor_env: Option<&str>,
+    line: usize,
+    file: &Path,
+) -> Option<EditorInvocation> {
+    let env = editor_env?.trim();
+    if env.is_empty() {
+        return None;
+    }
+    let mut parts = env.split_whitespace().map(String::from);
+    let program = parts.next()?;
+    let mut args: Vec<String> = parts.collect();
+    args.push(format!("+{line}"));
+    args.push(file.display().to_string());
+    Some(EditorInvocation { program, args })
 }
 
 /// Two ways the renderer can park the cursor inside the viewport.
@@ -898,6 +943,15 @@ impl App {
             KeyCode::Char('x') => {
                 self.open_revert_confirm();
             }
+            KeyCode::Char('e') => {
+                // Read `$EDITOR` at dispatch time (not at bootstrap)
+                // so users who `export EDITOR=` mid-session pick up
+                // the new value without restarting kizu.
+                let env = std::env::var("EDITOR").ok();
+                if let Some(inv) = self.open_in_editor(env.as_deref()) {
+                    return KeyEffect::OpenEditor(inv);
+                }
+            }
             KeyCode::Char('R') => {
                 return self.reset_baseline();
             }
@@ -1531,6 +1585,17 @@ impl App {
         }
     }
 
+    /// Resolve the cursor's current target (path + 1-indexed line)
+    /// into an [`EditorInvocation`], reading the user's `$EDITOR`
+    /// preference from `editor_env`. Returns `None` when the cursor
+    /// is not on a scar-able row **or** the environment has no
+    /// editor configured — in either case the `e` key should be a
+    /// silent no-op.
+    pub fn open_in_editor(&self, editor_env: Option<&str>) -> Option<EditorInvocation> {
+        let (path, line) = self.scar_target_line()?;
+        build_editor_invocation(editor_env, line, &path)
+    }
+
     /// Enter the hunk-revert confirmation overlay. No-op when the
     /// cursor is not inside a diff hunk (file headers, spacers,
     /// binary notices) or when the enclosing file is not text.
@@ -2139,7 +2204,14 @@ async fn run_loop(
                     Some(Ok(Event::Key(key))) => {
                         app.input_health = None;
                         let effect = app.handle_key(key);
-                        apply_key_effect(effect, app, watch);
+                        match effect {
+                            KeyEffect::OpenEditor(inv) => {
+                                if let Err(err) = run_external_editor(terminal, inv) {
+                                    app.last_error = Some(format!("editor: {err:#}"));
+                                }
+                            }
+                            other => apply_key_effect(other, app, watch),
+                        }
                     }
                     Some(Ok(_)) => {
                         app.input_health = None;
@@ -2201,7 +2273,72 @@ fn apply_key_effect(effect: KeyEffect, app: &App, watch: &watcher::WatchHandle) 
         KeyEffect::ReconfigureWatcher => {
             watch.update_current_branch_ref(app.current_branch_ref.as_deref());
         }
+        KeyEffect::OpenEditor(_) => {
+            // Handled inline inside `run_loop`: the editor
+            // spawn needs mutable access to the terminal for the
+            // suspend/resume dance, which this `&App` /
+            // `&WatchHandle` helper cannot provide. Any
+            // `OpenEditor` that reaches this arm is a caller
+            // bug.
+            debug_assert!(
+                false,
+                "OpenEditor must be handled by run_loop, not apply_key_effect"
+            );
+        }
     }
+}
+
+/// Suspend the ratatui terminal, run an external editor
+/// synchronously, then re-enter the alternate screen and force a
+/// full repaint on the next draw tick. Blocks the event loop for
+/// the editor's lifetime — intentional, because the user is
+/// inside the editor anyway and no diff-view update would be
+/// visible under it.
+fn run_external_editor(
+    terminal: &mut ratatui::DefaultTerminal,
+    invocation: EditorInvocation,
+) -> Result<()> {
+    use crossterm::{
+        ExecutableCommand,
+        event::{DisableBracketedPaste, EnableBracketedPaste},
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    };
+    use std::io::stdout;
+
+    // Tear down the ratatui terminal state so the child editor
+    // sees a plain cooked terminal. Errors here are surfaced —
+    // half-suspended state is worse than not launching the editor
+    // at all.
+    disable_raw_mode().context("disable raw mode before editor")?;
+    let mut out = stdout();
+    out.execute(LeaveAlternateScreen)
+        .context("leave alternate screen before editor")?;
+    out.execute(DisableBracketedPaste).ok();
+
+    let status = std::process::Command::new(&invocation.program)
+        .args(&invocation.args)
+        .status()
+        .with_context(|| format!("spawning editor `{}`", invocation.program));
+
+    // Always re-arm the alternate screen + raw mode even if the
+    // spawn itself failed. Otherwise a mistyped `$EDITOR` would
+    // leave the user stranded at a raw-mode prompt.
+    enable_raw_mode().context("re-enable raw mode after editor")?;
+    stdout()
+        .execute(EnterAlternateScreen)
+        .context("re-enter alternate screen after editor")?;
+    stdout().execute(EnableBracketedPaste).ok();
+    terminal.clear().ok();
+
+    let status = status?;
+    if !status.success() {
+        return Err(anyhow!(
+            "editor `{}` exited with status {}",
+            invocation.program,
+            status
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4881,6 +5018,104 @@ mod tests {
         assert!(!app.should_quit, "q while overlay open must not quit");
         let state = app.scar_comment.as_ref().expect("still open");
         assert_eq!(state.body, "q");
+    }
+
+    // ---- M4 slice 5: `e` external editor --------------------------
+
+    #[test]
+    fn build_editor_invocation_parses_bare_editor_name() {
+        let inv = build_editor_invocation(Some("vim"), 42, Path::new("/tmp/foo.rs"))
+            .expect("some invocation");
+        assert_eq!(inv.program, "vim");
+        assert_eq!(inv.args, vec!["+42", "/tmp/foo.rs"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_preserves_leading_editor_args() {
+        // `$EDITOR=nvim -f` (used to run nvim non-detached from
+        // `git commit` etc.) must keep `-f` on the front of the
+        // args list.
+        let inv = build_editor_invocation(Some("nvim -f"), 7, Path::new("x.rs")).unwrap();
+        assert_eq!(inv.program, "nvim");
+        assert_eq!(inv.args, vec!["-f", "+7", "x.rs"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_passes_multi_flag_editors() {
+        // `code --wait --new-window` → first token is program,
+        // the two flags + line + file follow.
+        let inv = build_editor_invocation(Some("code --wait --new-window"), 1, Path::new("a.rs"))
+            .unwrap();
+        assert_eq!(inv.program, "code");
+        assert_eq!(inv.args, vec!["--wait", "--new-window", "+1", "a.rs"]);
+    }
+
+    #[test]
+    fn build_editor_invocation_returns_none_when_env_is_unset() {
+        assert!(build_editor_invocation(None, 1, Path::new("x.rs")).is_none());
+    }
+
+    #[test]
+    fn build_editor_invocation_returns_none_when_env_is_blank() {
+        assert!(build_editor_invocation(Some("   "), 1, Path::new("x.rs")).is_none());
+        assert!(build_editor_invocation(Some(""), 1, Path::new("x.rs")).is_none());
+    }
+
+    #[test]
+    fn open_in_editor_pairs_cursor_target_line_with_env_program() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/bar.rs",
+            "a\nb\n",
+            2,
+            vec![diff_line(LineKind::Added, "b")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        let inv = app.open_in_editor(Some("vim")).expect("invocation");
+        assert_eq!(inv.program, "vim");
+        assert_eq!(inv.args.len(), 2);
+        assert_eq!(inv.args[0], "+2");
+        assert_eq!(
+            inv.args[1],
+            tmp.path().join("src/bar.rs").display().to_string()
+        );
+    }
+
+    #[test]
+    fn open_in_editor_returns_none_when_cursor_is_on_file_header() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "lib.rs",
+            "x\n",
+            1,
+            vec![diff_line(LineKind::Added, "x")],
+        );
+        let header = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("header");
+        app.scroll_to(header);
+
+        assert!(app.open_in_editor(Some("vim")).is_none());
+    }
+
+    #[test]
+    fn open_in_editor_returns_none_when_env_is_empty() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "a.rs",
+            "x\n",
+            1,
+            vec![diff_line(LineKind::Added, "x")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        assert!(app.open_in_editor(None).is_none());
     }
 
     // ---- M4 slice 4: `x` hunk revert confirmation dialog ----------
