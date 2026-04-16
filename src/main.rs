@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 mod app;
 mod git;
+mod hook;
 mod scar;
 mod ui;
 mod watcher;
@@ -20,16 +21,22 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Initialize Claude Code hooks in .claude/settings.json (v0.2)
+    /// Initialize agent hooks (v0.2)
     Init,
-    /// Remove Claude Code hooks (v0.2)
+    /// Remove agent hooks (v0.2)
     Teardown,
-    /// PostToolUse hook entry: synchronous single-file scar grep (v0.2)
-    HookPostTool,
-    /// PostToolUse hook entry: async event log writer for stream mode (v0.2)
+    /// PostToolUse hook: scan the edited file for @kizu scars
+    HookPostTool {
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+    },
+    /// PostToolUse hook: async event log writer for stream mode (v0.2)
     HookLogEvent,
-    /// Stop hook entry: detect outstanding @kizu[*]: scars (v0.2)
-    HookStop,
+    /// Stop hook: block if unresolved @kizu scars remain
+    HookStop {
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -40,8 +47,47 @@ async fn main() -> Result<()> {
         None => app::run().await,
         Some(Command::Init) => unimplemented!("v0.2: kizu init"),
         Some(Command::Teardown) => unimplemented!("v0.2: kizu teardown"),
-        Some(Command::HookPostTool) => unimplemented!("v0.2: kizu hook-post-tool"),
+        Some(Command::HookPostTool { agent }) => run_hook_post_tool(&agent),
         Some(Command::HookLogEvent) => unimplemented!("v0.2: kizu hook-log-event"),
-        Some(Command::HookStop) => unimplemented!("v0.2: kizu hook-stop"),
+        Some(Command::HookStop { agent }) => run_hook_stop(&agent),
     }
+}
+
+fn run_hook_post_tool(agent_str: &str) -> Result<()> {
+    let agent = hook::AgentKind::from_str(agent_str)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent: {agent_str}"))?;
+    let input = hook::parse_hook_input(agent, std::io::stdin().lock())?;
+
+    if input.file_paths.is_empty() {
+        return Ok(());
+    }
+
+    let hits = hook::scan_scars(&input.file_paths);
+    if let Some(json) = hook::format_additional_context(&hits) {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn run_hook_stop(agent_str: &str) -> Result<()> {
+    let agent = hook::AgentKind::from_str(agent_str)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent: {agent_str}"))?;
+    let input = hook::parse_hook_input(agent, std::io::stdin().lock())?;
+
+    if input.stop_hook_active {
+        return Ok(());
+    }
+
+    let cwd = input
+        .cwd
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let root = git::find_root(&cwd)?;
+    let changed = hook::enumerate_changed_files(&root)?;
+    let hits = hook::scan_scars(&changed);
+
+    if !hits.is_empty() {
+        eprint!("{}", hook::format_stop_stderr(&hits));
+        std::process::exit(2);
+    }
+    Ok(())
 }

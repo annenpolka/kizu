@@ -751,6 +751,7 @@ dependencies = [
  "notify",
  "notify-debouncer-full",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "syntect",
