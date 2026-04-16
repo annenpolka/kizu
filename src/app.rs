@@ -20,11 +20,14 @@ const HALF_PAGE: usize = 12;
 
 /// Canned scar body bound to the `a` key — "ask". The `@review:`
 /// marker itself is added by [`crate::scar::CommentSyntax::render`],
-/// so this constant holds *just the human message*.
-pub(crate) const SCAR_TEXT_ASK: &str = "この変更について説明して";
+/// so this constant holds *just the instruction text*. Plain English
+/// imperatives travel across agents (Claude Code / Codex / Cursor /
+/// Gemini) without translation layers — the scar is read by the
+/// agent as part of the source file itself.
+pub(crate) const SCAR_TEXT_ASK: &str = "explain this change";
 
 /// Canned scar body bound to the `r` key — "reject".
-pub(crate) const SCAR_TEXT_REJECT: &str = "この変更をやめて";
+pub(crate) const SCAR_TEXT_REJECT: &str = "revert this change";
 
 /// Top-level application state. Single-threaded, mutated by the event loop
 /// via `&mut self` (we run on tokio's `current_thread` flavor — see ADR-0003).
@@ -4273,7 +4276,6 @@ mod tests {
             "wrap toggle must clear scroll animation to avoid cross-coordinate tween"
         );
     }
-// @review: この変更について説明して
 
     // ---- M4: scar dispatch (a / r canned insertion) -----------------
 
@@ -4338,7 +4340,7 @@ mod tests {
 
         let after = std::fs::read_to_string(tmp.path().join("src/main.rs")).expect("read back");
         assert_eq!(
-            after, "fn one() {}\n// @review: この変更について説明して\nfn two() {}\n",
+            after, "fn one() {}\n// @review: explain this change\nfn two() {}\n",
             "`a` key must insert the canned ask scar above the cursor row",
         );
         assert!(
@@ -4363,7 +4365,7 @@ mod tests {
 
         let after = std::fs::read_to_string(tmp.path().join("auth.py")).expect("read back");
         assert_eq!(
-            after, "def main():\n# @review: この変更をやめて\n    return 1\n",
+            after, "def main():\n# @review: revert this change\n    return 1\n",
             "`r` key must insert the canned reject scar using python # syntax",
         );
     }
