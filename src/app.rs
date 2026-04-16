@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -82,6 +82,14 @@ pub struct App {
     /// Hunk-revert confirmation overlay. `Some` when the user has
     /// pressed `x` on a hunk and is being asked `(y/N)`.
     pub revert_confirm: Option<RevertConfirmState>,
+    /// "Seen" marks for hunks the user has visually reviewed and
+    /// wants to hide from the attention surface. Keyed by
+    /// `(relative file path, hunk.old_start)` so the mark survives
+    /// a watcher-driven `compute_diff` as long as the hunk's
+    /// pre-image anchor doesn't move — same fingerprint used by
+    /// [`HunkAnchor`]. Space toggles; nothing is written to disk
+    /// (see plans/v0.2.md M4).
+    pub seen_hunks: BTreeSet<(PathBuf, usize)>,
     pub follow_mode: bool,
     /// Set when the most recent `compute_diff` failed. Cleared on success.
     pub last_error: Option<String>,
@@ -598,6 +606,7 @@ impl App {
             picker: None,
             scar_comment: None,
             revert_confirm: None,
+            seen_hunks: BTreeSet::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -942,6 +951,9 @@ impl App {
             }
             KeyCode::Char('x') => {
                 self.open_revert_confirm();
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_seen_current_hunk();
             }
             KeyCode::Char('e') => {
                 // Read `$EDITOR` at dispatch time (not at bootstrap)
@@ -1583,6 +1595,47 @@ impl App {
         {
             self.last_error = Some(format!("scar: {err:#}"));
         }
+    }
+
+    /// Toggle the "seen" mark on the hunk the cursor is currently
+    /// inside. No-op when the cursor is on a file header, spacer,
+    /// binary notice, or any other row with no enclosing hunk.
+    /// Pure state change — nothing is written to disk (the mark
+    /// lives only for the session, see plans/v0.2.md M4).
+    pub fn toggle_seen_current_hunk(&mut self) {
+        let Some((file_idx, hunk_idx)) = self.current_hunk() else {
+            return;
+        };
+        let Some(file) = self.files.get(file_idx) else {
+            return;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return;
+        };
+        let Some(hunk) = hunks.get(hunk_idx) else {
+            return;
+        };
+        let key = (file.path.clone(), hunk.old_start);
+        if !self.seen_hunks.remove(&key) {
+            self.seen_hunks.insert(key);
+        }
+    }
+
+    /// Read helper: does `(file_idx, hunk_idx)` currently carry a
+    /// "seen" mark? Used by the renderer to decorate the hunk
+    /// header without learning the fingerprint scheme.
+    pub fn hunk_is_seen(&self, file_idx: usize, hunk_idx: usize) -> bool {
+        let Some(file) = self.files.get(file_idx) else {
+            return false;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return false;
+        };
+        let Some(hunk) = hunks.get(hunk_idx) else {
+            return false;
+        };
+        self.seen_hunks
+            .contains(&(file.path.clone(), hunk.old_start))
     }
 
     /// Resolve the cursor's current target (path + 1-indexed line)
@@ -2428,6 +2481,7 @@ mod tests {
             picker: None,
             scar_comment: None,
             revert_confirm: None,
+            seen_hunks: BTreeSet::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -3373,21 +3427,84 @@ mod tests {
     }
 
     #[test]
-    fn space_is_currently_unbound_in_normal_mode() {
-        // Guards the intentional gap between v0.1 (Space = picker)
-        // and the later M4 slice that will bind Space to the scar
-        // "seen" mark. Until then Space is a no-op so an accidental
-        // press while the user's thumb remembers v0.1 doesn't pop
-        // the picker anymore.
+    fn space_toggles_seen_mark_on_current_hunk() {
+        // M4 slice 6: Space flips the cursor's enclosing hunk
+        // into and out of the "seen" set. Pure TUI state — no
+        // file write, no cursor movement, no picker.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
             100,
         )]);
+        cursor_on_nth_diff_line(&mut app, 0);
         let before_scroll = app.scroll;
+
         app.handle_key(key(KeyCode::Char(' ')));
+
+        assert!(
+            app.hunk_is_seen(0, 0),
+            "Space must toggle the current hunk into the seen set"
+        );
         assert!(app.picker.is_none(), "Space must not open the picker");
         assert_eq!(app.scroll, before_scroll, "Space must not move cursor");
+
+        // Second press removes the mark.
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(
+            !app.hunk_is_seen(0, 0),
+            "a second Space must remove the seen mark"
+        );
+    }
+
+    #[test]
+    fn space_on_file_header_row_is_noop() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("header");
+        app.scroll_to(header_row);
+
+        app.handle_key(key(KeyCode::Char(' ')));
+
+        assert!(
+            app.seen_hunks.is_empty(),
+            "file-header Space must not add anything to seen_hunks"
+        );
+    }
+
+    #[test]
+    fn seen_mark_persists_across_a_recompute_that_preserves_hunk_old_start() {
+        // seen_hunks is keyed by (path, hunk.old_start) so a
+        // watcher-driven recompute that rebuilds the FileDiff
+        // list without moving the hunk's pre-image anchor must
+        // leave the mark in place.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 0));
+
+        let fresh = vec![make_file(
+            "a.rs",
+            vec![hunk(42, vec![diff_line(LineKind::Added, "y")])],
+            100,
+        )];
+        app.apply_computed_files(fresh);
+
+        assert!(
+            app.hunk_is_seen(0, 0),
+            "recompute that preserves hunk.old_start must preserve the seen mark"
+        );
     }
 
     #[test]

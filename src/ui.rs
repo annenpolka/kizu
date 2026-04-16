@@ -194,6 +194,7 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             cursor_sub,
             wrap_body_width,
             nowrap_body_width,
+            &app.seen_hunks,
         );
         let mut take = row_lines.into_iter();
         // Discard any leading visual lines requested by the
@@ -230,7 +231,12 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let (Some(header_rect), Some((file_idx, hunk_idx))) = (header_area, sticky)
         && let DiffContent::Text(hunks) = &app.files[file_idx].content
     {
-        let line = render_hunk_header(&hunks[hunk_idx], true, false);
+        let line = render_hunk_header(
+            &hunks[hunk_idx],
+            true,
+            false,
+            app.hunk_is_seen(file_idx, hunk_idx),
+        );
         frame.render_widget(Paragraph::new(line), header_rect);
     }
 }
@@ -271,6 +277,7 @@ fn render_row(
     cursor_sub: Option<usize>,
     wrap_body_width: Option<usize>,
     nowrap_body_width: usize,
+    seen_hunks: &std::collections::BTreeSet<(std::path::PathBuf, usize)>,
 ) -> Vec<Line<'static>> {
     match row {
         RowKind::FileHeader { file_idx } => {
@@ -289,6 +296,7 @@ fn render_row(
                 &hunks[*hunk_idx],
                 is_selected,
                 cursor_sub.is_some(),
+                seen_hunks.contains(&(files[*file_idx].path.clone(), hunks[*hunk_idx].old_start)),
             )]
         }
         RowKind::DiffLine {
@@ -486,11 +494,23 @@ fn render_file_header(_file_idx: usize, file: &FileDiff, is_cursor: bool) -> Lin
     Line::from(spans)
 }
 
-fn render_hunk_header(hunk: &Hunk, is_selected: bool, is_cursor: bool) -> Line<'static> {
+fn render_hunk_header(
+    hunk: &Hunk,
+    is_selected: bool,
+    is_cursor: bool,
+    is_seen: bool,
+) -> Line<'static> {
+    // Seen-mark indicator sits in front of the `@@` body. It only
+    // takes one cell and keeps the existing 5-cell left bar so
+    // diff-line alignment below the header is unchanged.
+    let seen_mark = if is_seen { "• " } else { "  " };
     let body = match &hunk.context {
-        Some(ctx) => format!("{}  @@ {ctx}", if is_cursor { "  ▶  " } else { "     " }),
+        Some(ctx) => format!(
+            "{}{seen_mark}@@ {ctx}",
+            if is_cursor { "  ▶  " } else { "     " }
+        ),
         None => format!(
-            "{}  @@ -{},{} +{},{} @@",
+            "{}{seen_mark}@@ -{},{} +{},{} @@",
             if is_cursor { "  ▶  " } else { "     " },
             hunk.old_start,
             hunk.old_count,
@@ -952,6 +972,7 @@ mod tests {
             picker: None,
             scar_comment: None,
             revert_confirm: None,
+            seen_hunks: std::collections::BTreeSet::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
