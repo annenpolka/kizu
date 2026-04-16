@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod app;
+mod attach;
 mod config;
 mod git;
 mod highlight;
@@ -20,6 +21,10 @@ mod watcher;
     about = "Realtime diff monitor + inline scar review TUI for AI coding agents"
 )]
 struct Cli {
+    /// Auto-split the terminal and launch kizu in the new pane.
+    #[arg(long)]
+    attach: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -59,6 +64,13 @@ enum Command {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.attach {
+        let config = config::load_config();
+        let terminal = attach::resolve_terminal(&config.attach.terminal)?;
+        let kizu_bin = std::env::current_exe().context("resolving kizu binary path")?;
+        return attach::split_and_launch(terminal, &kizu_bin);
+    }
 
     match cli.command {
         None => app::run().await,
