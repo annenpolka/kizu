@@ -48,3 +48,8 @@ Michael Nygard 形式を採用する。ファイル名は `NNNN-kebab-case-title
 - [0011 — common git-dir root watch を常設し late packed-refs rewrite を拾う](0011-common-git-root-watch-for-late-packed-refs.md)
 - [0012 — macOS PollWatcher の worktree 監視は compare_contents を有効にする](0012-worktree-content-compare-on-macos-poll.md)
 - [0013 — watcher health は source-aware に追跡する](0013-source-aware-watcher-health.md)
+- [0014 — delta 風背景色ベースの diff 表示](0014-delta-style-background-diff.md)
+- [0015 — build output を worktree watch から除外する](0015-exclude-build-output-from-worktree-watch.md)
+- [0016 — ストリームモードの per-operation diff 表示はスナップショット差分で近似する](0016-stream-mode-per-operation-diff.md)
+- [0017 — per-project events dir でハッシュで worktree を分離する](0017-per-project-events-dir.md)
+- [0018 — --attach はターミナル別のネイティブ分割コマンドを shell out する](0018-attach-terminal-split.md)
