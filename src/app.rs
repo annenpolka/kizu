@@ -780,9 +780,16 @@ impl App {
             // Lowercase `j`/`k` + arrows are the *daily driver*: adaptive
             // motion that reads like continuous scrolling in long hunks
             // (chunk scroll) but collapses to a one-press hunk jump in
-            // short hunks. SHIFT-J / SHIFT-K are the strict "skip to
-            // next hunk header" motion, for when you want to blow past
-            // the current hunk regardless of its size.
+            // short hunks.
+            //
+            // v0.2 key remap (ADR-0015 / plans/v0.2.md M4):
+            // - `J` / `K` now move the cursor by **exactly one visual row**.
+            //   The old hunk-header jump behavior was relocated to `l` /
+            //   `h` so add/delete scar decisions can be made row-by-row.
+            // - `l` / `h` strictly jump to the next / previous hunk header,
+            //   mirroring the pre-v0.2 `J` / `K` binding.
+            // - Picker open moved from `Space` to `s` so `Space` can be
+            //   used for the scar "seen" mark (wired up in a later M4 slice).
             KeyCode::Char('j') | KeyCode::Down => {
                 self.next_change();
                 self.follow_mode = false;
@@ -792,10 +799,18 @@ impl App {
                 self.follow_mode = false;
             }
             KeyCode::Char('J') => {
-                self.next_hunk();
+                self.scroll_by(1);
                 self.follow_mode = false;
             }
             KeyCode::Char('K') => {
+                self.scroll_by(-1);
+                self.follow_mode = false;
+            }
+            KeyCode::Char('l') => {
+                self.next_hunk();
+                self.follow_mode = false;
+            }
+            KeyCode::Char('h') => {
                 self.prev_hunk();
                 self.follow_mode = false;
             }
@@ -810,7 +825,7 @@ impl App {
             KeyCode::Char('f') => {
                 self.follow_restore();
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char('s') => {
                 self.open_picker();
             }
             KeyCode::Char('R') => {
@@ -2235,10 +2250,11 @@ mod tests {
     }
 
     #[test]
-    fn capital_j_in_short_run_jumps_to_next_run_anywhere() {
-        // Two short hunks. Each fits comfortably in the default viewport,
-        // so SHIFT-J should behave like `j` and jump to the next hunk's
-        // header row.
+    fn l_jumps_to_next_hunk_header() {
+        // v0.2 remap: `l` takes over the strict hunk-jump role the old
+        // SHIFT-J used to play. Two short hunks; pressing `l` from the
+        // first lands on the second; pressing `l` again stays put
+        // because there is no third hunk.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![
@@ -2252,12 +2268,12 @@ mod tests {
         let second_hunk = app.layout.hunk_starts[1];
 
         app.scroll_to(first_hunk);
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(app.scroll, second_hunk);
         assert!(!app.follow_mode);
 
         // No more hunks after this one → stay put.
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(app.scroll, second_hunk);
     }
 
@@ -2317,10 +2333,10 @@ mod tests {
     }
 
     #[test]
-    fn capital_j_crosses_hunk_and_file_boundaries() {
-        // One tiny hunk per file. Short-hunk SHIFT-J falls back to
-        // `next_hunk`, which jumps across the file boundary into b.rs
-        // for free.
+    fn l_crosses_hunk_and_file_boundaries() {
+        // v0.2 remap: `l` walks to the next hunk regardless of the
+        // file boundary between them. One tiny hunk per file so the
+        // jump has to cross from a.rs into b.rs.
         let mut app = fake_app(vec![
             make_file(
                 "a.rs",
@@ -2338,10 +2354,10 @@ mod tests {
         let second_hunk = app.layout.hunk_starts[1];
 
         app.scroll_to(first_hunk);
-        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(
             app.scroll, second_hunk,
-            "SHIFT-J on a short hunk must cross hunk + file boundaries"
+            "`l` on a short hunk must cross hunk + file boundaries"
         );
     }
 
@@ -2371,9 +2387,10 @@ mod tests {
     }
 
     #[test]
-    fn capital_k_in_short_hunk_jumps_to_previous_hunk() {
-        // Two short hunks. SHIFT-K from the second lands on the first
-        // hunk's header row, same behaviour as `k`.
+    fn h_jumps_to_previous_hunk_header() {
+        // v0.2 remap: `h` is the strict previous-hunk jump that the
+        // old SHIFT-K used to do. Two short hunks, cursor on the
+        // second — pressing `h` lands on the first hunk header.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![
@@ -2386,15 +2403,64 @@ mod tests {
         let second_hunk = app.layout.hunk_starts[1];
 
         app.scroll_to(second_hunk);
-        app.handle_key(key(KeyCode::Char('K')));
+        app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.scroll, first_hunk);
     }
 
     #[test]
-    fn capital_j_flows_from_end_of_long_hunk_into_next_hunk() {
-        // Long hunk + short hunk. SHIFT-J walks the long hunk in chunks,
-        // then on the *next* press flows into the next hunk's header row
-        // automatically — no extra key press to cross the boundary.
+    fn shift_j_moves_cursor_down_by_exactly_one_visual_row() {
+        // v0.2 remap: `J` is a one-row forward cursor move, not a
+        // hunk jump. Starting at the file header row, `J` walks one
+        // row at a time (header → hunk header → first diff line).
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "one"),
+                    diff_line(LineKind::Added, "two"),
+                    diff_line(LineKind::Added, "three"),
+                ],
+            )],
+            100,
+        )]);
+        app.scroll_to(0);
+        let before = app.scroll;
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.scroll, before + 1);
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.scroll, before + 2);
+        assert!(!app.follow_mode);
+    }
+
+    #[test]
+    fn shift_k_moves_cursor_up_by_exactly_one_visual_row() {
+        // v0.2 remap: `K` is a one-row backward cursor move.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "one"),
+                    diff_line(LineKind::Added, "two"),
+                    diff_line(LineKind::Added, "three"),
+                ],
+            )],
+            100,
+        )]);
+        app.scroll_to(3);
+        app.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(app.scroll, 2);
+        app.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(app.scroll, 1);
+        assert!(!app.follow_mode);
+    }
+
+    #[test]
+    fn l_flows_from_end_of_long_hunk_into_next_hunk_header() {
+        // Even from the last row of a long hunk, `l` jumps to the
+        // next hunk's header. This mirrors the old SHIFT-J "flow
+        // across boundary" behavior but now lives on `l`.
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
@@ -2412,8 +2478,8 @@ mod tests {
         // Park on the last row of the long hunk (row 21: 1 header + 20
         // diff lines starting at row 1).
         app.scroll_to(21);
-        // One more SHIFT-J should leap into the next hunk's header.
-        app.handle_key(key(KeyCode::Char('J')));
+        // `l` from there must leap into the next hunk's header.
+        app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(app.scroll, second_hunk);
     }
 
@@ -2867,17 +2933,38 @@ mod tests {
     }
 
     #[test]
-    fn space_opens_picker_and_esc_closes_it() {
+    fn s_opens_picker_and_esc_closes_it() {
+        // v0.2 remap: picker trigger moved from `Space` to `s` so
+        // `Space` is free for the scar "seen" mark (wired up in a
+        // later M4 slice).
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
             100,
         )]);
-        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('s')));
         assert!(app.picker.is_some());
 
         app.handle_key(key(KeyCode::Esc));
         assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn space_is_currently_unbound_in_normal_mode() {
+        // Guards the intentional gap between v0.1 (Space = picker)
+        // and the later M4 slice that will bind Space to the scar
+        // "seen" mark. Until then Space is a no-op so an accidental
+        // press while the user's thumb remembers v0.1 doesn't pop
+        // the picker anymore.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        let before_scroll = app.scroll;
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.picker.is_none(), "Space must not open the picker");
+        assert_eq!(app.scroll, before_scroll, "Space must not move cursor");
     }
 
     #[test]

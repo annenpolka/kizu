@@ -65,12 +65,15 @@ test("f restores follow mode after manual navigation", async () => {
   await session.waitForText("[follow]", { timeout: 5_000 });
 });
 
-test("space opens the file picker overlay", async () => {
+test("s opens the file picker overlay", async () => {
+  // v0.2 remap: picker trigger moved from `Space` to `s` (see
+  // plans/v0.2.md M4). Space is now unbound in normal mode and
+  // will later carry the scar "seen" mark.
   repo = seedTwoFileRepo();
   session = await launchKizu({ cwd: repo.path });
   await session.waitForText("src/auth.rs", { timeout: 10_000 });
 
-  await session.press("space");
+  await session.press("s");
   // The picker renders `Files N/M` in its border title and a `>` query
   // prompt on the first row of the popup.
   await session.waitForText(/Files \d+\/\d+/, { timeout: 5_000 });

@@ -708,7 +708,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
 
         spans.push(sep());
-        spans.push(Span::styled("⎵", Style::default().fg(Color::Magenta)));
+        spans.push(Span::styled("s", Style::default().fg(Color::Magenta)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled("picker", dim));
     }
