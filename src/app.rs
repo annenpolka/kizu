@@ -173,6 +173,12 @@ pub struct App {
     pub config: crate::config::KizuConfig,
     /// Active view mode: Diff (default) or Stream.
     pub view_mode: ViewMode,
+    /// Saved scroll position for the diff view, restored when Tab
+    /// switches back from stream mode.
+    pub saved_diff_scroll: usize,
+    /// Saved scroll position for the stream view, restored when Tab
+    /// switches back from diff mode.
+    pub saved_stream_scroll: usize,
     /// Stream mode events, ordered by timestamp ascending.
     pub stream_events: Vec<StreamEvent>,
     /// Per-file diff snapshots used to compute per-operation diffs.
@@ -882,6 +888,8 @@ impl App {
             highlighter: std::cell::OnceCell::new(),
             config,
             view_mode: ViewMode::default(),
+            saved_diff_scroll: 0,
+            saved_stream_scroll: 0,
             stream_events: Vec::new(),
             diff_snapshots: std::collections::HashMap::new(),
         };
@@ -933,28 +941,21 @@ impl App {
     pub fn toggle_view_mode(&mut self) {
         match self.view_mode {
             ViewMode::Diff => {
+                // Save diff scroll, restore stream scroll.
+                self.saved_diff_scroll = self.scroll;
                 self.view_mode = ViewMode::Stream;
                 let stream_files = build_stream_files(&self.stream_events);
                 self.apply_computed_files(stream_files);
+                let max = self.last_row_index();
+                self.scroll_to(self.saved_stream_scroll.min(max));
             }
             ViewMode::Stream => {
-                // Capture context from the stream cursor for position
-                // estimation after switching back to diff mode.
-                let target_path = self.current_file_path().map(|p| p.to_path_buf());
-                let target_content = self.current_diff_line_content();
+                // Save stream scroll, restore diff scroll.
+                self.saved_stream_scroll = self.scroll;
                 self.view_mode = ViewMode::Diff;
                 self.recompute_diff();
-                if let Some(path) = target_path {
-                    // Try content-based match first (survives line shifts),
-                    // fall back to file header if the content can't be found.
-                    if let Some(ref content) = target_content {
-                        if !self.scroll_to_diff_content(&path, content) {
-                            self.scroll_to_file(&path);
-                        }
-                    } else {
-                        self.scroll_to_file(&path);
-                    }
-                }
+                let max = self.last_row_index();
+                self.scroll_to(self.saved_diff_scroll.min(max));
             }
         }
     }
@@ -1948,90 +1949,6 @@ impl App {
 
     /// Scroll to the first row of the file matching `path`. No-op if
     /// the file is not in the current layout.
-    /// Extract the content of the diff line at the current scroll
-    /// position. Returns the raw `DiffLine.content` (without `+`/`-`
-    /// prefix) for content-based matching when switching view modes.
-    pub fn current_diff_line_content(&self) -> Option<String> {
-        let row = self.layout.rows.get(self.scroll)?;
-        if let RowKind::DiffLine {
-            file_idx,
-            hunk_idx,
-            line_idx,
-        } = *row
-        {
-            let file = self.files.get(file_idx)?;
-            let DiffContent::Text(hunks) = &file.content else {
-                return None;
-            };
-            let line = hunks.get(hunk_idx)?.lines.get(line_idx)?;
-            if !matches!(line.kind, LineKind::Context) {
-                return Some(line.content.clone());
-            }
-        }
-        // If on a hunk header, grab the first changed line in the hunk.
-        if let RowKind::HunkHeader {
-            file_idx, hunk_idx, ..
-        } = *row
-        {
-            let file = self.files.get(file_idx)?;
-            let DiffContent::Text(hunks) = &file.content else {
-                return None;
-            };
-            for dl in &hunks.get(hunk_idx)?.lines {
-                if !matches!(dl.kind, LineKind::Context) {
-                    return Some(dl.content.clone());
-                }
-            }
-        }
-        None
-    }
-
-    /// Scroll to a diff line in `path` whose content matches `needle`.
-    /// Returns `true` if a match was found and scrolled to.
-    pub fn scroll_to_diff_content(&mut self, path: &Path, needle: &str) -> bool {
-        let needle = needle.trim();
-        if needle.is_empty() {
-            return false;
-        }
-        for (i, row) in self.layout.rows.iter().enumerate() {
-            if let RowKind::DiffLine {
-                file_idx,
-                hunk_idx,
-                line_idx,
-            } = *row
-            {
-                let Some(file) = self.files.get(file_idx) else {
-                    continue;
-                };
-                if file.path != path {
-                    continue;
-                }
-                let DiffContent::Text(hunks) = &file.content else {
-                    continue;
-                };
-                let Some(line) = hunks.get(hunk_idx).and_then(|h| h.lines.get(line_idx)) else {
-                    continue;
-                };
-                if line.content.trim() == needle {
-                    self.scroll_to(i);
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    pub fn scroll_to_file(&mut self, path: &Path) {
-        for (i, row) in self.layout.rows.iter().enumerate() {
-            if let RowKind::FileHeader { file_idx } = row
-                && self.files.get(*file_idx).is_some_and(|f| f.path == path)
-            {
-                self.scroll_to(i);
-                return;
-            }
-        }
-    }
-
     /// Insert a scar of the given `kind` with `body` as the human
     /// text, at the cursor's current position. No-op when the
     /// cursor is not on a diff row (file header, hunk header,
@@ -3562,6 +3479,8 @@ mod tests {
             highlighter: std::cell::OnceCell::new(),
             config: crate::config::KizuConfig::default(),
             view_mode: ViewMode::default(),
+            saved_diff_scroll: 0,
+            saved_stream_scroll: 0,
             stream_events: Vec::new(),
             diff_snapshots: std::collections::HashMap::new(),
         };

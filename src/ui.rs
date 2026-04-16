@@ -1364,6 +1364,8 @@ mod tests {
             highlighter: std::cell::OnceCell::new(),
             config: crate::config::KizuConfig::default(),
             view_mode: crate::app::ViewMode::default(),
+            saved_diff_scroll: 0,
+            saved_stream_scroll: 0,
             stream_events: Vec::new(),
             diff_snapshots: std::collections::HashMap::new(),
         }
