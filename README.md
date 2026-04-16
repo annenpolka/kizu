@@ -1,10 +1,10 @@
 # kizu
 
-Realtime diff monitor + inline scar review TUI for AI coding agents like Claude Code.
+Realtime diff monitor + inline scar review TUI for AI coding agents (Claude Code, Cursor, Codex, Qwen Code, Cline, Gemini).
 
-> ⚠️ **Status: pre-alpha.** Only the v0.1 skeleton compiles. The TUI loop, watcher, and diff parser are stubs. See [`docs/SPEC.md`](docs/SPEC.md) for the full specification.
+> **Status: alpha (v0.2).** TUI, scar review, hook integration, and multi-agent init/teardown are implemented. See [`docs/SPEC.md`](docs/SPEC.md) for the full specification.
 
-## What it does (when finished)
+## What it does
 
 While Claude Code (or another terminal AI coding agent) edits files in another pane, kizu sits next to it and shows you what changed in real time. When something looks wrong, you press one key and a `@kizu[ask|reject|free]:` comment is written into the source file at the change site. Claude Code picks it up on the next read, or on the next `Stop` hook firing — whichever comes first — and fixes it without you having to type a sentence.
 
@@ -18,8 +18,8 @@ kizu's answer is **the precision of pointing**. Capture every change, let the hu
 
 ## Phases
 
-- **v0.1 (MVP)** — fsnotify + git diff + ratatui two-pane TUI. Pure observer. No scar, no hooks. _← current scaffold_
-- **v0.2** — `a`/`r`/`c`/`x`/`space` keybindings, `kizu init`, PostToolUse + Stop hooks, async event log to `/tmp/kizu-events/` for stream mode.
+- **v0.1 (MVP)** — fsnotify + git diff + ratatui scroll TUI. Pure observer. No scar, no hooks.
+- **v0.2** — `a`/`r`/`c`/`x`/`e`/`Space` scar keybindings, `/` search, Enter file-view zoom, `kizu init/teardown`, PostToolUse + Stop + pre-commit hooks, multi-agent support (6 agents). _← current_
 - **v0.3** — `--attach` for tmux/Ghostty/zellij/kitty, Claude Code plugin, stream mode UI, config file.
 
 ## Stack
