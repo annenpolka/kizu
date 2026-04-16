@@ -105,16 +105,13 @@ test("interactive init shows agent selection prompt", async () => {
   // Create .claude/ dir so Claude Code appears as "config found".
   execFileSync("mkdir", ["-p", join(repo.path, ".claude")]);
 
-  // Build a minimal PATH that includes `claude` but excludes other agents
-  // (e.g. codex, cursor) so only Claude Code is auto-recommended.
-  // Without this, locally-installed agents get auto-selected and may be
-  // incompatible with the default project-local scope.
-  const claudeDir = execFileSync("bash", ["-c", "dirname $(which claude) 2>/dev/null || true"], {
-    encoding: "utf8",
-  }).trim();
-  const minimalPath = [claudeDir, "/usr/bin", "/bin", "/usr/local/bin"]
-    .filter(Boolean)
-    .join(":");
+  // Build a minimal PATH with a stub `claude` binary so only Claude Code
+  // is auto-recommended. This works both locally (where the real claude
+  // may coexist with codex/cursor) and in CI (where claude is absent).
+  const stubBin = join(repo.path, ".stub-bin");
+  execFileSync("mkdir", ["-p", stubBin]);
+  execFileSync("bash", ["-c", `printf '#!/bin/sh\\nexit 0\\n' > "${stubBin}/claude" && chmod +x "${stubBin}/claude"`]);
+  const minimalPath = [stubBin, "/usr/bin", "/bin", "/usr/local/bin"].join(":");
 
   session = await launchKizu({
     cwd: repo.path,
