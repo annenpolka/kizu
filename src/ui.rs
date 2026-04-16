@@ -68,7 +68,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     let footer = chunks[2];
 
     if let Some(fv) = app.file_view.as_ref() {
-        render_file_view(frame, main, fv);
+        let hl = app
+            .highlighter
+            .get_or_init(crate::highlight::Highlighter::new);
+        render_file_view(frame, main, fv, Some(hl));
     } else if app.files.is_empty() {
         render_empty(frame, main, app);
     } else {
@@ -292,6 +295,9 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             None
         };
+        let hl = app
+            .highlighter
+            .get_or_init(crate::highlight::Highlighter::new);
         let row_lines = render_row(
             &app.layout.rows[row_idx],
             &app.files,
@@ -300,6 +306,7 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             wrap_body_width,
             nowrap_body_width,
             &app.seen_hunks,
+            Some(hl),
         );
         let mut take = row_lines.into_iter();
         // Discard any leading visual lines requested by the
@@ -375,6 +382,7 @@ fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> O
 /// middle of a long wrapped line via Ctrl-d / J). The arrow marker
 /// lands on that visual sub-row instead of always on the first
 /// (ADR-0009 fix). `None` for non-cursor rows.
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     row: &RowKind,
     files: &[FileDiff],
@@ -383,6 +391,7 @@ fn render_row(
     wrap_body_width: Option<usize>,
     nowrap_body_width: usize,
     seen_hunks: &std::collections::BTreeSet<(std::path::PathBuf, usize)>,
+    hl: Option<&crate::highlight::Highlighter>,
 ) -> Vec<Line<'static>> {
     match row {
         RowKind::FileHeader { file_idx } => {
@@ -422,6 +431,8 @@ fn render_row(
                     is_selected,
                     is_cursor,
                     nowrap_body_width,
+                    hl,
+                    Some(&files[*file_idx].path),
                 )],
             }
         }
@@ -635,14 +646,9 @@ fn render_diff_line(
     is_selected: bool,
     is_cursor: bool,
     body_width: usize,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: Option<&std::path::Path>,
 ) -> Line<'static> {
-    // ADR-0014: background-color diff rendering. The `+`/`-` prefix
-    // column is gone; add/delete is encoded by row background color
-    // (delta-style). The selected hunk keeps full brightness while
-    // every other hunk is drawn with `Modifier::DIM` so the eye
-    // still flows to the focus. Context lines in the selected hunk
-    // render at the terminal default so code stays fully readable;
-    // context lines outside the focus fall back to dim dark-gray.
     let bg = match line.kind {
         LineKind::Added => Some(BG_ADDED),
         LineKind::Deleted => Some(BG_DELETED),
@@ -660,7 +666,7 @@ fn render_diff_line(
     } else {
         Span::raw("     ")
     };
-    let body_style = match (bg, is_selected) {
+    let base_style = match (bg, is_selected) {
         (Some(b), true) => Style::default().bg(b),
         (Some(b), false) => Style::default().bg(b).add_modifier(Modifier::DIM),
         (None, true) => Style::default(),
@@ -668,9 +674,37 @@ fn render_diff_line(
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
     };
-    // Pad (or truncate) the body to exactly `body_width` chars so
-    // the delta-style background color extends all the way to the
-    // viewport edge instead of stopping at the last content char.
+
+    // Try syntax highlighting. If available, produce per-token spans
+    // with the token fg color + the diff bg style overlay.
+    if let (Some(hl), Some(path)) = (hl, file_path) {
+        let tokens = hl.highlight_line(&line.content, path);
+        if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
+            let mut spans = vec![bar];
+            let mut chars_emitted = 0;
+            for token in &tokens {
+                let token_chars = token.text.chars().count();
+                let remaining = body_width.saturating_sub(chars_emitted);
+                if remaining == 0 {
+                    break;
+                }
+                let take = token_chars.min(remaining);
+                let text: String = token.text.chars().take(take).collect();
+                spans.push(Span::styled(text, base_style.fg(token.fg)));
+                chars_emitted += take;
+            }
+            // Pad to body_width.
+            if chars_emitted < body_width {
+                spans.push(Span::styled(
+                    " ".repeat(body_width - chars_emitted),
+                    base_style,
+                ));
+            }
+            return Line::from(spans);
+        }
+    }
+
+    // Fallback: single-span body (no highlighting or unknown extension).
     let chunk_len = line.content.chars().count();
     let padded_body: String = if chunk_len >= body_width {
         line.content.chars().take(body_width).collect()
@@ -681,7 +715,7 @@ fn render_diff_line(
             .chain(std::iter::repeat_n(' ', pad))
             .collect()
     };
-    Line::from(vec![bar, Span::styled(padded_body, body_style)])
+    Line::from(vec![bar, Span::styled(padded_body, base_style)])
 }
 
 /// `HH:MM` formatted local time. Returns `--:--` when the metadata read
@@ -717,7 +751,12 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(p, mid);
 }
 
-fn render_file_view(frame: &mut Frame<'_>, area: Rect, fv: &crate::app::FileViewState) {
+fn render_file_view(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    fv: &crate::app::FileViewState,
+    hl: Option<&crate::highlight::Highlighter>,
+) {
     let height = area.height as usize;
     let width = area.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
@@ -755,12 +794,39 @@ fn render_file_view(frame: &mut Frame<'_>, area: Rect, fv: &crate::app::FileView
                 .collect()
         };
 
-        let body_style = if let Some(&bg) = fv.line_bg.get(&line_idx) {
+        let base_style = if let Some(&bg) = fv.line_bg.get(&line_idx) {
             Style::default().bg(bg)
         } else {
             Style::default()
         };
-        lines.push(Line::from(vec![bar, Span::styled(padded, body_style)]));
+
+        if let Some(hl) = hl {
+            let tokens = hl.highlight_line(content, &fv.path);
+            if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
+                let mut spans = vec![bar];
+                let mut chars_emitted = 0;
+                for token in &tokens {
+                    let remaining = body_width.saturating_sub(chars_emitted);
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = token.text.chars().count().min(remaining);
+                    let text: String = token.text.chars().take(take).collect();
+                    spans.push(Span::styled(text, base_style.fg(token.fg)));
+                    chars_emitted += take;
+                }
+                if chars_emitted < body_width {
+                    spans.push(Span::styled(
+                        " ".repeat(body_width - chars_emitted),
+                        base_style,
+                    ));
+                }
+                lines.push(Line::from(spans));
+                continue;
+            }
+        }
+
+        lines.push(Line::from(vec![bar, Span::styled(padded, base_style)]));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -1160,6 +1226,7 @@ mod tests {
             anim: None,
             wrap_lines: false,
             watcher_health: crate::app::WatcherHealth::default(),
+            highlighter: std::cell::OnceCell::new(),
         }
     }
 

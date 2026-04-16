@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 mod app;
 mod git;
+mod highlight;
 mod hook;
 mod init;
 mod paths;

@@ -142,6 +142,9 @@ pub struct App {
     /// (ADR-0008). `Failed` persists until a subsequent non-Error
     /// watcher event confirms recovery, or the watcher is restarted.
     pub watcher_health: WatcherHealth,
+    /// Lazy-initialized syntax highlighter. Loaded on first render
+    /// to avoid paying syntect's SyntaxSet load cost at startup.
+    pub highlighter: std::cell::OnceCell<crate::highlight::Highlighter>,
 }
 
 /// Tracks whether the underlying notify debouncers are still pushing
@@ -831,6 +834,7 @@ impl App {
             anim: None,
             wrap_lines: false,
             watcher_health: WatcherHealth::default(),
+            highlighter: std::cell::OnceCell::new(),
         };
         app.apply_computed_files(initial);
         Ok(app)
@@ -3119,6 +3123,7 @@ mod tests {
             anim: None,
             wrap_lines: false,
             watcher_health: WatcherHealth::default(),
+            highlighter: std::cell::OnceCell::new(),
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
