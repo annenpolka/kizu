@@ -131,23 +131,12 @@ pub fn scan_scars(paths: &[PathBuf]) -> Vec<ScarHit> {
         .expect("scar regex");
     let mut hits = Vec::new();
     for path in paths {
-        if is_documentation_file(path) {
-            continue;
-        }
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        for (i, line) in content.lines().enumerate() {
-            if let Some(caps) = re.captures(line) {
-                hits.push(ScarHit {
-                    path: path.clone(),
-                    line_number: i + 1,
-                    kind: caps[1].to_string(),
-                    message: caps[2].trim().to_string(),
-                });
-            }
-        }
+        let fence_aware = is_fenced_code_aware(path);
+        hits.extend(scan_content_for_scars(&re, &content, path, fence_aware));
     }
     hits
 }
@@ -208,12 +197,45 @@ pub fn format_stop_stderr(hits: &[ScarHit]) -> String {
     out
 }
 
-/// Returns `true` for documentation file extensions that may contain
-/// scar-like examples but should never be treated as live scars.
-fn is_documentation_file(path: &Path) -> bool {
+/// Returns `true` for file extensions where fenced code blocks can
+/// contain scar-like examples that should not be treated as live scars.
+fn is_fenced_code_aware(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| matches!(ext, "md" | "txt" | "rst" | "adoc"))
+}
+
+/// Scan `content` for scar hits, skipping matches inside Markdown
+/// fenced code blocks (`` ``` `` / `~~~`) when `fence_aware` is true.
+fn scan_content_for_scars(
+    re: &regex::Regex,
+    content: &str,
+    path: &Path,
+    fence_aware: bool,
+) -> Vec<ScarHit> {
+    let mut hits = Vec::new();
+    let mut in_fence = false;
+    for (i, line) in content.lines().enumerate() {
+        if fence_aware {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+        }
+        if let Some(caps) = re.captures(line) {
+            hits.push(ScarHit {
+                path: path.to_path_buf(),
+                line_number: i + 1,
+                kind: caps[1].to_string(),
+                message: caps[2].trim().to_string(),
+            });
+        }
+    }
+    hits
 }
 
 /// Grep staged (index) contents of `paths` for `@kizu[...]` scars.
@@ -225,9 +247,6 @@ pub fn scan_scars_from_index(root: &Path, paths: &[PathBuf]) -> Vec<ScarHit> {
         .expect("scar regex");
     let mut hits = Vec::new();
     for path in paths {
-        if is_documentation_file(path) {
-            continue;
-        }
         let rel = match path.strip_prefix(root) {
             Ok(r) => r,
             Err(_) => path.as_path(),
@@ -241,16 +260,8 @@ pub fn scan_scars_from_index(root: &Path, paths: &[PathBuf]) -> Vec<ScarHit> {
             _ => continue,
         };
         let content = String::from_utf8_lossy(&output.stdout);
-        for (i, line) in content.lines().enumerate() {
-            if let Some(caps) = re.captures(line) {
-                hits.push(ScarHit {
-                    path: path.clone(),
-                    line_number: i + 1,
-                    kind: caps[1].to_string(),
-                    message: caps[2].trim().to_string(),
-                });
-            }
-        }
+        let fence_aware = is_fenced_code_aware(path);
+        hits.extend(scan_content_for_scars(&re, &content, path, fence_aware));
     }
     hits
 }
@@ -529,6 +540,53 @@ mod tests {
 
         let hits = scan_scars(&[file]);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn scan_scars_skips_fenced_code_blocks_in_markdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("spec.md");
+        fs::write(
+            &file,
+            "# Spec\n\nExample:\n\n```html\n<!-- @kizu[ask]: example in fence -->\n```\n\nEnd.\n",
+        )
+        .unwrap();
+
+        let hits = scan_scars(&[file]);
+        assert!(hits.is_empty(), "fenced code block scar should be ignored");
+    }
+
+    #[test]
+    fn scan_scars_detects_real_scar_outside_fence_in_markdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notes.md");
+        fs::write(
+            &file,
+            "# Notes\n\n<!-- @kizu[ask]: real scar outside fence -->\n\n```\n<!-- @kizu[ask]: example -->\n```\n",
+        )
+        .unwrap();
+
+        let hits = scan_scars(&[file]);
+        assert_eq!(hits.len(), 1, "only the scar outside the fence");
+        assert_eq!(hits[0].message, "real scar outside fence -->");
+        assert_eq!(hits[0].line_number, 3);
+    }
+
+    #[test]
+    fn scan_scars_does_not_skip_fences_in_non_markdown_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.rs");
+        // Rust files should not get fence-aware treatment even if
+        // they happen to contain triple backticks in a string.
+        fs::write(
+            &file,
+            "let s = \"```\";\n// @kizu[ask]: real scar\nlet t = \"```\";\n",
+        )
+        .unwrap();
+
+        let hits = scan_scars(&[file]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "ask");
     }
 
     #[test]
