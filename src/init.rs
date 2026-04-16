@@ -606,12 +606,19 @@ fn config_path(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<Pat
 ///   }
 /// }
 /// ```
+/// A single hook command entry within a matcher group.
+struct HookCmd<'a> {
+    command: &'a str,
+    timeout: Option<u32>,
+    is_async: bool,
+}
+
 /// Each event holds an array of **matcher groups**, each with a
 /// `matcher` string (tool name filter, `""` = match all) and a
 /// `hooks` sub-array of command objects.
 fn merge_hooks_into_settings(
     path: &Path,
-    hooks: &[(&str, &str, &str)], // (event_name, matcher, command)
+    hooks: &[(&str, &str, &[HookCmd<'_>])], // (event_name, matcher, commands)
 ) -> Result<(usize, usize)> {
     let mut doc: serde_json::Value = if path.exists() {
         let content =
@@ -634,9 +641,9 @@ fn merge_hooks_into_settings(
     let mut added = 0;
     let mut skipped = 0;
 
-    for &(event_name, matcher, command) in hooks {
+    for (event_name, matcher, commands) in hooks {
         let matcher_groups = hooks_map
-            .entry(event_name)
+            .entry(*event_name)
             .or_insert_with(|| serde_json::json!([]));
         let arr = matcher_groups
             .as_array_mut()
@@ -655,6 +662,8 @@ fn merge_hooks_into_settings(
                                 c.contains("kizu hook-")
                                     || c.contains(" hook-post-tool")
                                     || c.contains(" hook-stop")
+                                    || c.contains(" hook-log-event")
+                                    || c.contains(" hook-log-event")
                             })
                     })
                 })
@@ -663,15 +672,25 @@ fn merge_hooks_into_settings(
         if already {
             skipped += 1;
         } else {
+            let cmd_array: Vec<serde_json::Value> = commands
+                .iter()
+                .map(|cmd| {
+                    let mut obj = serde_json::json!({
+                        "type": "command",
+                        "command": cmd.command,
+                    });
+                    if let Some(t) = cmd.timeout {
+                        obj["timeout"] = serde_json::json!(t);
+                    }
+                    if cmd.is_async {
+                        obj["async"] = serde_json::json!(true);
+                    }
+                    obj
+                })
+                .collect();
             arr.push(serde_json::json!({
                 "matcher": matcher,
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": command,
-                        "timeout": 10
-                    }
-                ]
+                "hooks": cmd_array
             }));
             added += 1;
         }
@@ -693,10 +712,34 @@ fn install_claude_code(scope: Scope, project_root: &Path) -> Result<InstallRepor
     let path = config_path(AgentKind::ClaudeCode, scope, project_root)?;
     let bin = kizu_bin_for_scope(scope);
     let post_cmd = format!("{bin} hook-post-tool --agent claude-code");
+    let log_cmd = format!("{bin} hook-log-event");
     let stop_cmd = format!("{bin} hook-stop --agent claude-code");
-    let hooks = &[
-        ("PostToolUse", "Edit|Write|MultiEdit", post_cmd.as_str()),
-        ("Stop", "", stop_cmd.as_str()),
+    let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[
+        (
+            "PostToolUse",
+            "Edit|Write|MultiEdit",
+            &[
+                HookCmd {
+                    command: &post_cmd,
+                    timeout: Some(10),
+                    is_async: false,
+                },
+                HookCmd {
+                    command: &log_cmd,
+                    timeout: None,
+                    is_async: true,
+                },
+            ],
+        ),
+        (
+            "Stop",
+            "",
+            &[HookCmd {
+                command: &stop_cmd,
+                timeout: Some(10),
+                is_async: false,
+            }],
+        ),
     ];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
@@ -786,7 +829,15 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     // Codex: Stop only (PreTool/PostTool is Bash-only).
     let bin = kizu_bin_for_scope(scope);
     let stop_cmd = format!("{bin} hook-stop --agent codex");
-    let hooks = &[("Stop", "", stop_cmd.as_str())];
+    let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[(
+        "Stop",
+        "",
+        &[HookCmd {
+            command: &stop_cmd,
+            timeout: Some(10),
+            is_async: false,
+        }],
+    )];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
         agent: AgentKind::Codex,
@@ -803,10 +854,34 @@ fn install_qwen(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::QwenCode, scope, project_root)?;
     let bin = kizu_bin_for_scope(scope);
     let post_cmd = format!("{bin} hook-post-tool --agent qwen");
+    let log_cmd = format!("{bin} hook-log-event");
     let stop_cmd = format!("{bin} hook-stop --agent qwen");
-    let hooks = &[
-        ("PostToolUse", "Edit|Write|MultiEdit", post_cmd.as_str()),
-        ("Stop", "", stop_cmd.as_str()),
+    let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[
+        (
+            "PostToolUse",
+            "Edit|Write|MultiEdit",
+            &[
+                HookCmd {
+                    command: &post_cmd,
+                    timeout: Some(10),
+                    is_async: false,
+                },
+                HookCmd {
+                    command: &log_cmd,
+                    timeout: None,
+                    is_async: true,
+                },
+            ],
+        ),
+        (
+            "Stop",
+            "",
+            &[HookCmd {
+                command: &stop_cmd,
+                timeout: Some(10),
+                is_async: false,
+            }],
+        ),
     ];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
@@ -1129,9 +1204,28 @@ mod tests {
                 (
                     "PostToolUse",
                     "Edit|Write",
-                    "kizu hook-post-tool --agent claude-code",
+                    &[
+                        HookCmd {
+                            command: "kizu hook-post-tool --agent claude-code",
+                            timeout: Some(10),
+                            is_async: false,
+                        },
+                        HookCmd {
+                            command: "kizu hook-log-event",
+                            timeout: None,
+                            is_async: true,
+                        },
+                    ],
                 ),
-                ("Stop", "", "kizu hook-stop --agent claude-code"),
+                (
+                    "Stop",
+                    "",
+                    &[HookCmd {
+                        command: "kizu hook-stop --agent claude-code",
+                        timeout: Some(10),
+                        is_async: false,
+                    }],
+                ),
             ],
         )
         .unwrap();
@@ -1143,13 +1237,21 @@ mod tests {
         let post = &doc["hooks"]["PostToolUse"].as_array().unwrap()[0];
         assert_eq!(post["matcher"].as_str().unwrap(), "Edit|Write");
         let cmds = post["hooks"].as_array().unwrap();
-        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0]["type"].as_str().unwrap(), "command");
         assert!(
             cmds[0]["command"]
                 .as_str()
                 .unwrap()
                 .contains("kizu hook-post-tool")
+        );
+        assert!(cmds[0].get("async").is_none());
+        assert_eq!(cmds[1]["async"].as_bool(), Some(true));
+        assert!(
+            cmds[1]["command"]
+                .as_str()
+                .unwrap()
+                .contains("hook-log-event")
         );
     }
 
@@ -1169,7 +1271,11 @@ mod tests {
             &[(
                 "PostToolUse",
                 "Edit|Write",
-                "kizu hook-post-tool --agent claude-code",
+                &[HookCmd {
+                    command: "kizu hook-post-tool --agent claude-code",
+                    timeout: Some(10),
+                    is_async: false,
+                }],
             )],
         )
         .unwrap();
@@ -1193,7 +1299,11 @@ mod tests {
             &[(
                 "PostToolUse",
                 "Edit|Write",
-                "kizu hook-post-tool --agent claude-code",
+                &[HookCmd {
+                    command: "kizu hook-post-tool --agent claude-code",
+                    timeout: Some(10),
+                    is_async: false,
+                }],
             )],
         )
         .unwrap();
