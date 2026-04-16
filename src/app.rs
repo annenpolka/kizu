@@ -966,6 +966,13 @@ impl App {
             Err(_) => return,
         };
 
+        // Filter: only accept events whose cwd matches this TUI's
+        // project root. The events dir is global, so other projects'
+        // hook-log-event writes land here too.
+        if event.cwd != self.root {
+            return;
+        }
+
         // Capture per-operation diff for each affected file.
         let mut operation_diff = String::new();
 
