@@ -1006,16 +1006,15 @@ impl App {
         }
     }
 
-    /// Load existing event-log files from `<state_dir>/events/` into
-    /// `stream_events`. Called once at startup so stream mode is
-    /// pre-populated. Events loaded this way have no diff_snapshot
-    /// (the TUI wasn't running when they were created).
-    pub fn load_existing_events(&mut self) {
+    /// Remove stale event-log files from `<state_dir>/events/`.
+    /// Called once at TUI startup so the stream view starts clean —
+    /// events from before this session cannot carry a per-operation
+    /// diff and would only show "[diff not captured]" noise.
+    pub fn clean_stale_events(&self) {
         let dir = match crate::paths::events_dir() {
             Some(d) if d.is_dir() => d,
             _ => return,
         };
-        let mut entries: Vec<(PathBuf, u64)> = Vec::new();
         let Ok(read_dir) = std::fs::read_dir(&dir) else {
             return;
         };
@@ -1025,30 +1024,9 @@ impl App {
             if name_str.starts_with('.') {
                 continue;
             }
-            if let Some(ts_str) = name_str.split('-').next()
-                && let Ok(ts) = ts_str.parse::<u64>()
-            {
-                entries.push((entry.path(), ts));
+            if name_str.ends_with(".json") {
+                let _ = std::fs::remove_file(entry.path());
             }
-        }
-        // Sort oldest first (chronological).
-        entries.sort_by_key(|(_, ts)| *ts);
-
-        for (path, _) in entries {
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let event: SanitizedEvent = match serde_json::from_str(&content) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            self.stream_events.push(StreamEvent {
-                metadata: event,
-                diff_snapshot: None, // Can't reconstruct past diffs
-                add_count: 0,
-                del_count: 0,
-            });
         }
     }
 
@@ -3027,10 +3005,9 @@ pub async fn run() -> Result<()> {
             eprintln!("warning: failed to write kizu session file: {e}");
         }
 
-        // Load existing stream events from the events directory so
-        // stream mode is populated even when the TUI starts after
-        // hook-log-event has already written events.
-        app.load_existing_events();
+        // Clean stale events from before this session so stream
+        // mode starts fresh — old events can't carry diffs.
+        app.clean_stale_events();
 
         // Draw one static frame before watcher startup. On macOS the
         // PollWatcher fallback may take noticeable time to arm because it

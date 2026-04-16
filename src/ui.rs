@@ -915,6 +915,30 @@ fn render_file_view(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Convert a Unix epoch millisecond timestamp to a local-time
+/// `HH:MM:SS` string. Uses `libc::localtime_r` on Unix for
+/// timezone-aware conversion; falls back to UTC on other platforms.
+fn format_local_time(timestamp_ms: u64) -> String {
+    let epoch_secs = (timestamp_ms / 1000) as i64;
+
+    #[cfg(unix)]
+    {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let time_t = epoch_secs as libc::time_t;
+        unsafe { libc::localtime_r(&time_t, &mut tm) };
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let secs = epoch_secs as u64;
+        let hours = (secs / 3600) % 24;
+        let mins = (secs / 60) % 60;
+        let s = secs % 60;
+        format!("{hours:02}:{mins:02}:{s:02}")
+    }
+}
+
 /// Render the stream mode view: a vertical scroll of operation
 /// entries, each with a header line (timestamp + tool + path +
 /// counts) followed by the operation's diff lines. Same layout
@@ -948,12 +972,7 @@ fn render_stream_view(frame: &mut Frame<'_>, area: Rect, app: &App) {
         event_header_positions.push(all_lines.len());
 
         // --- Event header line ---
-        let ts = ev.metadata.timestamp_ms;
-        let secs = ts / 1000;
-        let hours = (secs / 3600) % 24;
-        let mins = (secs / 60) % 60;
-        let s = secs % 60;
-        let time_str = format!("{hours:02}:{mins:02}:{s:02}");
+        let time_str = format_local_time(ev.metadata.timestamp_ms);
         let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
         let file_path = ev
             .metadata
