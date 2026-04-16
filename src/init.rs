@@ -262,16 +262,26 @@ pub fn run_init(
     };
 
     for agent_kind in &selected_agents {
-        let effective_scope = resolve_scope(*agent_kind, scope);
-        if effective_scope != scope {
-            println!(
-                "  {}  {} scope unavailable for {}; installing to {} instead",
-                c_yellow("⚠"),
-                scope,
-                agent_kind,
-                effective_scope,
-            );
-        }
+        let effective_scope = if needs_scope_fallback(*agent_kind, scope) {
+            if non_interactive {
+                let fb = fallback_scope(*agent_kind);
+                println!(
+                    "  {}  {} scope unavailable for {}; falling back to {}",
+                    c_yellow("⚠"),
+                    scope,
+                    agent_kind,
+                    fb,
+                );
+                fb
+            } else {
+                match ask_scope_fallback(*agent_kind, scope)? {
+                    Some(s) => s,
+                    None => continue, // user chose to skip
+                }
+            }
+        } else {
+            scope
+        };
         let report = install_agent(*agent_kind, effective_scope, project_root)?;
         print_report(&report);
     }
@@ -472,31 +482,66 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the effective scope for an agent. If the requested scope
-/// is not supported, fall back to the closest alternative instead of
-/// erroring out. Only Claude Code supports `project-local`
-/// (`settings.local.json`); other agents fall back to `user` (personal,
-/// not committed) to honor the "don't commit my hooks" intent.
-fn resolve_scope(kind: AgentKind, requested: Scope) -> Scope {
+/// Returns `true` when the requested scope is not natively supported
+/// by this agent and a fallback choice is needed.
+fn needs_scope_fallback(kind: AgentKind, requested: Scope) -> bool {
     match (kind, requested) {
-        // Claude Code supports all three scopes.
-        (AgentKind::ClaudeCode, _) => requested,
-        // Cursor: ~/.cursor/hooks.json (user) is supported.
-        // project-local has no local variant → fall back to user.
-        (AgentKind::Cursor, Scope::ProjectLocal) => Scope::User,
-        (AgentKind::Cursor, Scope::User) => Scope::User,
-        (AgentKind::Cursor, Scope::ProjectShared) => Scope::ProjectShared,
-        // Codex: project-local has no local variant → fall back to user.
-        (AgentKind::Codex, Scope::ProjectLocal) => Scope::User,
-        // Qwen: no settings.local.json → fall back to user.
-        (AgentKind::QwenCode, Scope::ProjectLocal) => Scope::User,
-        // Cline: file-based hooks, only project scope exists.
-        (AgentKind::Cline, _) => Scope::ProjectShared,
-        // Gemini: no hooks at all → keep requested (install_gemini is a no-op).
-        (AgentKind::Gemini, _) => requested,
-        // Default: pass through.
-        _ => requested,
+        (AgentKind::ClaudeCode, _) => false,
+        (AgentKind::Cursor, Scope::ProjectLocal) => true,
+        (AgentKind::Codex, Scope::ProjectLocal) => true,
+        (AgentKind::QwenCode, Scope::ProjectLocal) => true,
+        (AgentKind::Cline, Scope::ProjectLocal | Scope::User) => true,
+        _ => false,
     }
+}
+
+/// Default fallback scope for non-interactive mode.
+fn fallback_scope(kind: AgentKind) -> Scope {
+    match kind {
+        AgentKind::Cline => Scope::ProjectShared,
+        _ => Scope::User,
+    }
+}
+
+/// Interactively ask the user what to do when the chosen scope is
+/// unavailable for a specific agent. Returns `None` to skip.
+fn ask_scope_fallback(kind: AgentKind, requested: Scope) -> Result<Option<Scope>> {
+    use dialoguer::{Select, theme::ColorfulTheme};
+
+    println!(
+        "\n  {}  {} does not support {} scope",
+        c_yellow("⚠"),
+        c_bold(&kind.to_string()),
+        requested,
+    );
+
+    let choices: Vec<(&str, Option<Scope>)> = match kind {
+        AgentKind::Cline => vec![
+            (
+                "Install to project-shared (committed)",
+                Some(Scope::ProjectShared),
+            ),
+            ("Skip this agent", None),
+        ],
+        _ => vec![
+            (
+                "Install to project-shared (committed)",
+                Some(Scope::ProjectShared),
+            ),
+            ("Install to user (global, personal)", Some(Scope::User)),
+            ("Skip this agent", None),
+        ],
+    };
+
+    let labels: Vec<&str> = choices.iter().map(|(l, _)| *l).collect();
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!("How to install {} hooks?", kind))
+        .items(&labels)
+        .default(0)
+        .interact()
+        .context("scope fallback selection cancelled")?;
+
+    Ok(choices[selection].1)
 }
 
 fn install_agent(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<InstallReport> {
