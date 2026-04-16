@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 mod app;
 mod git;
 mod hook;
+mod init;
 mod scar;
 mod ui;
 mod watcher;
@@ -21,9 +22,19 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Initialize agent hooks (v0.2)
-    Init,
-    /// Remove agent hooks (v0.2)
+    /// Initialize agent hooks
+    Init {
+        /// Comma-separated agent names (e.g. claude-code,cursor)
+        #[arg(long, value_delimiter = ',')]
+        agent: Option<Vec<String>>,
+        /// Install scope: project or user
+        #[arg(long)]
+        scope: Option<String>,
+        /// Skip interactive prompts
+        #[arg(long)]
+        non_interactive: bool,
+    },
+    /// Remove all kizu hooks from detected agents
     Teardown,
     /// PostToolUse hook: scan the edited file for @kizu scars
     HookPostTool {
@@ -45,8 +56,20 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => app::run().await,
-        Some(Command::Init) => unimplemented!("v0.2: kizu init"),
-        Some(Command::Teardown) => unimplemented!("v0.2: kizu teardown"),
+        Some(Command::Init {
+            agent,
+            scope,
+            non_interactive,
+        }) => {
+            let cwd = std::env::current_dir()?;
+            let root = git::find_root(&cwd).unwrap_or(cwd);
+            init::run_init(&root, agent.as_deref(), scope.as_deref(), non_interactive)
+        }
+        Some(Command::Teardown) => {
+            let cwd = std::env::current_dir()?;
+            let root = git::find_root(&cwd).unwrap_or(cwd);
+            init::run_teardown(&root)
+        }
         Some(Command::HookPostTool { agent }) => run_hook_post_tool(&agent),
         Some(Command::HookLogEvent) => unimplemented!("v0.2: kizu hook-log-event"),
         Some(Command::HookStop { agent }) => run_hook_stop(&agent),
