@@ -1,19 +1,10 @@
-//! scar (`@review:` inline comment) core — M2 of the v0.2 ExecPlan.
+//! scar (`@review:` inline comment) core — M2/M3 of the v0.2 ExecPlan.
 //!
 //! Pure, dependency-free logic for picking the right source-level
-//! comment syntax for a given file path and for rendering an
-//! `@review: ...` scar in that syntax. File I/O (`insert_scar`)
-//! lives in a later milestone; this module is deliberately
-//! side-effect free so it can be unit-tested without touching the
-//! filesystem.
-//
-// The `dead_code` allow is intentional: kizu is a single-binary
-// crate and the `app.rs` layer only wires scar in during M4 of the
-// v0.2 ExecPlan. Until then these items are reachable only from
-// this module's test suite, and rustc would otherwise refuse to
-// compile because nothing outside `#[cfg(test)]` calls them.
-
-#![allow(dead_code)]
+//! comment syntax for a given file path and for rendering +
+//! inserting an `@review: ...` scar. The app layer calls
+//! [`insert_scar`] from its normal-mode `a` / `r` / `c` / `x` key
+//! dispatch (M4 of v0.2).
 
 use std::path::Path;
 

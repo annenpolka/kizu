@@ -18,6 +18,14 @@ use crate::watcher::{self, WatchEvent, WatchSource};
 /// value keeps `handle_key` testable as a pure function.
 const HALF_PAGE: usize = 12;
 
+/// Canned scar body bound to the `a` key — "ask". The `@review:`
+/// marker itself is added by [`crate::scar::CommentSyntax::render`],
+/// so this constant holds *just the human message*.
+pub(crate) const SCAR_TEXT_ASK: &str = "この変更について説明して";
+
+/// Canned scar body bound to the `r` key — "reject".
+pub(crate) const SCAR_TEXT_REJECT: &str = "この変更をやめて";
+
 /// Top-level application state. Single-threaded, mutated by the event loop
 /// via `&mut self` (we run on tokio's `current_thread` flavor — see ADR-0003).
 pub struct App {
@@ -828,6 +836,17 @@ impl App {
             KeyCode::Char('s') => {
                 self.open_picker();
             }
+            // v0.2 M4 scar dispatch. `a` and `r` insert the two
+            // canned scars; the free-text `c`, hunk-revert `x`,
+            // external-editor `e`, and "seen" Space will land in
+            // later M4 slices. Picker mode is already handled
+            // upstream so these arms only fire in normal mode.
+            KeyCode::Char('a') => {
+                self.insert_canned_scar(SCAR_TEXT_ASK);
+            }
+            KeyCode::Char('r') => {
+                self.insert_canned_scar(SCAR_TEXT_REJECT);
+            }
             KeyCode::Char('R') => {
                 return self.reset_baseline();
             }
@@ -1402,6 +1421,71 @@ impl App {
             } => Some((*file_idx, *hunk_idx)),
             _ => None,
         }
+    }
+
+    /// Insert a scar with the given canned body at the cursor's
+    /// current position. No-op when the cursor is not on a diff row
+    /// (file header, hunk header, spacer, binary notice). Write
+    /// failures from [`crate::scar::insert_scar`] are captured in
+    /// `last_error` so the footer surfaces them instead of panicking.
+    /// The watcher picks up the resulting write on its next tick and
+    /// re-runs `compute_diff`, which shows the new scar line in place.
+    pub fn insert_canned_scar(&mut self, body: &'static str) {
+        let Some((path, line)) = self.scar_target_line() else {
+            return;
+        };
+        if let Err(err) = crate::scar::insert_scar(&path, line, body) {
+            self.last_error = Some(format!("scar: {err:#}"));
+        }
+    }
+
+    /// Resolve the cursor's current row to an absolute file path and a
+    /// 1-indexed **new-file** line number, suitable for
+    /// [`crate::scar::insert_scar`].
+    ///
+    /// - Returns `None` when the cursor is parked on a non-diff row
+    ///   (file header, hunk header, spacer, binary notice) or the
+    ///   underlying file is binary / truncated. Those cases should
+    ///   surface a no-op at the keybinding level so scar does not
+    ///   silently write to the wrong line.
+    /// - For a cursor on an Added or Context line, returns the new-file
+    ///   line number of that line itself. The caller asks
+    ///   `insert_scar` to drop the scar on the line *directly above* it,
+    ///   which is the documented "comment above the code" convention.
+    /// - For a cursor on a Deleted line, the line has no new-file
+    ///   position; we return the new-file line number of the next
+    ///   non-deleted line in the same hunk (i.e. the line that effectively
+    ///   "replaces" it). If the deleted run reaches the hunk tail we fall
+    ///   through to the same offset, which matches "insert the scar right
+    ///   after the deletion block".
+    pub fn scar_target_line(&self) -> Option<(PathBuf, usize)> {
+        let RowKind::DiffLine {
+            file_idx,
+            hunk_idx,
+            line_idx,
+        } = *self.layout.rows.get(self.scroll)?
+        else {
+            return None;
+        };
+        let file = self.files.get(file_idx)?;
+        let DiffContent::Text(hunks) = &file.content else {
+            return None;
+        };
+        let hunk = hunks.get(hunk_idx)?;
+        let mut offset: usize = 0;
+        for (i, line) in hunk.lines.iter().enumerate() {
+            if i > line_idx {
+                break;
+            }
+            let is_deleted = matches!(line.kind, LineKind::Deleted);
+            if i == line_idx {
+                return Some((self.root.join(&file.path), hunk.new_start + offset));
+            }
+            if !is_deleted {
+                offset += 1;
+            }
+        }
+        None
     }
 
     /// `(start, end_exclusive)` row range of the cursor's current hunk.
@@ -4187,6 +4271,183 @@ mod tests {
         assert!(
             app.anim.is_none(),
             "wrap toggle must clear scroll animation to avoid cross-coordinate tween"
+        );
+    }
+// @review: この変更について説明して
+
+    // ---- M4: scar dispatch (a / r canned insertion) -----------------
+
+    /// Build an `App` backed by a real tempdir on disk so `insert_scar`
+    /// can actually read + write the target file. The source files and
+    /// the `FileDiff` layout are kept in sync by hand — enough to
+    /// exercise the `a` / `r` keybinding end-to-end without booting a
+    /// full git repo.
+    fn scar_app_with_real_fs(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        lines: Vec<DiffLine>,
+    ) -> App {
+        let abs = tmp.path().join(rel_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(&abs, source).expect("seed source file");
+
+        let file = make_file(rel_path, vec![hunk(hunk_new_start, lines)], 100);
+        let mut app = fake_app(vec![file]);
+        app.root = tmp.path().to_path_buf();
+        app
+    }
+
+    /// Park the cursor on the Nth DiffLine row in the layout (0-indexed
+    /// across the whole scroll, not per file). Panics if there aren't
+    /// enough DiffLine rows — the tests control the layout exactly so
+    /// this is a loud-failure helper on purpose.
+    fn cursor_on_nth_diff_line(app: &mut App, n: usize) {
+        let mut seen = 0;
+        for (i, row) in app.layout.rows.iter().enumerate() {
+            if matches!(row, RowKind::DiffLine { .. }) {
+                if seen == n {
+                    app.scroll_to(i);
+                    return;
+                }
+                seen += 1;
+            }
+        }
+        panic!("layout has fewer than {} DiffLine rows", n + 1);
+    }
+
+    #[test]
+    fn handle_key_a_inserts_ask_scar_above_cursor_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Simulate a diff where line 2 of main.rs was newly added. The
+        // cursor lands on that added row, and pressing `a` should insert
+        // the canned "ask" scar directly above it.
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn one() {}\nfn two() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn two() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(tmp.path().join("src/main.rs")).expect("read back");
+        assert_eq!(
+            after, "fn one() {}\n// @review: この変更について説明して\nfn two() {}\n",
+            "`a` key must insert the canned ask scar above the cursor row",
+        );
+        assert!(
+            app.last_error.is_none(),
+            "successful scar insert must not touch last_error"
+        );
+    }
+
+    #[test]
+    fn handle_key_r_inserts_reject_scar_above_cursor_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "auth.py",
+            "def main():\n    return 1\n",
+            2,
+            vec![diff_line(LineKind::Added, "    return 1")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('r')));
+
+        let after = std::fs::read_to_string(tmp.path().join("auth.py")).expect("read back");
+        assert_eq!(
+            after, "def main():\n# @review: この変更をやめて\n    return 1\n",
+            "`r` key must insert the canned reject scar using python # syntax",
+        );
+    }
+
+    #[test]
+    fn handle_key_a_is_noop_when_cursor_is_on_a_file_header_row() {
+        // File header rows have no hunk id → `scar_target_line`
+        // returns None → `a` must be a no-op. The source file on
+        // disk stays untouched and no error is recorded.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let original = "fn one() {}\n";
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "lib.rs",
+            original,
+            1,
+            vec![diff_line(LineKind::Added, "fn one() {}")],
+        );
+        // Park the cursor on the FileHeader row explicitly.
+        let file_header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::FileHeader { .. }))
+            .expect("file header exists");
+        app.scroll_to(file_header_row);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(tmp.path().join("lib.rs")).expect("read back");
+        assert_eq!(after, original, "header-row `a` must not touch the file");
+        assert!(app.last_error.is_none(), "header-row `a` is a clean no-op");
+    }
+
+    #[test]
+    fn handle_key_a_surfaces_insert_failure_on_last_error() {
+        // Point `file.path` at a path that does not exist on disk.
+        // `insert_scar` will fail inside the read phase, and the
+        // dispatch must surface that through `last_error` without
+        // panicking.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = make_file(
+            "ghost.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "fn missing()")])],
+            100,
+        );
+        let mut app = fake_app(vec![file]);
+        app.root = tmp.path().to_path_buf();
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        assert!(
+            app.last_error
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with("scar:")),
+            "missing-file scar failure must land on last_error, got {:?}",
+            app.last_error
+        );
+    }
+
+    #[test]
+    fn scar_target_line_maps_cursor_on_deleted_line_to_next_live_line() {
+        // hunk: Added "x" (new file line 10), Deleted "y" (no new pos),
+        //       Added "z" (new file line 11). Cursor on the Deleted
+        //       row should resolve to line 11 — the replacement.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                10,
+                vec![
+                    diff_line(LineKind::Added, "x"),
+                    diff_line(LineKind::Deleted, "y"),
+                    diff_line(LineKind::Added, "z"),
+                ],
+            )],
+            100,
+        )]);
+        // Cursor on the Deleted row (2nd diff line in the hunk = nth=1).
+        cursor_on_nth_diff_line(&mut app, 1);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(
+            line, 11,
+            "deleted-row cursor must map to the next live line"
         );
     }
 }
