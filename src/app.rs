@@ -973,20 +973,24 @@ impl App {
             let current_diff = git::diff_single_file(&self.root, &self.baseline_sha, file_path)
                 .unwrap_or_default();
 
-            if let Some(prev) = self.diff_snapshots.get(file_path) {
-                // We have a previous snapshot — compute the delta.
-                let op_diff = compute_operation_diff(prev, &current_diff);
-                if !op_diff.is_empty() {
-                    if !operation_diff.is_empty() {
-                        operation_diff.push('\n');
-                    }
-                    operation_diff.push_str(&op_diff);
+            let op_diff = if let Some(prev) = self.diff_snapshots.get(file_path) {
+                // Previous snapshot exists — compute delta.
+                compute_operation_diff(prev, &current_diff)
+            } else {
+                // No previous snapshot (first event for this file).
+                // Use the cumulative diff as the operation diff — this
+                // is accurate when seed_diff_snapshots ran at startup
+                // (the seed captured the pre-event state so current_diff
+                // minus seed = this operation's change). For truly new
+                // files, current_diff IS the operation's change.
+                current_diff.clone()
+            };
+            if !op_diff.is_empty() {
+                if !operation_diff.is_empty() {
+                    operation_diff.push('\n');
                 }
+                operation_diff.push_str(&op_diff);
             }
-            // If no previous snapshot exists (new file or first edit),
-            // we record the current state as the baseline and produce
-            // no diff for this event. The next event on this file will
-            // correctly show only its delta.
 
             self.diff_snapshots.insert(file_path.clone(), current_diff);
         }
