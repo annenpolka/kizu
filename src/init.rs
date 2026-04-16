@@ -252,6 +252,19 @@ pub fn run_init(
         select_scope_interactive()?
     };
 
+    // Validate scope compatibility for every selected agent before
+    // writing anything. This prevents partial installs when one
+    // agent rejects the chosen scope after earlier agents already
+    // had their configs mutated.
+    for agent_kind in &selected_agents {
+        if let Some(reason) = scope_incompatible(*agent_kind, scope) {
+            anyhow::bail!(
+                "{agent_kind} is incompatible with scope {scope}: {reason}\n\
+                 Choose a different scope or deselect {agent_kind}.",
+            );
+        }
+    }
+
     for agent_kind in &selected_agents {
         let report = install_agent(*agent_kind, scope, project_root)?;
         print_report(&report);
@@ -440,6 +453,13 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
         }
         // Existing non-kizu hook → rename and wrap.
         let user_hook = hooks_dir.join("pre-commit.user");
+        if user_hook.exists() {
+            anyhow::bail!(
+                "cannot install pre-commit shim: backup path already exists at {}\n\
+                 Remove or rename it manually, then re-run `kizu init`.",
+                user_hook.display()
+            );
+        }
         std::fs::rename(&hook_path, &user_hook)?;
         let shim = format!(
             "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
@@ -473,6 +493,16 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
         hook_path.display()
     );
     Ok(())
+}
+
+/// Returns `Some(reason)` if `kind` cannot be installed at `scope`.
+fn scope_incompatible(kind: AgentKind, scope: Scope) -> Option<&'static str> {
+    match (kind, scope) {
+        (AgentKind::Cursor, Scope::User) => Some("Cursor only supports project-level hooks"),
+        (AgentKind::Cline, Scope::User) => Some("Cline uses file-based project hooks only"),
+        (AgentKind::Gemini, _) => Some("Gemini CLI has no hook mechanism"),
+        _ => None,
+    }
 }
 
 fn install_agent(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<InstallReport> {

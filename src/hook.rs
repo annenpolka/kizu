@@ -78,6 +78,25 @@ pub fn parse_hook_input(_agent: AgentKind, reader: impl Read) -> Result<Normaliz
         if let Some(fp) = fp {
             file_paths.push(PathBuf::from(fp));
         }
+
+        // Cursor afterFileEdit sends an `edits` array with per-file
+        // entries. Extract paths from each element so multi-file edits
+        // don't silently drop scar notifications.
+        if let Some(edits) = tool_input.get("edits").and_then(|v| v.as_array()) {
+            for edit in edits {
+                let ep = edit
+                    .get("file_path")
+                    .or_else(|| edit.get("path"))
+                    .or_else(|| edit.get("filePath"))
+                    .and_then(|v| v.as_str());
+                if let Some(ep) = ep {
+                    file_paths.push(PathBuf::from(ep));
+                }
+            }
+        }
+
+        file_paths.sort();
+        file_paths.dedup();
     }
 
     Ok(NormalizedHookInput {
@@ -368,6 +387,43 @@ mod tests {
         }"#;
         let input = parse_hook_input(AgentKind::Cursor, json.as_bytes()).unwrap();
         assert_eq!(input.file_paths, vec![PathBuf::from("/tmp/cursor.ts")]);
+    }
+
+    #[test]
+    fn parse_hook_input_extracts_cursor_multi_file_edits_array() {
+        let json = r#"{
+            "hook_event_name": "PostToolUse",
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "edits": [
+                    { "filePath": "/tmp/a.ts", "content": "a" },
+                    { "filePath": "/tmp/b.ts", "content": "b" }
+                ]
+            },
+            "cwd": "/home/user"
+        }"#;
+        let input = parse_hook_input(AgentKind::Cursor, json.as_bytes()).unwrap();
+        assert_eq!(
+            input.file_paths,
+            vec![PathBuf::from("/tmp/a.ts"), PathBuf::from("/tmp/b.ts")]
+        );
+    }
+
+    #[test]
+    fn parse_hook_input_deduplicates_paths_from_scalar_and_edits() {
+        let json = r#"{
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": {
+                "filePath": "/tmp/a.ts",
+                "edits": [
+                    { "filePath": "/tmp/a.ts", "content": "dup" }
+                ]
+            },
+            "cwd": "/home/user"
+        }"#;
+        let input = parse_hook_input(AgentKind::Cursor, json.as_bytes()).unwrap();
+        assert_eq!(input.file_paths, vec![PathBuf::from("/tmp/a.ts")]);
     }
 
     #[test]
