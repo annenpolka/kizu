@@ -421,6 +421,40 @@ fn print_report(report: &InstallReport) {
 /// Kizu-managed shim marker embedded in generated pre-commit hooks.
 const KIZU_SHIM_MARKER: &str = "# kizu-managed-shim";
 
+/// Wrap `s` in POSIX single quotes, escaping any interior single
+/// quotes with the standard `'\''` sequence. Produces a token that
+/// `sh` always parses as exactly one literal argument, regardless of
+/// spaces, `$`, `"`, `\`, `*`, etc. Kizu binaries installed under
+/// paths like `/Users/John Doe/.cargo/bin/kizu` would otherwise
+/// wordsplit in the generated pre-commit shim.
+fn shell_single_quote(s: &str) -> String {
+    let escaped = s.replace('\'', r"'\''");
+    format!("'{escaped}'")
+}
+
+/// Render the `/bin/sh` shim body that `.git/hooks/pre-commit`
+/// writes. Extracted from `install_git_pre_commit_hook` so the
+/// quoting contract can be unit-tested without touching the
+/// filesystem.
+fn pre_commit_shim_body(bin: &str, has_user_hook: bool) -> String {
+    let bin_q = shell_single_quote(bin);
+    if has_user_hook {
+        format!(
+            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
+             # Run the original user hook first.\n\
+             \"$(dirname \"$0\")/pre-commit.user\" \"$@\"\n\
+             # Then run kizu scar guard.\n\
+             {bin_q} hook-pre-commit\n"
+        )
+    } else {
+        format!(
+            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
+             # kizu scar guard\n\
+             {bin_q} hook-pre-commit\n"
+        )
+    }
+}
+
 /// Install a kizu-managed pre-commit shim that guarantees
 /// `kizu hook-pre-commit` always runs, even when the repo has a
 /// pre-existing hook script that may contain `exit`/`exec`.
@@ -454,13 +488,7 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
         }
         std::fs::rename(&hook_path, &user_hook)?;
         let bin = kizu_bin_for_scope(Scope::ProjectLocal);
-        let shim = format!(
-            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
-             # Run the original user hook first.\n\
-             \"$(dirname \"$0\")/pre-commit.user\" \"$@\"\n\
-             # Then run kizu scar guard.\n\
-             {bin} hook-pre-commit\n"
-        );
+        let shim = pre_commit_shim_body(&bin, true);
         std::fs::write(&hook_path, shim)?;
         println!(
             "  git pre-commit hook: wrapped existing hook → {}",
@@ -468,11 +496,7 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
         );
     } else {
         let bin = kizu_bin_for_scope(Scope::ProjectLocal);
-        let shim = format!(
-            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
-             # kizu scar guard\n\
-             {bin} hook-pre-commit\n"
-        );
+        let shim = pre_commit_shim_body(&bin, false);
         std::fs::write(&hook_path, shim)?;
     }
 
@@ -1365,6 +1389,48 @@ mod tests {
     fn remove_kizu_hooks_returns_false_for_missing_file() {
         let removed = remove_kizu_hooks_from_json(Path::new("/nonexistent/settings.json")).unwrap();
         assert!(!removed);
+    }
+
+    #[test]
+    fn shell_single_quote_wraps_and_escapes_embedded_quotes() {
+        // Plain path: wrapped only.
+        assert_eq!(
+            super::shell_single_quote("/usr/bin/kizu"),
+            "'/usr/bin/kizu'"
+        );
+        // Path with a space: still one literal token after the shim parses it.
+        assert_eq!(
+            super::shell_single_quote("/Users/John Doe/kizu"),
+            "'/Users/John Doe/kizu'"
+        );
+        // Path containing a single quote gets the standard '\'' escape.
+        assert_eq!(
+            super::shell_single_quote("/home/ev'an/kizu"),
+            r"'/home/ev'\''an/kizu'"
+        );
+    }
+
+    #[test]
+    fn pre_commit_shim_body_quotes_bin_with_spaces() {
+        let shim = super::pre_commit_shim_body("/Users/John Doe/kizu", false);
+        // The shim must contain the quoted form so `/bin/sh` does
+        // not wordsplit at the space.
+        assert!(
+            shim.contains("'/Users/John Doe/kizu' hook-pre-commit"),
+            "shim body should quote the binary path; got:\n{shim}"
+        );
+        // And must NOT contain the unquoted form that would break.
+        assert!(
+            !shim.contains("/Users/John Doe/kizu hook-pre-commit"),
+            "shim body must not embed the unquoted path; got:\n{shim}"
+        );
+    }
+
+    #[test]
+    fn pre_commit_shim_body_with_user_hook_still_quotes_bin() {
+        let shim = super::pre_commit_shim_body("/p with space/kizu", true);
+        assert!(shim.contains("'/p with space/kizu' hook-pre-commit"));
+        assert!(shim.contains("pre-commit.user"));
     }
 
     #[test]
