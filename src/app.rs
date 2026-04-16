@@ -1053,8 +1053,13 @@ impl App {
     /// [`Self::recompute_diff`] (watcher-driven refreshes).
     fn apply_computed_files(&mut self, mut files: Vec<FileDiff>) {
         let picker_selected_path = self.picker_selected_path();
-        self.populate_mtimes(&mut files);
-        files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        // Stream mode files are already ordered by event timestamp and
+        // must not have their mtime overwritten by the filesystem. Diff
+        // mode files need filesystem mtime for chronological sorting.
+        if self.view_mode != ViewMode::Stream {
+            self.populate_mtimes(&mut files);
+            files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        }
         self.last_error = None;
         self.files = files;
         self.build_layout();
@@ -2922,15 +2927,21 @@ impl App {
 pub fn build_stream_files(events: &[StreamEvent]) -> Vec<FileDiff> {
     events
         .iter()
-        .map(|ev| {
+        .enumerate()
+        .map(|(i, ev)| {
             let ts = ev.metadata.timestamp_ms;
             let time_str = crate::ui::format_local_time(ts);
             let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
             let prefix = format!("{time_str} {tool}");
             let path = ev.metadata.file_paths.first().cloned().unwrap_or_default();
 
+            // Use event index * 10000 as old_start so hunk anchors
+            // (keyed on path + old_start) stay unique even when
+            // multiple events edit the same file.
             let (hunks, added, deleted) = match &ev.diff_snapshot {
-                Some(diff_text) if !diff_text.is_empty() => parse_stream_diff_to_hunk(diff_text),
+                Some(diff_text) if !diff_text.is_empty() => {
+                    parse_stream_diff_to_hunk(diff_text, i * 10000 + 1)
+                }
                 _ => (vec![], 0, 0),
             };
 
@@ -2950,7 +2961,7 @@ pub fn build_stream_files(events: &[StreamEvent]) -> Vec<FileDiff> {
 /// Parse raw diff text (from a stream event snapshot) into a single
 /// `Hunk` with `DiffLine` entries. Hunk header lines (`@@`) are
 /// skipped; `+`/`-`/` ` prefix determines `LineKind`.
-fn parse_stream_diff_to_hunk(diff_text: &str) -> (Vec<git::Hunk>, usize, usize) {
+fn parse_stream_diff_to_hunk(diff_text: &str, old_start: usize) -> (Vec<git::Hunk>, usize, usize) {
     let mut lines = Vec::new();
     let mut added = 0usize;
     let mut deleted = 0usize;
@@ -2984,9 +2995,9 @@ fn parse_stream_diff_to_hunk(diff_text: &str) -> (Vec<git::Hunk>, usize, usize) 
         return (vec![], 0, 0);
     }
     let hunk = git::Hunk {
-        old_start: 1,
+        old_start,
         old_count: deleted,
-        new_start: 1,
+        new_start: old_start,
         new_count: added,
         lines,
         context: None,
