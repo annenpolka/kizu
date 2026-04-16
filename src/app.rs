@@ -6489,4 +6489,135 @@ mod tests {
             "deleted-row cursor must map to the next live line"
         );
     }
+
+    #[test]
+    fn scar_target_line_on_all_deleted_hunk_returns_hunk_new_start() {
+        // A pure-deletion hunk has no Added/Context lines in the
+        // new file. The cursor on any deleted row should still
+        // resolve to `hunk.new_start` — the position in the new
+        // file where the deletion gap sits. The scar will land
+        // above that line (which may be a surviving neighbour or
+        // the end of the file).
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                5,
+                vec![
+                    diff_line(LineKind::Deleted, "gone_a"),
+                    diff_line(LineKind::Deleted, "gone_b"),
+                    diff_line(LineKind::Deleted, "gone_c"),
+                ],
+            )],
+            100,
+        )]);
+        // Cursor on the first deleted row.
+        cursor_on_nth_diff_line(&mut app, 0);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(
+            line, 5,
+            "pure-deletion hunk cursor must resolve to hunk.new_start"
+        );
+
+        // Middle deleted row — same target.
+        cursor_on_nth_diff_line(&mut app, 1);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(line, 5);
+
+        // Last deleted row — same target.
+        cursor_on_nth_diff_line(&mut app, 2);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(line, 5);
+    }
+
+    #[test]
+    fn scar_on_deleted_line_writes_above_next_surviving_line() {
+        // End-to-end: commit "a\nb\nc\n", worktree becomes "a\nc\n"
+        // (line "b" deleted). Cursor on the deleted "b" row, press
+        // `a` → scar should land above line 2 of the new file
+        // (which is "c", the survivor after the deletion).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(&tmp, "del.rs", "a\nb\nc\n", "a\nc\n");
+        // Find the deleted row (LineKind::Deleted for "b").
+        let del_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                if let RowKind::DiffLine {
+                    file_idx,
+                    hunk_idx,
+                    line_idx,
+                } = r
+                {
+                    app.files
+                        .get(*file_idx)
+                        .and_then(|f| match &f.content {
+                            DiffContent::Text(hunks) => hunks
+                                .get(*hunk_idx)
+                                .and_then(|h| h.lines.get(*line_idx))
+                                .map(|l| l.kind == LineKind::Deleted),
+                            _ => None,
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            })
+            .expect("a deleted row exists");
+        app.scroll_to(del_row);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(&abs).expect("read back");
+        assert_eq!(
+            after, "a\n// @kizu[ask]: explain this change\nc\n",
+            "scar on a deleted row must land above the next surviving line"
+        );
+    }
+
+    #[test]
+    fn scar_on_all_deleted_hunk_writes_at_deletion_point() {
+        // Commit "a\nb\nc\nd\n", worktree "a\nd\n" (lines b,c
+        // deleted). The hunk's new_start points at the gap between
+        // "a" and "d". Scar should land above line 2 of the new
+        // file (which is "d").
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, abs) = revert_app_with_real_repo(&tmp, "gap.rs", "a\nb\nc\nd\n", "a\nd\n");
+        // Park on the first deleted row.
+        let del_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                if let RowKind::DiffLine {
+                    file_idx,
+                    hunk_idx,
+                    line_idx,
+                } = r
+                {
+                    app.files
+                        .get(*file_idx)
+                        .and_then(|f| match &f.content {
+                            DiffContent::Text(hunks) => hunks
+                                .get(*hunk_idx)
+                                .and_then(|h| h.lines.get(*line_idx))
+                                .map(|l| l.kind == LineKind::Deleted),
+                            _ => None,
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            })
+            .expect("deleted row");
+        app.scroll_to(del_row);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(&abs).expect("read back");
+        assert_eq!(
+            after, "a\n// @kizu[ask]: explain this change\nd\n",
+            "scar on all-deleted hunk must land at the deletion gap"
+        );
+    }
 }
