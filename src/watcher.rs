@@ -93,7 +93,6 @@ pub enum WatchEvent {
     /// A new event-log file was created in `<state_dir>/events/`.
     /// Carries the absolute path to the new file so the app can
     /// read and parse it without re-scanning the directory.
-    #[allow(dead_code)] // Constructed when events dir watcher is wired up
     EventLog(PathBuf),
     /// The underlying notify backend reported an error. The app
     /// treats this as a forced recompute plus a visible error string.
@@ -134,6 +133,9 @@ pub struct WatchHandle {
     // The debouncers must outlive `events`; dropping them stops the watchers.
     worktree_debouncer: KizuDebouncer,
     _git_state: Vec<KizuDebouncer>,
+    /// Events dir debouncer for stream mode. `None` if the events
+    /// directory could not be resolved or created.
+    _events_debouncer: Option<KizuDebouncer>,
 }
 
 impl WatchHandle {
@@ -234,6 +236,9 @@ pub fn start(
         )?);
     }
 
+    // Stream mode: watch the events directory for new event-log files.
+    let events_debouncer = spawn_events_dir_debouncer(tx.clone());
+
     Ok(WatchHandle {
         events: rx,
         matcher,
@@ -243,6 +248,7 @@ pub fn start(
         watched_children: initial_children,
         worktree_debouncer,
         _git_state: git_state,
+        _events_debouncer: events_debouncer,
     })
 }
 
@@ -593,6 +599,57 @@ pub(crate) fn canonicalize_or_self(p: &Path) -> PathBuf {
     }
 
     p.to_path_buf()
+}
+
+/// Debounce window for the events directory — short, since each
+/// hook-log-event writes exactly one file.
+const EVENTS_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Spawn a debouncer that watches `<state_dir>/events/` for new
+/// event-log files and emits [`WatchEvent::EventLog`]. Returns
+/// `None` if the events directory cannot be resolved or the watcher
+/// fails to start (non-fatal: stream mode simply won't get live
+/// updates).
+fn spawn_events_dir_debouncer(tx: UnboundedSender<WatchEvent>) -> Option<KizuDebouncer> {
+    let events_dir = crate::paths::events_dir()?;
+    // Ensure the directory exists so the watcher has something to watch.
+    let _ = crate::paths::ensure_private_dir(&events_dir);
+    if !events_dir.is_dir() {
+        return None;
+    }
+
+    let events_dir_owned = events_dir.clone();
+    let mut debouncer = new_kizu_debouncer(
+        EVENTS_DEBOUNCE,
+        false, // No compare_contents needed for event log files
+        move |result: DebounceEventResult| {
+            let events = match result {
+                Ok(events) => events,
+                Err(_) => return, // Swallow errors — stream mode is best-effort
+            };
+            for event in events {
+                for path in &event.event.paths {
+                    // Skip temp files written by write_event.
+                    if path
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                    {
+                        continue;
+                    }
+                    // Only emit for files inside the events dir.
+                    if path.starts_with(&events_dir_owned) {
+                        let _ = tx.send(WatchEvent::EventLog(path.clone()));
+                    }
+                }
+            }
+        },
+    )
+    .ok()?;
+
+    debouncer
+        .watch(&events_dir, RecursiveMode::NonRecursive)
+        .ok()?;
+    Some(debouncer)
 }
 
 #[cfg(test)]
