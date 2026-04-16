@@ -34,12 +34,15 @@ test("non-interactive init creates claude-code hooks in project scope", async ()
   expect(settings.hooks.PostToolUse).toBeArray();
   expect(settings.hooks.Stop).toBeArray();
 
-  const postCmd = settings.hooks.PostToolUse[0]?.command;
-  expect(postCmd).toContain("kizu hook-post-tool");
-  expect(postCmd).toContain("--agent claude-code");
+  // New matcher-group schema: each entry has matcher + hooks array.
+  const postGroup = settings.hooks.PostToolUse[0];
+  expect(postGroup.matcher).toBe("Edit|Write|MultiEdit");
+  expect(postGroup.hooks).toBeArray();
+  expect(postGroup.hooks[0].command).toContain("kizu hook-post-tool");
+  expect(postGroup.hooks[0].command).toContain("--agent claude-code");
 
-  const stopCmd = settings.hooks.Stop[0]?.command;
-  expect(stopCmd).toContain("kizu hook-stop");
+  const stopGroup = settings.hooks.Stop[0];
+  expect(stopGroup.hooks[0].command).toContain("kizu hook-stop");
 });
 
 test("non-interactive init is idempotent (skips on second run)", async () => {
@@ -69,11 +72,11 @@ test("teardown removes kizu hooks and preserves user hooks", async () => {
   const initial = {
     hooks: {
       PostToolUse: [
-        { command: "my-linter --check", timeout: 5 },
-        { command: "kizu hook-post-tool --agent claude-code", timeout: 10 },
+        { matcher: "", hooks: [{ type: "command", command: "my-linter --check", timeout: 5 }] },
+        { matcher: "Edit|Write", hooks: [{ type: "command", command: "kizu hook-post-tool --agent claude-code", timeout: 10 }] },
       ],
       Stop: [
-        { command: "kizu hook-stop --agent claude-code", timeout: 10 },
+        { matcher: "", hooks: [{ type: "command", command: "kizu hook-stop --agent claude-code", timeout: 10 }] },
       ],
     },
   };
@@ -87,7 +90,7 @@ test("teardown removes kizu hooks and preserves user hooks", async () => {
   const after = JSON.parse(readFileSync(settingsPath, "utf8"));
   // kizu entries removed, user linter preserved.
   expect(after.hooks.PostToolUse).toHaveLength(1);
-  expect(after.hooks.PostToolUse[0].command).toBe("my-linter --check");
+  expect(after.hooks.PostToolUse[0].hooks[0].command).toBe("my-linter --check");
   // Stop array was entirely kizu → key removed.
   expect(after.hooks.Stop).toBeUndefined();
 });

@@ -344,11 +344,30 @@ fn config_path(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<Pat
 
 // ── JSON hook merging ───────────────────────────────────────────
 
-/// Merge kizu hook entries into a Claude Code / Qwen style
+/// Merge kizu hook entries into a Claude Code / Qwen Code style
 /// settings.json. Creates the file + parent dirs if missing.
+///
+/// Claude Code hook schema (as of 2026):
+/// ```json
+/// {
+///   "hooks": {
+///     "PostToolUse": [
+///       {
+///         "matcher": "Edit|Write",
+///         "hooks": [
+///           { "type": "command", "command": "kizu hook-post-tool ...", "timeout": 10 }
+///         ]
+///       }
+///     ]
+///   }
+/// }
+/// ```
+/// Each event holds an array of **matcher groups**, each with a
+/// `matcher` string (tool name filter, `""` = match all) and a
+/// `hooks` sub-array of command objects.
 fn merge_hooks_into_settings(
     path: &Path,
-    hooks: &[(&str, &str)], // (event_name, command)
+    hooks: &[(&str, &str, &str)], // (event_name, matcher, command)
 ) -> Result<(usize, usize)> {
     let mut doc: serde_json::Value = if path.exists() {
         let content =
@@ -371,27 +390,40 @@ fn merge_hooks_into_settings(
     let mut added = 0;
     let mut skipped = 0;
 
-    for &(event_name, command) in hooks {
-        let entries = hooks_map
+    for &(event_name, matcher, command) in hooks {
+        let matcher_groups = hooks_map
             .entry(event_name)
             .or_insert_with(|| serde_json::json!([]));
-        let arr = entries
+        let arr = matcher_groups
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("hooks.{event_name} is not an array"))?;
 
-        let already = arr.iter().any(|entry| {
-            entry
-                .get("command")
-                .and_then(|v| v.as_str())
-                .is_some_and(|c| c.starts_with("kizu hook-"))
+        // Check if any existing matcher group already has a kizu hook.
+        let already = arr.iter().any(|group| {
+            group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|cmds| {
+                    cmds.iter().any(|cmd| {
+                        cmd.get("command")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|c| c.starts_with("kizu hook-"))
+                    })
+                })
         });
 
         if already {
             skipped += 1;
         } else {
             arr.push(serde_json::json!({
-                "command": command,
-                "timeout": 10
+                "matcher": matcher,
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                        "timeout": 10
+                    }
+                ]
             }));
             added += 1;
         }
@@ -412,8 +444,12 @@ fn merge_hooks_into_settings(
 fn install_claude_code(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::ClaudeCode, scope, project_root)?;
     let hooks = &[
-        ("PostToolUse", "kizu hook-post-tool --agent claude-code"),
-        ("Stop", "kizu hook-stop --agent claude-code"),
+        (
+            "PostToolUse",
+            "Edit|Write|MultiEdit",
+            "kizu hook-post-tool --agent claude-code",
+        ),
+        ("Stop", "", "kizu hook-stop --agent claude-code"),
     ];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
@@ -492,7 +528,7 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
             .join("hooks.json"),
     };
     // Codex: Stop only (PreTool/PostTool is Bash-only).
-    let hooks = &[("Stop", "kizu hook-stop --agent codex")];
+    let hooks = &[("Stop", "", "kizu hook-stop --agent codex")];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
         agent: AgentKind::Codex,
@@ -508,8 +544,12 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
 fn install_qwen(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::QwenCode, scope, project_root)?;
     let hooks = &[
-        ("PostToolUse", "kizu hook-post-tool --agent qwen"),
-        ("Stop", "kizu hook-stop --agent qwen"),
+        (
+            "PostToolUse",
+            "Edit|Write|MultiEdit",
+            "kizu hook-post-tool --agent qwen",
+        ),
+        ("Stop", "", "kizu hook-stop --agent qwen"),
     ];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
@@ -662,11 +702,27 @@ fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
     for (_event, entries) in hooks.iter_mut() {
         if let Some(arr) = entries.as_array_mut() {
             let before = arr.len();
-            arr.retain(|entry| {
-                !entry
+            // New schema: each element is a matcher group with a
+            // `hooks` sub-array. Remove groups that contain kizu commands.
+            arr.retain(|group| {
+                // Old flat schema: { "command": "kizu hook-..." }
+                let flat_kizu = group
                     .get("command")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|c| c.starts_with("kizu hook-"))
+                    .is_some_and(|c| c.starts_with("kizu hook-"));
+                // New nested schema: { "matcher": "...", "hooks": [{ "command": "kizu hook-..." }] }
+                let nested_kizu =
+                    group
+                        .get("hooks")
+                        .and_then(|h| h.as_array())
+                        .is_some_and(|cmds| {
+                            cmds.iter().any(|cmd| {
+                                cmd.get("command")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|c| c.starts_with("kizu hook-"))
+                            })
+                        });
+                !flat_kizu && !nested_kizu
             });
             if arr.len() < before {
                 removed = true;
@@ -689,15 +745,19 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn merge_hooks_creates_settings_from_scratch() {
+    fn merge_hooks_creates_settings_with_matcher_group_schema() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(".claude").join("settings.json");
 
         let (added, skipped) = merge_hooks_into_settings(
             &path,
             &[
-                ("PostToolUse", "kizu hook-post-tool --agent claude-code"),
-                ("Stop", "kizu hook-stop --agent claude-code"),
+                (
+                    "PostToolUse",
+                    "Edit|Write",
+                    "kizu hook-post-tool --agent claude-code",
+                ),
+                ("Stop", "", "kizu hook-stop --agent claude-code"),
             ],
         )
         .unwrap();
@@ -706,23 +766,37 @@ mod tests {
         assert_eq!(skipped, 0);
         let doc: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(doc["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
-        assert_eq!(doc["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        let post = &doc["hooks"]["PostToolUse"].as_array().unwrap()[0];
+        assert_eq!(post["matcher"].as_str().unwrap(), "Edit|Write");
+        let cmds = post["hooks"].as_array().unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0]["type"].as_str().unwrap(), "command");
+        assert!(
+            cmds[0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("kizu hook-post-tool")
+        );
     }
 
     #[test]
     fn merge_hooks_skips_duplicate_kizu_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
+        // Pre-existing kizu hook in new matcher-group schema.
         fs::write(
             &path,
-            r#"{"hooks":{"PostToolUse":[{"command":"kizu hook-post-tool --agent claude-code","timeout":10}]}}"#,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write","hooks":[{"type":"command","command":"kizu hook-post-tool --agent claude-code","timeout":10}]}]}}"#,
         )
         .unwrap();
 
         let (added, skipped) = merge_hooks_into_settings(
             &path,
-            &[("PostToolUse", "kizu hook-post-tool --agent claude-code")],
+            &[(
+                "PostToolUse",
+                "Edit|Write",
+                "kizu hook-post-tool --agent claude-code",
+            )],
         )
         .unwrap();
 
@@ -731,35 +805,44 @@ mod tests {
     }
 
     #[test]
-    fn merge_hooks_preserves_existing_non_kizu_entries() {
+    fn merge_hooks_preserves_existing_non_kizu_matcher_groups() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         fs::write(
             &path,
-            r#"{"hooks":{"PostToolUse":[{"command":"my-linter","timeout":5}]}}"#,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"command","command":"my-linter","timeout":5}]}]}}"#,
         )
         .unwrap();
 
         merge_hooks_into_settings(
             &path,
-            &[("PostToolUse", "kizu hook-post-tool --agent claude-code")],
+            &[(
+                "PostToolUse",
+                "Edit|Write",
+                "kizu hook-post-tool --agent claude-code",
+            )],
         )
         .unwrap();
 
         let doc: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let arr = doc["hooks"]["PostToolUse"].as_array().unwrap();
-        assert_eq!(arr.len(), 2, "existing entry must be preserved");
-        assert_eq!(arr[0]["command"].as_str().unwrap(), "my-linter");
+        assert_eq!(arr.len(), 2, "existing matcher group must be preserved");
+        assert!(
+            arr[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("my-linter")
+        );
     }
 
     #[test]
-    fn remove_kizu_hooks_strips_only_kizu_entries() {
+    fn remove_kizu_hooks_strips_nested_kizu_matcher_groups() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         fs::write(
             &path,
-            r#"{"hooks":{"PostToolUse":[{"command":"my-linter"},{"command":"kizu hook-post-tool --agent claude-code"}],"Stop":[{"command":"kizu hook-stop --agent claude-code"}]}}"#,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"command","command":"my-linter"}]},{"matcher":"Edit|Write","hooks":[{"type":"command","command":"kizu hook-post-tool --agent claude-code"}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"kizu hook-stop --agent claude-code"}]}]}}"#,
         )
         .unwrap();
 
@@ -770,8 +853,13 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let post = doc["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(post.len(), 1);
-        assert_eq!(post[0]["command"].as_str().unwrap(), "my-linter");
-        // Stop array was emptied → key removed entirely.
+        assert!(
+            post[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("my-linter")
+        );
+        // Stop array was entirely kizu → key removed.
         assert!(doc["hooks"].get("Stop").is_none());
     }
 
@@ -781,7 +869,7 @@ mod tests {
         let path = tmp.path().join("settings.json");
         fs::write(
             &path,
-            r#"{"hooks":{"PostToolUse":[{"command":"my-linter"}]}}"#,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"command","command":"my-linter"}]}]}}"#,
         )
         .unwrap();
 
