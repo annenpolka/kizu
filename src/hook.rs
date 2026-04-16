@@ -92,8 +92,15 @@ pub struct ScarHit {
 /// Grep every file in `paths` for `@kizu[...]` scars. Returns all
 /// hits across all files, in order. Files that cannot be read (e.g.
 /// deleted between the scan and the grep) are silently skipped.
+// @kizu[ask]: explain this change
+///
+/// Only matches scars that appear as the primary content of a
+/// comment line (preceded by `//`, `#`, `--`, `/*`, or `<!--`
+/// after optional whitespace). This avoids false positives from
+/// string literals in test code that happen to contain `@kizu[`.
 pub fn scan_scars(paths: &[PathBuf]) -> Vec<ScarHit> {
-    let re = regex::Regex::new(r"@kizu\[(\w+)\]:\s*(.*)").expect("scar regex");
+    let re = regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--)\s*@kizu\[(\w+)\]:\s*(.*)")
+        .expect("scar regex");
     let mut hits = Vec::new();
     for path in paths {
         let content = match std::fs::read_to_string(path) {

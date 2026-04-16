@@ -2373,10 +2373,17 @@ impl App {
         };
         let hunk = hunks.get(hunk_idx)?;
 
-        // Hunk header cursor: target the very first line of the hunk
-        // body. `insert_scar` will then land the scar above that line,
-        // which is the natural "annotate the whole hunk" position.
+        // Hunk header cursor: target the first *changed* line (Added
+        // or Deleted) in the hunk, skipping leading Context lines. If
+        // the hunk is all-context (unlikely but possible in corner
+        // cases), fall back to `new_start`. This places the scar
+        // directly above the change rather than above distant context.
         let Some(line_idx) = diff_line_idx else {
+            for (offset, dl) in hunk.lines.iter().enumerate() {
+                if !matches!(dl.kind, LineKind::Context) {
+                    return Some((self.root.join(&file.path), hunk.new_start + offset));
+                }
+            }
             return Some((self.root.join(&file.path), hunk.new_start));
         };
 
@@ -5491,10 +5498,9 @@ mod tests {
     }
 
     #[test]
-    fn scar_target_line_maps_hunk_header_cursor_to_hunk_new_start() {
-        // When the cursor sits on the `@@ ... @@` row, the scar
-        // should land above the first line of the hunk body — i.e.
-        // at `hunk.new_start`.
+    fn scar_target_line_maps_hunk_header_to_first_changed_line_no_context() {
+        // Hunk starts immediately with Added lines (no leading context).
+        // The first changed line IS new_start, so the result equals new_start.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(
@@ -5514,7 +5520,42 @@ mod tests {
             .expect("hunk header row exists");
         app.scroll_to(header_row);
         let (_, line) = app.scar_target_line().expect("target");
-        assert_eq!(line, 42, "hunk-header cursor must map to hunk.new_start");
+        assert_eq!(
+            line, 42,
+            "no-context hunk header → first changed line = new_start"
+        );
+    }
+
+    #[test]
+    fn scar_target_line_maps_hunk_header_skipping_leading_context() {
+        // Hunk has 2 leading Context lines before the first Added line.
+        // The scar should land above the Added line, not above the context.
+        // new_start=10, context, context, added → target = 10 + 2 = 12.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                10,
+                vec![
+                    diff_line(LineKind::Context, "ctx1"),
+                    diff_line(LineKind::Context, "ctx2"),
+                    diff_line(LineKind::Added, "new_stuff"),
+                    diff_line(LineKind::Context, "ctx3"),
+                ],
+            )],
+            100,
+        )]);
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
+            .expect("hunk header row exists");
+        app.scroll_to(header_row);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(
+            line, 12,
+            "hunk header with 2 leading context lines → first changed line at new_start+2"
+        );
     }
 
     #[test]
