@@ -282,10 +282,6 @@ fn c_green(s: &str) -> String {
 fn c_yellow(s: &str) -> String {
     format!("\x1b[33m{s}\x1b[0m")
 }
-#[allow(dead_code)]
-fn c_red(s: &str) -> String {
-    format!("\x1b[31m{s}\x1b[0m")
-}
 fn c_dim(s: &str) -> String {
     format!("\x1b[2m{s}\x1b[0m")
 }
@@ -774,16 +770,31 @@ fn install_gemini() -> Result<InstallReport> {
 // ── M8: teardown ────────────────────────────────────────────────
 
 pub fn run_teardown(project_root: &Path) -> Result<()> {
+    println!();
+    println!(
+        "  {}  {}",
+        c_bold(&c_magenta("傷")),
+        c_bold("kizu teardown"),
+    );
+    println!();
+
     let detected = detect_agents(project_root);
     let mut any_removed = false;
 
     for agent in &detected {
+        let mut agent_removed = false;
+
         if let Some(dir) = agent.kind.project_config_dir() {
-            // Check both settings.json and settings.local.json.
             for filename in ["settings.json", "settings.local.json"] {
                 let path = project_root.join(dir).join(filename);
                 if remove_kizu_hooks_from_json(&path)? {
-                    println!("  {} hooks removed from {}", agent.kind, path.display());
+                    println!(
+                        "  {}  {}  {}",
+                        c_bold(&format!("{:<12}", agent.kind.to_string())),
+                        c_green("✓ removed"),
+                        c_dim(&format!("→ {}", path.display())),
+                    );
+                    agent_removed = true;
                     any_removed = true;
                 }
             }
@@ -792,22 +803,28 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
             let path = dir.join("settings.json");
             if remove_kizu_hooks_from_json(&path)? {
                 println!(
-                    "  {} user hooks removed from {}",
-                    agent.kind,
-                    path.display()
+                    "  {}  {}  {}",
+                    c_bold(&format!("{:<12}", agent.kind.to_string())),
+                    c_green("✓ removed"),
+                    c_dim(&format!("→ {}", path.display())),
                 );
+                agent_removed = true;
                 any_removed = true;
             }
         }
-        // Cursor special path
         if agent.kind == AgentKind::Cursor {
             let path = project_root.join(".cursor").join("hooks.json");
             if remove_kizu_hooks_from_json(&path)? {
-                println!("  Cursor hooks removed from {}", path.display());
+                println!(
+                    "  {}  {}  {}",
+                    c_bold(&format!("{:<12}", "Cursor")),
+                    c_green("✓ removed"),
+                    c_dim(&format!("→ {}", path.display())),
+                );
+                agent_removed = true;
                 any_removed = true;
             }
         }
-        // Cline file-based hook
         if agent.kind == AgentKind::Cline {
             let hook_file = project_root
                 .join(".clinerules")
@@ -826,17 +843,80 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
                     } else {
                         std::fs::write(&hook_file, cleaned + "\n")?;
                     }
-                    println!("  Cline hook removed from {}", hook_file.display());
+                    println!(
+                        "  {}  {}  {}",
+                        c_bold(&format!("{:<12}", "Cline")),
+                        c_green("✓ removed"),
+                        c_dim(&format!("→ {}", hook_file.display())),
+                    );
+                    agent_removed = true;
                     any_removed = true;
                 }
             }
         }
+
+        if !agent_removed && (agent.binary_found || agent.config_dir_found) {
+            println!(
+                "  {}  {}",
+                c_bold(&format!("{:<12}", agent.kind.to_string())),
+                c_dim("– no kizu hooks found"),
+            );
+        }
     }
 
-    if !any_removed {
-        println!("  No kizu hooks found to remove.");
+    // Remove git pre-commit hook.
+    if remove_git_pre_commit_hook(project_root)? {
+        println!(
+            "  {}  {}",
+            c_bold(&format!("{:<12}", "git")),
+            c_green("✓ pre-commit hook removed"),
+        );
+        any_removed = true;
     }
+
+    // Remove session file.
+    crate::session::remove_session(project_root);
+
+    println!();
+    if any_removed {
+        println!("  {}  {}", c_green("✓"), c_bold("kizu hooks removed"));
+    } else {
+        println!(
+            "  {}  {}",
+            c_dim("–"),
+            c_dim("No kizu hooks found to remove"),
+        );
+    }
+    println!();
+
     Ok(())
+}
+
+/// Remove `kizu hook-pre-commit` from `.git/hooks/pre-commit`.
+fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
+    let git_dir = match crate::git::git_dir(project_root) {
+        Ok(d) => d,
+        Err(_) => return Ok(false),
+    };
+    let hook_path = git_dir.join("hooks").join("pre-commit");
+    if !hook_path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&hook_path)?;
+    if !content.contains("kizu hook-pre-commit") {
+        return Ok(false);
+    }
+    let cleaned: String = content
+        .lines()
+        .filter(|l| !l.contains("kizu hook-pre-commit") && !l.contains("# kizu scar guard"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if cleaned.trim().is_empty() || cleaned.trim() == "#!/bin/sh" {
+        std::fs::remove_file(&hook_path)?;
+    } else {
+        std::fs::write(&hook_path, cleaned.trim_end().to_string() + "\n")?;
+    }
+    Ok(true)
 }
 
 /// Remove all hook entries whose `command` starts with `kizu hook-`
