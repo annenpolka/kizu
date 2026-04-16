@@ -439,7 +439,14 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
             let line = &hunks[*hunk_idx].lines[*line_idx];
             let is_cursor = cursor_sub.is_some();
             match wrap_body_width {
-                Some(width) => render_diff_line_wrapped(line, is_selected, cursor_sub, width),
+                Some(width) => render_diff_line_wrapped(
+                    line,
+                    is_selected,
+                    cursor_sub,
+                    width,
+                    hl,
+                    Some(&files[*file_idx].path),
+                ),
                 None => vec![render_diff_line(
                     line,
                     is_selected,
@@ -504,6 +511,8 @@ fn render_diff_line_wrapped(
     is_selected: bool,
     cursor_sub: Option<usize>,
     body_width: usize,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: Option<&std::path::Path>,
 ) -> Vec<Line<'static>> {
     // ADR-0014: background-color diff rendering. Focused hunks keep
     // full brightness; unfocused hunks wear `Modifier::DIM` so the
@@ -514,7 +523,7 @@ fn render_diff_line_wrapped(
         LineKind::Deleted => Some(BG_DELETED),
         LineKind::Context => None,
     };
-    let body_style = match (bg, is_selected) {
+    let base_style = match (bg, is_selected) {
         (Some(b), true) => Style::default().bg(b),
         (Some(b), false) => Style::default().bg(b).add_modifier(Modifier::DIM),
         (None, true) => Style::default(),
@@ -533,20 +542,44 @@ fn render_diff_line_wrapped(
             .add_modifier(Modifier::DIM),
     };
 
+    // Highlight the full line once, then distribute tokens across
+    // wrapped visual rows by tracking character positions.
+    let tokens: Option<Vec<crate::highlight::HlToken>> =
+        if let (Some(hl), Some(path)) = (hl, file_path) {
+            let toks = hl.highlight_line(&line.content, path);
+            if toks.len() > 1 || toks.first().is_some_and(|t| t.fg != Color::Reset) {
+                Some(toks)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // Pre-compute per-character fg colors from tokens (if available).
+    // This avoids complex token-boundary tracking when distributing
+    // across wrapped chunks.
+    let char_colors: Vec<Color> = if let Some(ref toks) = tokens {
+        let mut colors = Vec::with_capacity(line.content.len());
+        for tok in toks {
+            for _ in tok.text.chars() {
+                colors.push(tok.fg);
+            }
+        }
+        colors
+    } else {
+        Vec::new()
+    };
+
     let chunks = wrap_at_chars(&line.content, body_width.max(1));
     let last_idx = chunks.len().saturating_sub(1);
+    let mut char_offset = 0usize;
 
     chunks
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
             let is_last = i == last_idx;
-            // ADR-0009: the cursor arrow lands on the visual sub-row
-            // the user has actually walked to via Ctrl-d / J inside
-            // a long wrapped line, not always on the first visual
-            // row. If `cursor_sub` is larger than the available
-            // visual rows (e.g. after a clamped move), fall back to
-            // the last visual row so the marker never disappears.
             let cursor_line = cursor_sub.map(|s| s.min(last_idx));
             let bar = if cursor_line == Some(i) {
                 Span::styled(
@@ -560,22 +593,44 @@ fn render_diff_line_wrapped(
             } else {
                 Span::raw("     ")
             };
-            // Pad the body chunk out to `body_width` with spaces so the
-            // background color tints the entire right margin. The pad
-            // count must leave room for the `¶` marker on the last row.
             let marker_reserve = if is_last && line.has_trailing_newline {
                 1
             } else {
                 0
             };
-            let chunk_len = chunk.chars().count();
-            let pad = body_width.saturating_sub(chunk_len + marker_reserve);
-            let padded_body: String = chunk.chars().chain(std::iter::repeat_n(' ', pad)).collect();
-            let body_span = Span::styled(padded_body, body_style);
-            let mut spans = vec![bar, body_span];
+            let chunk_char_count = chunk.chars().count();
+            let pad = body_width.saturating_sub(chunk_char_count + marker_reserve);
+
+            let mut spans = vec![bar];
+
+            if !char_colors.is_empty() {
+                // Build per-token spans for this wrapped chunk.
+                let chunk_colors = &char_colors[char_offset..char_offset + chunk_char_count];
+                let mut run_start = 0usize;
+                let chunk_chars: Vec<char> = chunk.chars().collect();
+                while run_start < chunk_chars.len() {
+                    let run_color = chunk_colors[run_start];
+                    let run_end = (run_start + 1..chunk_chars.len())
+                        .find(|&j| chunk_colors[j] != run_color)
+                        .unwrap_or(chunk_chars.len());
+                    let text: String = chunk_chars[run_start..run_end].iter().collect();
+                    spans.push(Span::styled(text, base_style.fg(run_color)));
+                    run_start = run_end;
+                }
+                if pad > 0 {
+                    spans.push(Span::styled(" ".repeat(pad), base_style));
+                }
+            } else {
+                // No highlighting: single span for the whole chunk.
+                let padded_body: String =
+                    chunk.chars().chain(std::iter::repeat_n(' ', pad)).collect();
+                spans.push(Span::styled(padded_body, base_style));
+            }
+
             if is_last && line.has_trailing_newline {
                 spans.push(Span::styled("¶", marker_style));
             }
+            char_offset += chunk_char_count;
             Line::from(spans)
         })
         .collect()
