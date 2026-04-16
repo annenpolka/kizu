@@ -496,10 +496,19 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
 }
 
 /// Returns `Some(reason)` if `kind` cannot be installed at `scope`.
+///
+/// Only Claude Code is known to support `settings.local.json` (the
+/// `project-local` gitignored variant). Qwen reads `.qwen/settings.json`
+/// only, so `project-local` would write a file Qwen never loads.
 fn scope_incompatible(kind: AgentKind, scope: Scope) -> Option<&'static str> {
     match (kind, scope) {
         (AgentKind::Cursor, Scope::User) => Some("Cursor only supports project-level hooks"),
-        (AgentKind::Cline, Scope::User) => Some("Cline uses file-based project hooks only"),
+        (AgentKind::Cline, Scope::User | Scope::ProjectLocal) => {
+            Some("Cline uses file-based project hooks only")
+        }
+        (AgentKind::QwenCode, Scope::ProjectLocal) => {
+            Some("Qwen Code does not read settings.local.json; use project-shared or user")
+        }
         (AgentKind::Gemini, _) => Some("Gemini CLI has no hook mechanism"),
         _ => None,
     }

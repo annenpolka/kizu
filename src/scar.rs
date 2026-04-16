@@ -212,9 +212,15 @@ pub fn insert_scar(path: &Path, line_number: usize, kind: ScarKind, body: &str) 
         }
     }
 
-    let mut out = String::with_capacity(original.len() + scar_body.len() + newline.len());
+    let mut out = String::with_capacity(original.len() + scar_body.len() + newline.len() * 2);
     for line in &lines[..insert_at] {
         out.push_str(line);
+    }
+    // If appending after a line that lacks a trailing newline (e.g.
+    // EOF without final newline), add one so the scar starts on its
+    // own line instead of splicing into the previous content.
+    if insert_at > 0 && !lines[insert_at - 1].ends_with('\n') {
+        out.push_str(newline);
     }
     out.push_str(&scar_body);
     out.push_str(newline);
@@ -521,6 +527,17 @@ mod tests {
             message.contains("reading"),
             "error should mention the read phase, got: {message}"
         );
+    }
+
+    #[test]
+    fn insert_scar_at_eof_without_trailing_newline_adds_separator() {
+        let dir = TempDir::new().expect("tmp");
+        // File ends without a trailing newline.
+        let path = write_tmp(&dir, "main.rs", "fn a() {}");
+        insert_scar(&path, 999, ScarKind::Ask, "eof").expect("insert");
+        let after = fs::read_to_string(&path).expect("read back");
+        // The scar must be on its own line, not spliced into "fn a() {}".
+        assert_eq!(after, "fn a() {}\n// @kizu[ask]: eof\n");
     }
 
     #[test]

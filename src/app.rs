@@ -724,6 +724,11 @@ pub struct RevertConfirmState {
     pub file_idx: usize,
     pub hunk_idx: usize,
     pub file_path: PathBuf,
+    /// Stable hunk identity: `old_start` captured when the dialog was
+    /// opened. Used in `confirm_revert` to re-resolve the hunk by
+    /// identity (path + old_start) instead of trusting the stale
+    /// index pair, which can drift after a watcher-driven refresh.
+    pub hunk_old_start: usize,
 }
 
 /// Single-shot easing state for the viewport's top-row tween.
@@ -2211,13 +2216,17 @@ impl App {
         let Some(file) = self.files.get(file_idx) else {
             return;
         };
-        if !matches!(file.content, DiffContent::Text(_)) {
+        let DiffContent::Text(hunks) = &file.content else {
             return;
-        }
+        };
+        let Some(hunk) = hunks.get(hunk_idx) else {
+            return;
+        };
         self.revert_confirm = Some(RevertConfirmState {
             file_idx,
             hunk_idx,
             file_path: file.path.clone(),
+            hunk_old_start: hunk.old_start,
         });
     }
 
@@ -2235,13 +2244,21 @@ impl App {
         let Some(state) = self.revert_confirm.take() else {
             return;
         };
-        let Some(file) = self.files.get(state.file_idx) else {
-            return;
-        };
-        let DiffContent::Text(hunks) = &file.content else {
-            return;
-        };
-        let Some(hunk) = hunks.get(state.hunk_idx) else {
+        // Re-resolve the hunk by stable identity (path + old_start)
+        // instead of trusting the saved indices, which may have
+        // drifted after a watcher-driven refresh.
+        let hunk = self
+            .files
+            .iter()
+            .find(|f| f.path == state.file_path)
+            .and_then(|f| match &f.content {
+                DiffContent::Text(hunks) => {
+                    hunks.iter().find(|h| h.old_start == state.hunk_old_start)
+                }
+                _ => None,
+            });
+        let Some(hunk) = hunk else {
+            self.last_error = Some("revert: hunk no longer present".into());
             return;
         };
         let patch = git::build_hunk_patch(&state.file_path, hunk);
