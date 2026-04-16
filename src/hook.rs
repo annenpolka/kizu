@@ -299,7 +299,7 @@ pub fn sanitize_event(input: &NormalizedHookInput) -> SanitizedEvent {
 /// directory is created with `0700` permissions if it doesn't exist.
 /// Individual event files are written with `0600` permissions.
 pub fn write_event(event: &SanitizedEvent) -> Result<PathBuf> {
-    let dir = crate::paths::events_dir()
+    let dir = crate::paths::events_dir(&event.cwd)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve kizu events directory"))?;
     crate::paths::ensure_private_dir(&dir)?;
 
@@ -329,8 +329,8 @@ pub fn write_event(event: &SanitizedEvent) -> Result<PathBuf> {
 /// Prune the events directory: remove entries older than `ttl` and
 /// enforce a maximum entry count. Returns the number of files removed.
 /// Uses the default events directory from [`crate::paths::events_dir`].
-pub fn prune_event_log(ttl: Duration, max_entries: usize) -> Result<usize> {
-    let dir = match crate::paths::events_dir() {
+pub fn prune_event_log(root: &Path, ttl: Duration, max_entries: usize) -> Result<usize> {
+    let dir = match crate::paths::events_dir(root) {
         Some(d) if d.is_dir() => d,
         _ => return Ok(0),
     };

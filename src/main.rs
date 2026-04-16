@@ -136,7 +136,14 @@ fn run_hook_stop(agent_str: &str) -> Result<()> {
 
 fn run_hook_log_event() -> Result<()> {
     let input = hook::parse_hook_input(hook::AgentKind::ClaudeCode, std::io::stdin().lock())?;
-    let event = hook::sanitize_event(&input);
+    let cwd = input
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let root = git::find_root(&cwd).unwrap_or(cwd);
+    let mut event = hook::sanitize_event(&input);
+    // Ensure cwd is the git root so per-project events dir resolves correctly.
+    event.cwd = root.clone();
     hook::write_event(&event)?;
 
     // Prune old entries. TTL defaults to 24h, overridable via env var.
@@ -144,7 +151,7 @@ fn run_hook_log_event() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(86400);
-    hook::prune_event_log(std::time::Duration::from_secs(ttl_secs), 1000)?;
+    hook::prune_event_log(&root, std::time::Duration::from_secs(ttl_secs), 1000)?;
 
     Ok(())
 }

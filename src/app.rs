@@ -966,13 +966,6 @@ impl App {
             Err(_) => return,
         };
 
-        // Filter: only accept events whose cwd matches this TUI's
-        // project root. The events dir is global, so other projects'
-        // hook-log-event writes land here too.
-        if event.cwd != self.root {
-            return;
-        }
-
         // Capture per-operation diff for each affected file.
         let mut operation_diff = String::new();
 
@@ -1020,7 +1013,7 @@ impl App {
     /// events from before this session cannot carry a per-operation
     /// diff and would only show "[diff not captured]" noise.
     pub fn clean_stale_events(&self) {
-        let dir = match crate::paths::events_dir() {
+        let dir = match crate::paths::events_dir(&self.root) {
             Some(d) if d.is_dir() => d,
             _ => return,
         };
@@ -3323,7 +3316,12 @@ async fn run_loop(
                     let (need_recompute, need_head_dirty) = app.handle_watch_burst(burst);
                     if need_recompute {
                         watch.refresh_worktree_watches();
-                        app.recompute_diff();
+                        // In stream mode, don't overwrite files/layout with
+                        // git diff — the scroll view shows stream events.
+                        // The diff will be refreshed when the user tabs back.
+                        if app.view_mode != ViewMode::Stream {
+                            app.recompute_diff();
+                        }
                     }
                     if need_head_dirty {
                         app.mark_head_dirty();
@@ -3335,7 +3333,9 @@ async fn run_loop(
             }
             _ = &mut startup_refresh, if startup_refresh_pending => {
                 startup_refresh_pending = false;
-                app.recompute_diff();
+                if app.view_mode != ViewMode::Stream {
+                    app.recompute_diff();
+                }
             }
             _ = frame.tick(), if app.anim.is_some() => {
                 // The tick itself carries no payload — falling through

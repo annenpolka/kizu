@@ -62,10 +62,11 @@ pub fn session_file(root: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Full path to the events directory for stream mode data.
-/// Returns `None` if the state directory cannot be resolved.
-pub fn events_dir() -> Option<PathBuf> {
-    state_dir().map(|d| d.join("events"))
+/// Full path to the per-project events directory for stream mode.
+/// Scoped by `project_hash(root)` so multiple kizu instances on
+/// different projects write to isolated directories.
+pub fn events_dir(root: &Path) -> Option<PathBuf> {
+    state_dir().map(|d| d.join("events").join(project_hash(root)))
 }
 
 /// Create a directory with `0700` permissions (owner-only access).
@@ -120,11 +121,16 @@ mod tests {
     }
 
     #[test]
-    fn events_dir_with_override() {
+    fn events_dir_is_per_project() {
         unsafe { std::env::set_var("KIZU_STATE_DIR", "/tmp/kizu-test-state") };
-        let path = events_dir().unwrap();
+        let path_a = events_dir(Path::new("/project-a")).unwrap();
+        let path_b = events_dir(Path::new("/project-b")).unwrap();
         unsafe { std::env::remove_var("KIZU_STATE_DIR") };
-        assert_eq!(path, PathBuf::from("/tmp/kizu-test-state/events"));
+        // Different projects get different events dirs.
+        assert_ne!(path_a, path_b);
+        // Both live under <state_dir>/events/<hash>/.
+        assert!(path_a.starts_with("/tmp/kizu-test-state/events/"));
+        assert!(path_b.starts_with("/tmp/kizu-test-state/events/"));
     }
 
     #[test]

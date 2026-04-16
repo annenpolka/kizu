@@ -237,7 +237,7 @@ pub fn start(
     }
 
     // Stream mode: watch the events directory for new event-log files.
-    let events_debouncer = spawn_events_dir_debouncer(tx.clone());
+    let events_debouncer = spawn_events_dir_debouncer(&worktree_root, tx.clone());
 
     Ok(WatchHandle {
         events: rx,
@@ -610,8 +610,11 @@ const EVENTS_DEBOUNCE: Duration = Duration::from_millis(100);
 /// `None` if the events directory cannot be resolved or the watcher
 /// fails to start (non-fatal: stream mode simply won't get live
 /// updates).
-fn spawn_events_dir_debouncer(tx: UnboundedSender<WatchEvent>) -> Option<KizuDebouncer> {
-    let events_dir = crate::paths::events_dir()?;
+fn spawn_events_dir_debouncer(
+    root: &Path,
+    tx: UnboundedSender<WatchEvent>,
+) -> Option<KizuDebouncer> {
+    let events_dir = crate::paths::events_dir(root)?;
     // Ensure the directory exists so the watcher has something to watch.
     let _ = crate::paths::ensure_private_dir(&events_dir);
     if !events_dir.is_dir() {
