@@ -37,11 +37,7 @@ pub fn detect_terminal() -> Option<TerminalKind> {
     if std::env::var("KITTY_LISTEN_ON").is_ok() {
         return Some(TerminalKind::Kitty);
     }
-    if std::env::var("TERM_PROGRAM")
-        .ok()
-        .as_deref()
-        == Some("ghostty")
-    {
+    if std::env::var("TERM_PROGRAM").ok().as_deref() == Some("ghostty") {
         return Some(TerminalKind::Ghostty);
     }
     None

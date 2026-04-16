@@ -927,8 +927,8 @@ fn render_stream_view(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     // Split into left (event list) and right (diff detail).
-    let chunks = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(area);
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
     let list_area = chunks[0];
     let detail_area = chunks[1];
 
@@ -989,7 +989,11 @@ fn render_stream_view(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Block::default()
                 .borders(Borders::RIGHT)
                 .title(" Stream ")
-                .title_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                .title_style(
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
         )
         .highlight_style(
             Style::default()

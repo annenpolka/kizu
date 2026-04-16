@@ -961,7 +961,11 @@ impl App {
                 .unwrap_or_default();
 
             // Compute per-operation diff by comparing with previous snapshot.
-            let prev = self.diff_snapshots.get(file_path).cloned().unwrap_or_default();
+            let prev = self
+                .diff_snapshots
+                .get(file_path)
+                .cloned()
+                .unwrap_or_default();
             let op_diff = compute_operation_diff(&prev, &current_diff);
 
             if !op_diff.is_empty() {

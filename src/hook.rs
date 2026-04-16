@@ -996,9 +996,12 @@ mod tests {
 
     #[test]
     fn prune_returns_zero_when_events_dir_missing() {
-        let removed =
-            prune_event_log_in(Path::new("/nonexistent/path"), Duration::from_secs(3600), 1000)
-                .unwrap();
+        let removed = prune_event_log_in(
+            Path::new("/nonexistent/path"),
+            Duration::from_secs(3600),
+            1000,
+        )
+        .unwrap();
         assert_eq!(removed, 0);
     }
 

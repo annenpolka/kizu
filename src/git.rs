@@ -80,11 +80,15 @@ pub enum LineKind {
 /// Get the unified diff for a single file against the baseline.
 /// Returns the raw diff output as a string, or an empty string on failure.
 pub fn diff_single_file(root: &Path, baseline_sha: &str, file_path: &Path) -> Result<String> {
-    let rel = file_path
-        .strip_prefix(root)
-        .unwrap_or(file_path);
+    let rel = file_path.strip_prefix(root).unwrap_or(file_path);
     let output = Command::new("git")
-        .args(["diff", "--no-renames", baseline_sha, "--", &rel.to_string_lossy()])
+        .args([
+            "diff",
+            "--no-renames",
+            baseline_sha,
+            "--",
+            &rel.to_string_lossy(),
+        ])
         .current_dir(root)
         .output()
         .context("git diff single file")?;

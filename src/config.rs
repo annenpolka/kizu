@@ -279,7 +279,10 @@ pub fn load_config_from(path: &Path) -> KizuConfig {
     match toml::from_str(&content) {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("kizu: warning: failed to parse config {}: {e}", path.display());
+            eprintln!(
+                "kizu: warning: failed to parse config {}: {e}",
+                path.display()
+            );
             KizuConfig::default()
         }
     }
