@@ -92,7 +92,6 @@ pub struct ScarHit {
 /// Grep every file in `paths` for `@kizu[...]` scars. Returns all
 /// hits across all files, in order. Files that cannot be read (e.g.
 /// deleted between the scan and the grep) are silently skipped.
-// @kizu[ask]: explain this change
 ///
 /// Only matches scars that appear as the primary content of a
 /// comment line (preceded by `//`, `#`, `--`, `/*`, or `<!--`
@@ -165,29 +164,34 @@ pub fn format_stop_stderr(hits: &[ScarHit]) -> String {
     out
 }
 
-/// List all files that might contain scars: tracked modified +
-/// untracked. Mirrors the file set that the kizu TUI's diff view
-/// shows, ensuring the Stop hook scans the same scope.
-pub fn enumerate_changed_files(root: &Path) -> Result<Vec<PathBuf>> {
+/// List all files that might contain scars: **all tracked files**
+/// plus untracked. The Stop hook must catch scars that rode along
+/// into a commit (the user marked a line, then an auto-commit
+/// included the scar), so limiting to `git diff --name-only HEAD`
+/// is insufficient — a committed scar would slip through.
+///
+/// Uses `git ls-files` (tracked) + `git status --porcelain`
+/// (untracked) to cover the full worktree.
+pub fn enumerate_all_files(root: &Path) -> Result<Vec<PathBuf>> {
     use std::process::Command;
 
-    // tracked modified/added
-    let diff_output = Command::new("git")
-        .args(["diff", "--name-only", "HEAD", "--"])
+    // All tracked files in the worktree.
+    let ls_output = Command::new("git")
+        .args(["ls-files", "-z"])
         .current_dir(root)
         .output()
-        .context("git diff --name-only")?;
+        .context("git ls-files")?;
     let mut paths: Vec<PathBuf> = Vec::new();
-    if diff_output.status.success() {
-        for line in String::from_utf8_lossy(&diff_output.stdout).lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                paths.push(root.join(trimmed));
+    if ls_output.status.success() {
+        for record in ls_output.stdout.split(|&b| b == 0) {
+            if !record.is_empty() {
+                let rel = String::from_utf8_lossy(record);
+                paths.push(root.join(rel.as_ref()));
             }
         }
     }
 
-    // untracked
+    // Untracked files.
     let status_output = Command::new("git")
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(root)

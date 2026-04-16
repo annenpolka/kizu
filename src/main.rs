@@ -105,7 +105,7 @@ fn run_hook_stop(agent_str: &str) -> Result<()> {
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let root = git::find_root(&cwd)?;
-    let changed = hook::enumerate_changed_files(&root)?;
+    let changed = hook::enumerate_all_files(&root)?;
     let hits = hook::scan_scars(&changed);
 
     if !hits.is_empty() {
