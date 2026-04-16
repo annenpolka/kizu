@@ -6,7 +6,7 @@ Realtime diff monitor + inline scar review TUI for AI coding agents like Claude 
 
 ## What it does (when finished)
 
-While Claude Code (or another terminal AI coding agent) edits files in another pane, kizu sits next to it and shows you what changed in real time. When something looks wrong, you press one key and a `@review:` comment is written into the source file at the change site. Claude Code picks it up on the next read, or on the next `Stop` hook firing — whichever comes first — and fixes it without you having to type a sentence.
+While Claude Code (or another terminal AI coding agent) edits files in another pane, kizu sits next to it and shows you what changed in real time. When something looks wrong, you press one key and a `@kizu[ask|reject|free]:` comment is written into the source file at the change site. Claude Code picks it up on the next read, or on the next `Stop` hook firing — whichever comes first — and fixes it without you having to type a sentence.
 
 The design solves three frictions of "watching Claude Code stream output out of the corner of your eye":
 

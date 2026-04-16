@@ -11,6 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 const SCROLL_ANIM_DURATION: Duration = Duration::from_millis(150);
 
 use crate::git::{self, DiffContent, FileDiff, FileStatus, LineKind};
+use crate::scar::ScarKind;
 use crate::watcher::{self, WatchEvent, WatchSource};
 
 /// Half-page scroll constant for `Ctrl-d` / `Ctrl-u`. M5+ may swap this for
@@ -18,8 +19,9 @@ use crate::watcher::{self, WatchEvent, WatchSource};
 /// value keeps `handle_key` testable as a pure function.
 const HALF_PAGE: usize = 12;
 
-/// Canned scar body bound to the `a` key — "ask". The `@review:`
-/// marker itself is added by [`crate::scar::CommentSyntax::render`],
+/// Canned scar body bound to the `a` key — "ask". The
+/// `@kizu[ask]:` marker itself is added by
+/// [`crate::scar::CommentSyntax::render_scar`],
 /// so this constant holds *just the instruction text*. Plain English
 /// imperatives travel across agents (Claude Code / Codex / Cursor /
 /// Gemini) without translation layers — the scar is read by the
@@ -845,10 +847,10 @@ impl App {
             // later M4 slices. Picker mode is already handled
             // upstream so these arms only fire in normal mode.
             KeyCode::Char('a') => {
-                self.insert_canned_scar(SCAR_TEXT_ASK);
+                self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
             }
             KeyCode::Char('r') => {
-                self.insert_canned_scar(SCAR_TEXT_REJECT);
+                self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
             }
             KeyCode::Char('R') => {
                 return self.reset_baseline();
@@ -1426,18 +1428,19 @@ impl App {
         }
     }
 
-    /// Insert a scar with the given canned body at the cursor's
-    /// current position. No-op when the cursor is not on a diff row
-    /// (file header, hunk header, spacer, binary notice). Write
-    /// failures from [`crate::scar::insert_scar`] are captured in
-    /// `last_error` so the footer surfaces them instead of panicking.
-    /// The watcher picks up the resulting write on its next tick and
-    /// re-runs `compute_diff`, which shows the new scar line in place.
-    pub fn insert_canned_scar(&mut self, body: &'static str) {
+    /// Insert a scar of the given `kind` with `body` as the human
+    /// text, at the cursor's current position. No-op when the
+    /// cursor is not on a diff row (file header, hunk header,
+    /// spacer, binary notice). Write failures from
+    /// [`crate::scar::insert_scar`] are captured in `last_error` so
+    /// the footer surfaces them instead of panicking. The watcher
+    /// picks up the resulting write on its next tick and re-runs
+    /// `compute_diff`, which shows the new scar line in place.
+    pub fn insert_canned_scar(&mut self, kind: ScarKind, body: &str) {
         let Some((path, line)) = self.scar_target_line() else {
             return;
         };
-        if let Err(err) = crate::scar::insert_scar(&path, line, body) {
+        if let Err(err) = crate::scar::insert_scar(&path, line, kind, body) {
             self.last_error = Some(format!("scar: {err:#}"));
         }
     }
@@ -1446,35 +1449,50 @@ impl App {
     /// 1-indexed **new-file** line number, suitable for
     /// [`crate::scar::insert_scar`].
     ///
-    /// - Returns `None` when the cursor is parked on a non-diff row
-    ///   (file header, hunk header, spacer, binary notice) or the
-    ///   underlying file is binary / truncated. Those cases should
-    ///   surface a no-op at the keybinding level so scar does not
-    ///   silently write to the wrong line.
-    /// - For a cursor on an Added or Context line, returns the new-file
-    ///   line number of that line itself. The caller asks
-    ///   `insert_scar` to drop the scar on the line *directly above* it,
-    ///   which is the documented "comment above the code" convention.
-    /// - For a cursor on a Deleted line, the line has no new-file
+    /// - Returns `None` when the cursor is parked on a row that has no
+    ///   scar-able location: file headers (they point at a whole file,
+    ///   not a specific line), spacers, binary notices, or files whose
+    ///   content is binary / truncated.
+    /// - For a cursor on a **hunk header** row, returns the hunk's
+    ///   `new_start` so `insert_scar` drops the scar immediately above
+    ///   the first line of the hunk body. This is what the user wants
+    ///   when they hit `a` / `r` with the cursor on the `@@` header
+    ///   of a multi-line hunk: one scar that annotates the whole block.
+    /// - For a cursor on an **Added or Context line**, returns the
+    ///   new-file line number of that line itself. The scar lands
+    ///   directly above it, matching the "comment above the code"
+    ///   convention.
+    /// - For a cursor on a **Deleted line**, the line has no new-file
     ///   position; we return the new-file line number of the next
-    ///   non-deleted line in the same hunk (i.e. the line that effectively
-    ///   "replaces" it). If the deleted run reaches the hunk tail we fall
-    ///   through to the same offset, which matches "insert the scar right
-    ///   after the deletion block".
+    ///   non-deleted line in the same hunk (i.e. the line that
+    ///   effectively "replaces" it). If the deleted run reaches the
+    ///   hunk tail we fall through to the same offset, which matches
+    ///   "insert the scar right after the deletion block".
     pub fn scar_target_line(&self) -> Option<(PathBuf, usize)> {
-        let RowKind::DiffLine {
-            file_idx,
-            hunk_idx,
-            line_idx,
-        } = *self.layout.rows.get(self.scroll)?
-        else {
-            return None;
+        let row = self.layout.rows.get(self.scroll)?;
+        let (file_idx, hunk_idx, diff_line_idx) = match *row {
+            RowKind::DiffLine {
+                file_idx,
+                hunk_idx,
+                line_idx,
+            } => (file_idx, hunk_idx, Some(line_idx)),
+            RowKind::HunkHeader { file_idx, hunk_idx } => (file_idx, hunk_idx, None),
+            _ => return None,
         };
         let file = self.files.get(file_idx)?;
         let DiffContent::Text(hunks) = &file.content else {
             return None;
         };
         let hunk = hunks.get(hunk_idx)?;
+
+        // Hunk header cursor: target the very first line of the hunk
+        // body. `insert_scar` will then land the scar above that line,
+        // which is the natural "annotate the whole hunk" position.
+        let Some(line_idx) = diff_line_idx else {
+            return Some((self.root.join(&file.path), hunk.new_start));
+        };
+
+        // Diff line cursor: walk to compute the new-file line number.
         let mut offset: usize = 0;
         for (i, line) in hunk.lines.iter().enumerate() {
             if i > line_idx {
@@ -4340,7 +4358,7 @@ mod tests {
 
         let after = std::fs::read_to_string(tmp.path().join("src/main.rs")).expect("read back");
         assert_eq!(
-            after, "fn one() {}\n// @review: explain this change\nfn two() {}\n",
+            after, "fn one() {}\n// @kizu[ask]: explain this change\nfn two() {}\n",
             "`a` key must insert the canned ask scar above the cursor row",
         );
         assert!(
@@ -4365,7 +4383,7 @@ mod tests {
 
         let after = std::fs::read_to_string(tmp.path().join("auth.py")).expect("read back");
         assert_eq!(
-            after, "def main():\n# @review: revert this change\n    return 1\n",
+            after, "def main():\n# @kizu[reject]: revert this change\n    return 1\n",
             "`r` key must insert the canned reject scar using python # syntax",
         );
     }
@@ -4424,6 +4442,63 @@ mod tests {
                 .is_some_and(|msg| msg.starts_with("scar:")),
             "missing-file scar failure must land on last_error, got {:?}",
             app.last_error
+        );
+    }
+
+    #[test]
+    fn scar_target_line_maps_hunk_header_cursor_to_hunk_new_start() {
+        // When the cursor sits on the `@@ ... @@` row, the scar
+        // should land above the first line of the hunk body — i.e.
+        // at `hunk.new_start`.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                42,
+                vec![
+                    diff_line(LineKind::Added, "first"),
+                    diff_line(LineKind::Added, "second"),
+                ],
+            )],
+            100,
+        )]);
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
+            .expect("hunk header row exists");
+        app.scroll_to(header_row);
+        let (_, line) = app.scar_target_line().expect("target");
+        assert_eq!(line, 42, "hunk-header cursor must map to hunk.new_start");
+    }
+
+    #[test]
+    fn handle_key_a_on_hunk_header_writes_scar_above_first_hunk_line() {
+        // Real tempdir end-to-end: cursor on the hunk header row,
+        // press `a`, and the source file should now carry the
+        // canned ask scar directly above the first body line.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/lib.rs",
+            "line_a\nline_b\n",
+            2,
+            vec![diff_line(LineKind::Added, "line_b")],
+        );
+        let header_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
+            .expect("hunk header row exists");
+        app.scroll_to(header_row);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let after = std::fs::read_to_string(tmp.path().join("src/lib.rs")).expect("read back");
+        assert_eq!(
+            after, "line_a\n// @kizu[ask]: explain this change\nline_b\n",
+            "`a` on a hunk header must drop the scar above hunk.new_start",
         );
     }
 

@@ -28,7 +28,7 @@ enum Command {
     HookPostTool,
     /// PostToolUse hook entry: async event log writer for stream mode (v0.2)
     HookLogEvent,
-    /// Stop hook entry: detect outstanding @review: scars (v0.2)
+    /// Stop hook entry: detect outstanding @kizu[*]: scars (v0.2)
     HookStop,
 }
 

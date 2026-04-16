@@ -1,10 +1,12 @@
-//! scar (`@review:` inline comment) core — M2/M3 of the v0.2 ExecPlan.
+//! scar (`@kizu[...]:` inline comment) core — M2/M3 of the v0.2 ExecPlan.
 //!
 //! Pure, dependency-free logic for picking the right source-level
 //! comment syntax for a given file path and for rendering +
-//! inserting an `@review: ...` scar. The app layer calls
-//! [`insert_scar`] from its normal-mode `a` / `r` / `c` / `x` key
-//! dispatch (M4 of v0.2).
+//! inserting a `@kizu[<kind>]: <body>` scar. The bracket tag makes
+//! the format parse with a single regex (`/@kizu\[(\w+)\]:\s*(.*)/`)
+//! so the future hook layer can extract category without a
+//! per-language tokenizer. The app layer calls [`insert_scar`] from
+//! its normal-mode `a` / `r` / `c` key dispatch (M4 of v0.2).
 
 use std::path::Path;
 
@@ -26,22 +28,68 @@ pub struct CommentSyntax {
 }
 
 impl CommentSyntax {
-    /// Render an `@review: <text>` scar in this syntax. The leading
-    /// `@review:` marker is embedded here so callers cannot forget
-    /// it and drift from the inline-scar contract documented in
-    /// `docs/inline-scar-pattern.md`.
+    /// Wrap `body` in this comment syntax. The leading open marker
+    /// and optional close marker are always added; the body itself
+    /// is passed through verbatim, so callers that want structured
+    /// content ([`CommentSyntax::render_scar`]) build it on top.
+    pub fn wrap(&self, body: &str) -> String {
+        match self.close {
+            Some(close) => format!("{} {} {}", self.open, body, close),
+            None => format!("{} {}", self.open, body),
+        }
+    }
+
+    /// Render a kizu scar line in this comment syntax.
+    ///
+    /// The final shape is `<open> @kizu[<kind>]: <body> <close?>`.
+    /// The bracketed kind tag makes the line parse cleanly with a
+    /// single regex (`/@kizu\[(\w+)\]:\s*(.*)/`) and keeps category
+    /// extraction language-independent — the hook layer can list
+    /// open scars by category without a per-language tokenizer.
     ///
     /// Examples:
     ///
-    /// - Rust / TS / Go / …: `// @review: hello`
-    /// - Python / YAML / sh: `# @review: hello`
-    /// - HTML / XML / SVG: `<!-- @review: hello -->`
-    /// - CSS / SCSS: `/* @review: hello */`
-    /// - SQL / Lua / Haskell: `-- @review: hello`
-    pub fn render(&self, text: &str) -> String {
-        match self.close {
-            Some(close) => format!("{} @review: {} {}", self.open, text, close),
-            None => format!("{} @review: {}", self.open, text),
+    /// - Rust / TS / Go: `// @kizu[ask]: explain this change`
+    /// - Python / YAML: `# @kizu[reject]: revert this change`
+    /// - HTML / XML: `<!-- @kizu[free]: why is this here? -->`
+    /// - CSS / SCSS: `/* @kizu[ask]: explain this change */`
+    /// - SQL / Lua / Haskell: `-- @kizu[reject]: revert this change`
+    pub fn render_scar(&self, kind: ScarKind, body: &str) -> String {
+        self.wrap(&format!("@kizu[{}]: {body}", kind.tag()))
+    }
+}
+
+/// The three canned categories a scar can carry.
+///
+/// - `Ask` is bound to the `a` key; the canned body asks the agent
+///   to explain the change.
+/// - `Reject` is bound to `r`; asks the agent to revert the change.
+/// - `Free` is the free-text `c` key — the body is whatever the
+///   user typed into the scar comment prompt, and the `free` tag
+///   lets the hook layer distinguish "I wrote this by hand" from
+///   the canned variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScarKind {
+    Ask,
+    Reject,
+    // Wired up in the later M4 slice that adds the `c` free-text
+    // input mode. Until then `Free` is exercised only by the
+    // render / insert unit tests, so dead_code would otherwise
+    // fire — explicit allow keeps the variant visible in the
+    // API surface without hiding it behind a conditional compile.
+    #[allow(dead_code)]
+    Free,
+}
+
+impl ScarKind {
+    /// Lowercase tag used inside the `@kizu[...]:` bracket. Stable
+    /// across the whole codebase — changing it would invalidate
+    /// every scar already written into a repo.
+    pub fn tag(self) -> &'static str {
+        match self {
+            ScarKind::Ask => "ask",
+            ScarKind::Reject => "reject",
+            ScarKind::Free => "free",
         }
     }
 }
@@ -97,19 +145,21 @@ pub fn detect_comment_syntax(path: &Path) -> CommentSyntax {
 /// Insert a scar comment on the line directly above `line_number`.
 ///
 /// `line_number` is the 1-indexed source line the scar is commenting
-/// *about* — the rendered `@review: ...` line lands immediately above
-/// it so the reader sees the note first and then the code it
-/// annotates. `text` is the raw comment body; `insert_scar` wraps it
-/// in the file's comment syntax (via [`detect_comment_syntax`] +
-/// [`CommentSyntax::render`]) before writing.
+/// *about* — the rendered `@kizu[<kind>]: <body>` line lands
+/// immediately above it so the reader sees the note first and then
+/// the code it annotates. `kind` selects the canned category tag
+/// and `body` is the human instruction text; `insert_scar` wraps
+/// the pair in the file's comment syntax (via
+/// [`detect_comment_syntax`] + [`CommentSyntax::render_scar`])
+/// before writing.
 ///
 /// # Idempotency
 ///
 /// If the line directly above the insertion point is already the
-/// *same* scar (same syntax, same rendered text, trimmed), this is a
-/// no-op. This makes `insert_scar` safe to call repeatedly from the
-/// app loop without stacking duplicate comments — a property we rely
-/// on when a single keypress triggers both the write and the
+/// *same* scar (same kind, same body, trimmed), this is a no-op.
+/// This makes `insert_scar` safe to call repeatedly from the app
+/// loop without stacking duplicate comments — a property we rely on
+/// when a single keypress triggers both the write and the
 /// watcher-driven recompute that follows.
 ///
 /// # Line endings
@@ -132,9 +182,9 @@ pub fn detect_comment_syntax(path: &Path) -> CommentSyntax {
 /// permission-denied, non-UTF-8 in v0.2 scope) or the write-back
 /// fails (read-only mount, disk full). The caller is expected to
 /// surface this error through `App.last_error` rather than panic.
-pub fn insert_scar(path: &Path, line_number: usize, text: &str) -> Result<()> {
+pub fn insert_scar(path: &Path, line_number: usize, kind: ScarKind, body: &str) -> Result<()> {
     let syntax = detect_comment_syntax(path);
-    let scar_body = syntax.render(text);
+    let scar_body = syntax.render_scar(kind, body);
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("reading {} for scar insertion", path.display()))?;
     let newline = if original.contains("\r\n") {
@@ -318,27 +368,46 @@ mod tests {
     }
 
     #[test]
-    fn render_line_comment_prefixes_review_marker() {
+    fn render_scar_line_comment_emits_kizu_bracket_tag() {
         assert_eq!(
-            SLASH_SLASH.render("この変更について説明して"),
-            "// @review: この変更について説明して"
+            SLASH_SLASH.render_scar(ScarKind::Ask, "explain this change"),
+            "// @kizu[ask]: explain this change"
         );
-        assert_eq!(HASH.render("やめて"), "# @review: やめて");
-        assert_eq!(DASH_DASH.render("why"), "-- @review: why");
+        assert_eq!(
+            HASH.render_scar(ScarKind::Reject, "revert this change"),
+            "# @kizu[reject]: revert this change"
+        );
+        assert_eq!(
+            DASH_DASH.render_scar(ScarKind::Free, "why here?"),
+            "-- @kizu[free]: why here?"
+        );
     }
 
     #[test]
-    fn render_block_comment_wraps_with_open_and_close_markers() {
-        assert_eq!(HTML.render("explain"), "<!-- @review: explain -->");
-        assert_eq!(CSS.render("explain"), "/* @review: explain */");
+    fn render_scar_block_comment_wraps_kizu_bracket_tag() {
+        assert_eq!(
+            HTML.render_scar(ScarKind::Ask, "explain"),
+            "<!-- @kizu[ask]: explain -->"
+        );
+        assert_eq!(
+            CSS.render_scar(ScarKind::Free, "explain"),
+            "/* @kizu[free]: explain */"
+        );
     }
 
     #[test]
-    fn render_preserves_unicode_and_whitespace_inside_text() {
+    fn render_scar_preserves_unicode_and_whitespace_inside_body() {
         assert_eq!(
-            SLASH_SLASH.render("日本語 with spaces  and 記号！"),
-            "// @review: 日本語 with spaces  and 記号！"
+            SLASH_SLASH.render_scar(ScarKind::Free, "日本語 with spaces  and 記号！"),
+            "// @kizu[free]: 日本語 with spaces  and 記号！"
         );
+    }
+
+    #[test]
+    fn scar_kind_tag_is_stable_across_all_variants() {
+        assert_eq!(ScarKind::Ask.tag(), "ask");
+        assert_eq!(ScarKind::Reject.tag(), "reject");
+        assert_eq!(ScarKind::Free.tag(), "free");
     }
 
     // --- M3: insert_scar ------------------------------------------
@@ -361,11 +430,11 @@ mod tests {
             "main.rs",
             "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
         );
-        insert_scar(&path, 3, "この変更について説明して").expect("insert");
+        insert_scar(&path, 3, ScarKind::Ask, "explain this change").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
         assert_eq!(
             after,
-            "fn main() {\n    let x = 1;\n// @review: この変更について説明して\n    let y = 2;\n}\n"
+            "fn main() {\n    let x = 1;\n// @kizu[ask]: explain this change\n    let y = 2;\n}\n"
         );
     }
 
@@ -373,20 +442,20 @@ mod tests {
     fn insert_scar_uses_python_hash_syntax_for_py_file() {
         let dir = TempDir::new().expect("tmp");
         let path = write_tmp(&dir, "app.py", "def main():\n    return 1\n");
-        insert_scar(&path, 2, "why?").expect("insert");
+        insert_scar(&path, 2, ScarKind::Free, "why?").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, "def main():\n# @review: why?\n    return 1\n");
+        assert_eq!(after, "def main():\n# @kizu[free]: why?\n    return 1\n");
     }
 
     #[test]
     fn insert_scar_uses_html_block_syntax_for_html_file() {
         let dir = TempDir::new().expect("tmp");
         let path = write_tmp(&dir, "page.html", "<div>\n  <p>hi</p>\n</div>\n");
-        insert_scar(&path, 2, "check layout").expect("insert");
+        insert_scar(&path, 2, ScarKind::Free, "check layout").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
         assert_eq!(
             after,
-            "<div>\n<!-- @review: check layout -->\n  <p>hi</p>\n</div>\n"
+            "<div>\n<!-- @kizu[free]: check layout -->\n  <p>hi</p>\n</div>\n"
         );
     }
 
@@ -394,38 +463,42 @@ mod tests {
     fn insert_scar_preserves_crlf_line_endings() {
         let dir = TempDir::new().expect("tmp");
         let path = write_tmp(&dir, "main.rs", "fn a() {}\r\nfn b() {}\r\n");
-        insert_scar(&path, 2, "look").expect("insert");
+        insert_scar(&path, 2, ScarKind::Free, "look").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, "fn a() {}\r\n// @review: look\r\nfn b() {}\r\n");
+        assert_eq!(after, "fn a() {}\r\n// @kizu[free]: look\r\nfn b() {}\r\n");
     }
 
     #[test]
     fn insert_scar_preserves_lf_line_endings_when_no_crlf_present() {
         let dir = TempDir::new().expect("tmp");
         let path = write_tmp(&dir, "main.rs", "fn a() {}\nfn b() {}\n");
-        insert_scar(&path, 2, "look").expect("insert");
+        insert_scar(&path, 2, ScarKind::Free, "look").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, "fn a() {}\n// @review: look\nfn b() {}\n");
+        assert_eq!(after, "fn a() {}\n// @kizu[free]: look\nfn b() {}\n");
     }
 
     #[test]
     fn insert_scar_is_idempotent_when_same_scar_is_already_above_target() {
         let dir = TempDir::new().expect("tmp");
-        let path = write_tmp(&dir, "main.rs", "fn a() {}\n// @review: look\nfn b() {}\n");
+        let path = write_tmp(
+            &dir,
+            "main.rs",
+            "fn a() {}\n// @kizu[free]: look\nfn b() {}\n",
+        );
         // Target is line 3 (`fn b()`). The line above already holds
         // the identical scar, so a second insert must be a no-op.
-        insert_scar(&path, 3, "look").expect("second insert");
+        insert_scar(&path, 3, ScarKind::Free, "look").expect("second insert");
         let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, "fn a() {}\n// @review: look\nfn b() {}\n");
+        assert_eq!(after, "fn a() {}\n// @kizu[free]: look\nfn b() {}\n");
     }
 
     #[test]
     fn insert_scar_with_line_number_1_prepends_to_file_start() {
         let dir = TempDir::new().expect("tmp");
         let path = write_tmp(&dir, "main.rs", "fn a() {}\nfn b() {}\n");
-        insert_scar(&path, 1, "root").expect("insert");
+        insert_scar(&path, 1, ScarKind::Free, "root").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, "// @review: root\nfn a() {}\nfn b() {}\n");
+        assert_eq!(after, "// @kizu[free]: root\nfn a() {}\nfn b() {}\n");
     }
 
     #[test]
@@ -433,16 +506,16 @@ mod tests {
         let dir = TempDir::new().expect("tmp");
         let path = write_tmp(&dir, "main.rs", "fn a() {}\nfn b() {}\n");
         // Line 999 does not exist; scar should land at the tail.
-        insert_scar(&path, 999, "tail").expect("insert");
+        insert_scar(&path, 999, ScarKind::Free, "tail").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, "fn a() {}\nfn b() {}\n// @review: tail\n");
+        assert_eq!(after, "fn a() {}\nfn b() {}\n// @kizu[free]: tail\n");
     }
 
     #[test]
     fn insert_scar_errors_gracefully_on_missing_file() {
         let dir = TempDir::new().expect("tmp");
         let ghost = dir.path().join("nope.rs");
-        let err = insert_scar(&ghost, 1, "x").expect_err("missing file");
+        let err = insert_scar(&ghost, 1, ScarKind::Free, "x").expect_err("missing file");
         let message = format!("{err:#}");
         assert!(
             message.contains("reading"),
@@ -454,8 +527,8 @@ mod tests {
     fn insert_scar_respects_unknown_extension_by_falling_back_to_hash() {
         let dir = TempDir::new().expect("tmp");
         let path = write_tmp(&dir, "notes.zzz", "first line\nsecond line\n");
-        insert_scar(&path, 2, "n").expect("insert");
+        insert_scar(&path, 2, ScarKind::Free, "n").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, "first line\n# @review: n\nsecond line\n");
+        assert_eq!(after, "first line\n# @kizu[free]: n\nsecond line\n");
     }
 }

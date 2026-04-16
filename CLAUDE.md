@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `docs/SPEC.md` — 全体仕様、フェーズ分割、TUI/hook 層スキーマ
 - `docs/claude-code-hooks.md` — PostToolUse/Stop hook の入出力と落とし穴 (`stop_hook_active` 無限ループ等)
-- `docs/inline-scar-pattern.md` — scar (`@review:` インラインコメント) を非同期ファイル書き込みで実現する設計理由
+- `docs/inline-scar-pattern.md` — scar (`@kizu[ask|reject|free]:` インラインコメント) を非同期ファイル書き込みで実現する設計理由
 - `docs/related-tools.md` — diffpane など類似ツールのサーベイ
 - `docs/adr/` — Architecture Decision Records。採用した設計判断の「なぜ」を記録する不可逆な履歴
 
