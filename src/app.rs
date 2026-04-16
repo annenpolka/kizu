@@ -29,16 +29,11 @@ pub enum ViewMode {
 /// metadata (from `hook-log-event`) with optionally captured diff
 /// snapshots for per-operation diff display.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields read by ui::render_stream_view (M3 render)
 pub struct StreamEvent {
     pub metadata: SanitizedEvent,
     /// Per-operation diff captured by the TUI in real-time.
     /// `None` for events that occurred before the TUI was started.
     pub diff_snapshot: Option<String>,
-    /// Number of added lines in this operation's diff.
-    pub add_count: usize,
-    /// Number of deleted lines in this operation's diff.
-    pub del_count: usize,
 }
 
 /// Half-page scroll constant for `Ctrl-d` / `Ctrl-u`. M5+ may swap this for
@@ -958,15 +953,11 @@ impl App {
 
         // Capture per-operation diff for each affected file.
         let mut operation_diff = String::new();
-        let mut add_count = 0usize;
-        let mut del_count = 0usize;
 
         for file_path in &event.file_paths {
-            // Get current cumulative diff for this file.
             let current_diff = git::diff_single_file(&self.root, &self.baseline_sha, file_path)
                 .unwrap_or_default();
 
-            // Compute per-operation diff by comparing with previous snapshot.
             let prev = self
                 .diff_snapshots
                 .get(file_path)
@@ -981,16 +972,6 @@ impl App {
                 operation_diff.push_str(&op_diff);
             }
 
-            // Count added/deleted lines.
-            for line in op_diff.lines() {
-                if line.starts_with('+') && !line.starts_with("+++") {
-                    add_count += 1;
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    del_count += 1;
-                }
-            }
-
-            // Update snapshot.
             self.diff_snapshots.insert(file_path.clone(), current_diff);
         }
 
@@ -1001,8 +982,6 @@ impl App {
             } else {
                 Some(operation_diff)
             },
-            add_count,
-            del_count,
         };
         self.stream_events.push(stream_event);
 
@@ -6962,16 +6941,6 @@ mod tests {
     // ---- stream mode tests ----
 
     fn make_stream_event(tool: &str, path: &str, diff: Option<&str>, ts: u64) -> StreamEvent {
-        let add = diff
-            .unwrap_or("")
-            .lines()
-            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-            .count();
-        let del = diff
-            .unwrap_or("")
-            .lines()
-            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
-            .count();
         StreamEvent {
             metadata: crate::hook::SanitizedEvent {
                 session_id: None,
@@ -6982,8 +6951,6 @@ mod tests {
                 timestamp_ms: ts,
             },
             diff_snapshot: diff.map(String::from),
-            add_count: add,
-            del_count: del,
         }
     }
 

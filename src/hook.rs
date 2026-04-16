@@ -33,11 +33,8 @@ impl AgentKind {
 /// JSON dialects.
 #[derive(Debug, Clone)]
 pub struct NormalizedHookInput {
-    #[allow(dead_code)]
     pub session_id: Option<String>,
-    #[allow(dead_code)]
     pub hook_event_name: String,
-    #[allow(dead_code)]
     pub tool_name: Option<String>,
     pub file_paths: Vec<PathBuf>,
     pub cwd: Option<PathBuf>,

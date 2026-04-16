@@ -411,11 +411,7 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
     let hl = ctx.hl;
     match row {
         RowKind::FileHeader { file_idx } => {
-            vec![render_file_header(
-                *file_idx,
-                &files[*file_idx],
-                cursor_sub.is_some(),
-            )]
+            vec![render_file_header(&files[*file_idx], cursor_sub.is_some())]
         }
         RowKind::HunkHeader { file_idx, hunk_idx } => {
             let DiffContent::Text(hunks) = &files[*file_idx].content else {
@@ -648,7 +644,7 @@ fn render_diff_line_wrapped(
 /// Bottom-up file header: `  path                                14:03   +12 -3`.
 /// Path color encodes the status (cyan / green / red / yellow), no `M`/`A`/`D`
 /// label needed.
-fn render_file_header(_file_idx: usize, file: &FileDiff, is_cursor: bool) -> Line<'static> {
+fn render_file_header(file: &FileDiff, is_cursor: bool) -> Line<'static> {
     let path_color = match file.status {
         FileStatus::Modified => Color::Cyan,
         FileStatus::Added => Color::Green,
