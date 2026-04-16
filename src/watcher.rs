@@ -119,8 +119,13 @@ pub struct WatchHandle {
     /// Common git dir (equal to `git_dir` for normal repos, different
     /// for linked worktrees). Same rationale as `git_dir`.
     common_git_dir: PathBuf,
+    /// Worktree root, kept for `refresh_worktree_watches`.
+    worktree_root: PathBuf,
+    /// Set of top-level child directories that already have recursive
+    /// watches. `refresh_worktree_watches` adds any new ones.
+    watched_children: std::collections::HashSet<PathBuf>,
     // The debouncers must outlive `events`; dropping them stops the watchers.
-    _worktree: KizuDebouncer,
+    worktree_debouncer: KizuDebouncer,
     _git_state: Vec<KizuDebouncer>,
 }
 
@@ -141,6 +146,30 @@ impl WatchHandle {
             BaselineMatcherInner::new(&self.git_dir, &self.common_git_dir, current_branch_ref);
         if let Ok(mut guard) = self.matcher.write() {
             *guard = new_inner;
+        }
+    }
+
+    /// Re-scan the worktree root for new top-level directories and
+    /// add recursive watches for any that appeared since the last scan.
+    /// Called by the app after `WatchEvent::Worktree` to close the
+    /// blind spot where a directory created after startup would not be
+    /// watched recursively.
+    pub fn refresh_worktree_watches(&mut self) {
+        let children = match recursive_worktree_children(&self.worktree_root) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for child in children {
+            if self.watched_children.contains(&child) {
+                continue;
+            }
+            if self
+                .worktree_debouncer
+                .watch(&child, RecursiveMode::Recursive)
+                .is_ok()
+            {
+                self.watched_children.insert(child);
+            }
         }
     }
 }
@@ -187,7 +216,8 @@ pub fn start(
         current_branch_ref,
     )));
 
-    let worktree = spawn_worktree_debouncer(&worktree_root, &git_dir_owned, tx.clone())?;
+    let (worktree_debouncer, initial_children) =
+        spawn_worktree_debouncer(&worktree_root, &git_dir_owned, tx.clone())?;
     let mut git_state = Vec::new();
     for watch_root in git_state_watch_roots(&git_dir_owned, &common_git_dir_owned) {
         git_state.push(spawn_git_state_debouncer(
@@ -202,7 +232,9 @@ pub fn start(
         matcher,
         git_dir: git_dir_owned,
         common_git_dir: common_git_dir_owned,
-        _worktree: worktree,
+        worktree_root,
+        watched_children: initial_children,
+        worktree_debouncer,
         _git_state: git_state,
     })
 }
@@ -274,7 +306,7 @@ fn spawn_worktree_debouncer(
     root: &Path,
     git_dir: &Path,
     tx: UnboundedSender<WatchEvent>,
-) -> Result<KizuDebouncer> {
+) -> Result<(KizuDebouncer, std::collections::HashSet<PathBuf>)> {
     let git_dir = git_dir.to_path_buf();
     let callback_tx = tx.clone();
     let mut debouncer = new_kizu_debouncer(
@@ -320,16 +352,18 @@ fn spawn_worktree_debouncer(
                 source: WatchSource::Worktree,
                 message: format!("watcher [{}]: {err:#}", WatchSource::Worktree.label()),
             });
-            return Ok(debouncer);
+            return Ok((debouncer, std::collections::HashSet::new()));
         }
     };
 
+    let mut watched = std::collections::HashSet::with_capacity(recursive_children.len());
     for child in recursive_children {
         debouncer
             .watch(&child, RecursiveMode::Recursive)
             .with_context(|| format!("failed to watch worktree at {}", child.display()))?;
+        watched.insert(child);
     }
-    Ok(debouncer)
+    Ok((debouncer, watched))
 }
 
 fn recursive_worktree_children(root: &Path) -> Result<Vec<PathBuf>> {

@@ -2918,6 +2918,7 @@ async fn run_loop(
                     }
                     let (need_recompute, need_head_dirty) = app.handle_watch_burst(burst);
                     if need_recompute {
+                        watch.refresh_worktree_watches();
                         app.recompute_diff();
                     }
                     if need_head_dirty {

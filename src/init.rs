@@ -413,34 +413,53 @@ fn print_report(report: &InstallReport) {
 
 // ── Installer dispatch ──────────────────────────────────────────
 
-/// Install or append to `.git/hooks/pre-commit` so that
-/// `kizu hook-pre-commit` blocks commits containing scars.
+/// Kizu-managed shim marker embedded in generated pre-commit hooks.
+const KIZU_SHIM_MARKER: &str = "# kizu-managed-shim";
+
+/// Install a kizu-managed pre-commit shim that guarantees
+/// `kizu hook-pre-commit` always runs, even when the repo has a
+/// pre-existing hook script that may contain `exit`/`exec`.
+///
+/// Strategy:
+/// - **No existing hook**: write a simple shim.
+/// - **Existing hook is already kizu-managed**: no-op.
+/// - **Existing non-kizu hook**: rename it to `pre-commit.user`,
+///   then write a shim that calls the original *and* kizu. Both
+///   must succeed (fail-fast with `set -e`).
 fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
     let git_dir = crate::git::git_dir(project_root)?;
     let hooks_dir = git_dir.join("hooks");
     std::fs::create_dir_all(&hooks_dir)?;
     let hook_path = hooks_dir.join("pre-commit");
 
-    let kizu_line = "kizu hook-pre-commit";
-
     if hook_path.exists() {
         let content = std::fs::read_to_string(&hook_path)?;
-        if content.contains(kizu_line) {
+        if content.contains(KIZU_SHIM_MARKER) {
             println!("  git pre-commit hook: already installed");
             return Ok(());
         }
-        // Append to existing hook.
-        let mut new = content;
-        if !new.ends_with('\n') {
-            new.push('\n');
-        }
-        new.push_str(&format!("\n# kizu scar guard\n{kizu_line}\n"));
-        std::fs::write(&hook_path, new)?;
+        // Existing non-kizu hook → rename and wrap.
+        let user_hook = hooks_dir.join("pre-commit.user");
+        std::fs::rename(&hook_path, &user_hook)?;
+        let shim = format!(
+            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
+             # Run the original user hook first.\n\
+             \"$(dirname \"$0\")/pre-commit.user\" \"$@\"\n\
+             # Then run kizu scar guard.\n\
+             kizu hook-pre-commit\n"
+        );
+        std::fs::write(&hook_path, shim)?;
+        println!(
+            "  git pre-commit hook: wrapped existing hook → {}",
+            user_hook.display()
+        );
     } else {
-        std::fs::write(
-            &hook_path,
-            format!("#!/bin/sh\n\n# kizu scar guard\n{kizu_line}\n"),
-        )?;
+        let shim = format!(
+            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
+             # kizu scar guard\n\
+             kizu hook-pre-commit\n"
+        );
+        std::fs::write(&hook_path, shim)?;
     }
 
     #[cfg(unix)]
@@ -907,30 +926,32 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove `kizu hook-pre-commit` from `.git/hooks/pre-commit`.
+/// Remove kizu's pre-commit hook and restore the user's original if
+/// it was wrapped by the shim installer.
 fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
     let git_dir = match crate::git::git_dir(project_root) {
         Ok(d) => d,
         Err(_) => return Ok(false),
     };
-    let hook_path = git_dir.join("hooks").join("pre-commit");
+    let hooks_dir = git_dir.join("hooks");
+    let hook_path = hooks_dir.join("pre-commit");
     if !hook_path.exists() {
         return Ok(false);
     }
     let content = std::fs::read_to_string(&hook_path)?;
-    if !content.contains("kizu hook-pre-commit") {
+    if !content.contains("kizu hook-pre-commit") && !content.contains(KIZU_SHIM_MARKER) {
         return Ok(false);
     }
-    let cleaned: String = content
-        .lines()
-        .filter(|l| !l.contains("kizu hook-pre-commit") && !l.contains("# kizu scar guard"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if cleaned.trim().is_empty() || cleaned.trim() == "#!/bin/sh" {
-        std::fs::remove_file(&hook_path)?;
-    } else {
-        std::fs::write(&hook_path, cleaned.trim_end().to_string() + "\n")?;
+
+    // Remove the kizu shim.
+    std::fs::remove_file(&hook_path)?;
+
+    // Restore the original user hook if it was renamed by install.
+    let user_hook = hooks_dir.join("pre-commit.user");
+    if user_hook.exists() {
+        std::fs::rename(&user_hook, &hook_path)?;
     }
+
     Ok(true)
 }
 

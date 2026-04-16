@@ -64,10 +64,20 @@ pub fn parse_hook_input(_agent: AgentKind, reader: impl Read) -> Result<Normaliz
     let raw: RawHookInput = serde_json::from_reader(reader).context("parsing hook stdin JSON")?;
 
     let mut file_paths = Vec::new();
-    if let Some(tool_input) = &raw.tool_input
-        && let Some(fp) = tool_input.get("file_path").and_then(|v| v.as_str())
-    {
-        file_paths.push(PathBuf::from(fp));
+    if let Some(tool_input) = &raw.tool_input {
+        // Agents use different field names for the edited file path:
+        // - Claude Code / Qwen: tool_input.file_path
+        // - Cline: tool_input.path
+        // - Cursor: tool_input.filePath
+        // Try all known variants so every agent's payload is accepted.
+        let fp = tool_input
+            .get("file_path")
+            .or_else(|| tool_input.get("path"))
+            .or_else(|| tool_input.get("filePath"))
+            .and_then(|v| v.as_str());
+        if let Some(fp) = fp {
+            file_paths.push(PathBuf::from(fp));
+        }
     }
 
     Ok(NormalizedHookInput {
@@ -334,6 +344,30 @@ mod tests {
         assert_eq!(input.file_paths, vec![PathBuf::from("/tmp/foo.rs")]);
         assert_eq!(input.cwd.as_deref(), Some(Path::new("/home/user/project")));
         assert!(!input.stop_hook_active);
+    }
+
+    #[test]
+    fn parse_hook_input_extracts_cline_path_field() {
+        let json = r#"{
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Write",
+            "tool_input": { "path": "/tmp/cline.py", "content": "print(1)" },
+            "cwd": "/home/user"
+        }"#;
+        let input = parse_hook_input(AgentKind::Cline, json.as_bytes()).unwrap();
+        assert_eq!(input.file_paths, vec![PathBuf::from("/tmp/cline.py")]);
+    }
+
+    #[test]
+    fn parse_hook_input_extracts_cursor_file_path_field() {
+        let json = r#"{
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": { "filePath": "/tmp/cursor.ts", "content": "const x = 1" },
+            "cwd": "/home/user"
+        }"#;
+        let input = parse_hook_input(AgentKind::Cursor, json.as_bytes()).unwrap();
+        assert_eq!(input.file_paths, vec![PathBuf::from("/tmp/cursor.ts")]);
     }
 
     #[test]
