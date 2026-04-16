@@ -92,7 +92,7 @@ fn run_hook_post_tool(agent_str: &str) -> Result<()> {
     }
 
     let hits = hook::scan_scars(&input.file_paths);
-    if let Some(json) = hook::format_additional_context(&hits) {
+    if let Some(json) = hook::format_additional_context(agent, &hits) {
         println!("{json}");
     }
     Ok(())
@@ -149,7 +149,7 @@ fn run_hook_pre_commit() -> Result<()> {
         return Ok(());
     }
 
-    let hits = hook::scan_scars(&staged);
+    let hits = hook::scan_scars_from_index(&root, &staged);
     if !hits.is_empty() {
         eprintln!("kizu: commit blocked — unresolved scars in staged files:");
         for hit in &hits {

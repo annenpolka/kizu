@@ -825,6 +825,21 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
                 any_removed = true;
             }
         }
+        if agent.kind == AgentKind::Codex {
+            // Codex project-scoped install writes to <repo>/.codex/hooks.json
+            // which is not covered by project_config_dir() (returns None for Codex).
+            let path = project_root.join(".codex").join("hooks.json");
+            if remove_kizu_hooks_from_json(&path)? {
+                println!(
+                    "  {}  {}  {}",
+                    c_bold(&format!("{:<12}", "Codex CLI")),
+                    c_green("✓ removed"),
+                    c_dim(&format!("→ {}", path.display())),
+                );
+                agent_removed = true;
+                any_removed = true;
+            }
+        }
         if agent.kind == AgentKind::Cline {
             let hook_file = project_root
                 .join(".clinerules")
@@ -1115,5 +1130,31 @@ mod tests {
     fn remove_kizu_hooks_returns_false_for_missing_file() {
         let removed = remove_kizu_hooks_from_json(Path::new("/nonexistent/settings.json")).unwrap();
         assert!(!removed);
+    }
+
+    #[test]
+    fn teardown_removes_codex_project_scoped_hooks_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Simulate a Codex project-scoped install: <repo>/.codex/hooks.json
+        let codex_dir = root.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let hooks_path = codex_dir.join("hooks.json");
+        fs::write(
+            &hooks_path,
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"kizu hook-stop --agent codex","timeout":10}]}]}}"#,
+        )
+        .unwrap();
+
+        // Verify removal works via the same function teardown uses.
+        let removed = remove_kizu_hooks_from_json(&hooks_path).unwrap();
+        assert!(removed, "should remove kizu hooks from .codex/hooks.json");
+
+        // After removal the hooks object should be empty.
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let hooks = doc["hooks"].as_object().unwrap();
+        assert!(hooks.is_empty(), "all kizu entries should be gone");
     }
 }

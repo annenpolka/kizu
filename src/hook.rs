@@ -120,11 +120,15 @@ pub fn scan_scars(paths: &[PathBuf]) -> Vec<ScarHit> {
     hits
 }
 
-/// Format scar hits as a JSON `additionalContext` string suitable
-/// for Claude Code / Cursor / Codex / Qwen / Cline stdout.
-/// Returns `None` when there are no hits (caller should exit 0
-/// silently).
-pub fn format_additional_context(hits: &[ScarHit]) -> Option<String> {
+/// Format scar hits as a JSON string suitable for the given agent's
+/// stdout protocol. Returns `None` when there are no hits (caller
+/// should exit 0 silently).
+///
+/// Output envelopes per agent (see `docs/deep-research-ai-agent-hooks.md`):
+/// - Claude Code / Qwen / Cline: `{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"..."}}`
+/// - Cursor: `{"additional_context":"..."}`
+/// - Codex: `{"additionalContext":"..."}`
+pub fn format_additional_context(agent: AgentKind, hits: &[ScarHit]) -> Option<String> {
     if hits.is_empty() {
         return None;
     }
@@ -139,12 +143,20 @@ pub fn format_additional_context(hits: &[ScarHit]) -> Option<String> {
         ));
     }
     let context = lines.join("\n");
-    let envelope = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
+    let envelope = match agent {
+        AgentKind::Cursor => serde_json::json!({
+            "additional_context": context,
+        }),
+        AgentKind::Codex => serde_json::json!({
             "additionalContext": context,
-        }
-    });
+        }),
+        AgentKind::ClaudeCode | AgentKind::QwenCode | AgentKind::Cline => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": context,
+            }
+        }),
+    };
     Some(serde_json::to_string(&envelope).expect("json serialize"))
 }
 
@@ -162,6 +174,42 @@ pub fn format_stop_stderr(hits: &[ScarHit]) -> String {
         ));
     }
     out
+}
+
+/// Grep staged (index) contents of `paths` for `@kizu[...]` scars.
+/// Unlike [`scan_scars`] which reads the worktree, this reads the
+/// staged blob via `git show :<path>` so that worktree edits after
+/// staging don't mask scars that are actually about to be committed.
+pub fn scan_scars_from_index(root: &Path, paths: &[PathBuf]) -> Vec<ScarHit> {
+    let re = regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--)\s*@kizu\[(\w+)\]:\s*(.*)")
+        .expect("scar regex");
+    let mut hits = Vec::new();
+    for path in paths {
+        let rel = match path.strip_prefix(root) {
+            Ok(r) => r,
+            Err(_) => path.as_path(),
+        };
+        let output = match std::process::Command::new("git")
+            .args(["show", &format!(":{}", rel.display())])
+            .current_dir(root)
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        let content = String::from_utf8_lossy(&output.stdout);
+        for (i, line) in content.lines().enumerate() {
+            if let Some(caps) = re.captures(line) {
+                hits.push(ScarHit {
+                    path: path.clone(),
+                    line_number: i + 1,
+                    kind: caps[1].to_string(),
+                    message: caps[2].trim().to_string(),
+                });
+            }
+        }
+    }
+    hits
 }
 
 /// List files that might contain scars, scoped by the kizu session
@@ -350,14 +398,14 @@ mod tests {
     }
 
     #[test]
-    fn format_additional_context_produces_valid_json_envelope() {
+    fn format_additional_context_claude_code_envelope() {
         let hits = vec![ScarHit {
             path: PathBuf::from("src/foo.rs"),
             line_number: 10,
             kind: "ask".into(),
             message: "explain this".into(),
         }];
-        let json_str = format_additional_context(&hits).expect("non-empty");
+        let json_str = format_additional_context(AgentKind::ClaudeCode, &hits).expect("non-empty");
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         let ctx = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -367,8 +415,76 @@ mod tests {
     }
 
     #[test]
+    fn format_additional_context_cursor_envelope() {
+        let hits = vec![ScarHit {
+            path: PathBuf::from("src/foo.rs"),
+            line_number: 5,
+            kind: "reject".into(),
+            message: "revert".into(),
+        }];
+        let json_str = format_additional_context(AgentKind::Cursor, &hits).expect("non-empty");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        // Cursor uses flat "additional_context" key, not hookSpecificOutput.
+        let ctx = parsed["additional_context"].as_str().unwrap();
+        assert!(ctx.contains("src/foo.rs:5"));
+        assert!(ctx.contains("@kizu[reject]"));
+        assert!(parsed.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn format_additional_context_codex_envelope() {
+        let hits = vec![ScarHit {
+            path: PathBuf::from("lib.py"),
+            line_number: 3,
+            kind: "free".into(),
+            message: "note".into(),
+        }];
+        let json_str = format_additional_context(AgentKind::Codex, &hits).expect("non-empty");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        // Codex uses flat "additionalContext" key.
+        let ctx = parsed["additionalContext"].as_str().unwrap();
+        assert!(ctx.contains("lib.py:3"));
+        assert!(ctx.contains("@kizu[free]"));
+        assert!(parsed.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn format_additional_context_qwen_uses_claude_code_envelope() {
+        let hits = vec![ScarHit {
+            path: PathBuf::from("a.rs"),
+            line_number: 1,
+            kind: "ask".into(),
+            message: "why".into(),
+        }];
+        let json_str = format_additional_context(AgentKind::QwenCode, &hits).expect("non-empty");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(
+            parsed["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn format_additional_context_cline_uses_claude_code_envelope() {
+        let hits = vec![ScarHit {
+            path: PathBuf::from("a.rs"),
+            line_number: 1,
+            kind: "ask".into(),
+            message: "why".into(),
+        }];
+        let json_str = format_additional_context(AgentKind::Cline, &hits).expect("non-empty");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(
+            parsed["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn format_additional_context_returns_none_when_no_hits() {
-        assert!(format_additional_context(&[]).is_none());
+        assert!(format_additional_context(AgentKind::ClaudeCode, &[]).is_none());
     }
 
     #[test]
@@ -405,5 +521,53 @@ mod tests {
         assert_eq!(AgentKind::from_str("qwen"), Some(AgentKind::QwenCode));
         assert_eq!(AgentKind::from_str("cline"), Some(AgentKind::Cline));
         assert_eq!(AgentKind::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn scan_scars_from_index_reads_staged_blob_not_worktree() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Set up a git repo.
+        Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let file = root.join("a.rs");
+
+        // Write file with a scar and stage it.
+        fs::write(&file, "fn main() {}\n// @kizu[ask]: staged scar\n").unwrap();
+        Command::new("git")
+            .args(["add", "a.rs"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        // Now remove the scar from the worktree (but leave it staged).
+        fs::write(&file, "fn main() {}\n").unwrap();
+
+        // scan_scars (worktree) should find nothing.
+        let worktree_hits = scan_scars(std::slice::from_ref(&file));
+        assert!(worktree_hits.is_empty(), "worktree should be clean");
+
+        // scan_scars_from_index should still find the staged scar.
+        let index_hits = scan_scars_from_index(root, &[file]);
+        assert_eq!(index_hits.len(), 1);
+        assert_eq!(index_hits[0].kind, "ask");
+        assert_eq!(index_hits[0].message, "staged scar");
     }
 }
