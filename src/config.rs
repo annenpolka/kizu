@@ -94,6 +94,45 @@ impl Default for KeyConfig {
     }
 }
 
+impl KeyConfig {
+    /// Every `(action_name, char)` pair in this map, in a stable
+    /// order. Used by [`Self::conflicts`] for duplicate detection.
+    fn bindings(&self) -> [(&'static str, char); 14] {
+        [
+            ("ask", self.ask),
+            ("reject", self.reject),
+            ("comment", self.comment),
+            ("revert", self.revert),
+            ("editor", self.editor),
+            ("seen", self.seen),
+            ("follow", self.follow),
+            ("search", self.search),
+            ("search_next", self.search_next),
+            ("search_prev", self.search_prev),
+            ("picker", self.picker),
+            ("reset_baseline", self.reset_baseline),
+            ("cursor_placement", self.cursor_placement),
+            ("wrap_toggle", self.wrap_toggle),
+        ]
+    }
+
+    /// Group binding conflicts by the char that collides. Returns
+    /// one `(char, Vec<action_name>)` entry per char that two or
+    /// more actions share. A partial config that doesn't override
+    /// anything stays conflict-free because the defaults are disjoint.
+    pub fn conflicts(&self) -> Vec<(char, Vec<&'static str>)> {
+        use std::collections::BTreeMap;
+        let mut by_char: BTreeMap<char, Vec<&'static str>> = BTreeMap::new();
+        for (name, ch) in self.bindings() {
+            by_char.entry(ch).or_default().push(name);
+        }
+        by_char
+            .into_iter()
+            .filter(|(_, names)| names.len() > 1)
+            .collect()
+    }
+}
+
 impl Default for ColorConfig {
     fn default() -> Self {
         Self {
@@ -142,21 +181,68 @@ pub fn load_config_from(path: &Path) -> KizuConfig {
         Ok(c) => c,
         Err(_) => return KizuConfig::default(),
     };
-    match toml::from_str(&content) {
+    let config: KizuConfig = match toml::from_str(&content) {
         Ok(config) => config,
         Err(e) => {
             eprintln!(
                 "kizu: warning: failed to parse config {}: {e}",
                 path.display()
             );
-            KizuConfig::default()
+            return KizuConfig::default();
         }
+    };
+    for (ch, actions) in config.keys.conflicts() {
+        let display = if ch == ' ' {
+            "<space>".to_string()
+        } else {
+            ch.to_string()
+        };
+        eprintln!(
+            "kizu: warning: config key {display:?} is bound to multiple actions: {}",
+            actions.join(", ")
+        );
     }
+    config
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_config_conflicts_returns_empty_for_defaults() {
+        let config = KizuConfig::default();
+        assert!(
+            config.keys.conflicts().is_empty(),
+            "default key map must have no duplicates"
+        );
+    }
+
+    #[test]
+    fn key_config_conflicts_reports_duplicate_assignments() {
+        // User accidentally rebinds `reject` to the default `ask` char.
+        let mut config = KizuConfig::default();
+        config.keys.reject = 'a'; // Collides with ask = 'a'.
+        let conflicts = config.keys.conflicts();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "one group of conflicting actions expected, got: {conflicts:?}",
+        );
+        let (ch, names) = &conflicts[0];
+        assert_eq!(*ch, 'a');
+        assert!(names.contains(&"ask"));
+        assert!(names.contains(&"reject"));
+    }
+
+    #[test]
+    fn key_config_conflicts_ignores_space_search_next_prev_defaults() {
+        // The default `seen = ' '` doesn't conflict with any other key
+        // because no other default action uses space; make sure the
+        // detector doesn't false-positive on the default map.
+        let config = KizuConfig::default();
+        assert!(config.keys.conflicts().is_empty());
+    }
 
     #[test]
     fn default_config_has_correct_key_values() {
