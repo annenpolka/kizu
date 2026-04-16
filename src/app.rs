@@ -932,14 +932,22 @@ impl App {
                 self.apply_computed_files(stream_files);
             }
             ViewMode::Stream => {
-                // Remember which file the stream cursor was on so we
-                // can jump to it after switching back to diff mode.
+                // Capture context from the stream cursor for position
+                // estimation after switching back to diff mode.
                 let target_path = self.current_file_path().map(|p| p.to_path_buf());
+                let target_content = self.current_diff_line_content();
                 self.view_mode = ViewMode::Diff;
                 self.recompute_diff();
-                // Jump to the file that was focused in stream mode.
                 if let Some(path) = target_path {
-                    self.scroll_to_file(&path);
+                    // Try content-based match first (survives line shifts),
+                    // fall back to file header if the content can't be found.
+                    if let Some(ref content) = target_content {
+                        if !self.scroll_to_diff_content(&path, content) {
+                            self.scroll_to_file(&path);
+                        }
+                    } else {
+                        self.scroll_to_file(&path);
+                    }
                 }
             }
         }
@@ -1946,6 +1954,79 @@ impl App {
 
     /// Scroll to the first row of the file matching `path`. No-op if
     /// the file is not in the current layout.
+    /// Extract the content of the diff line at the current scroll
+    /// position. Returns the raw `DiffLine.content` (without `+`/`-`
+    /// prefix) for content-based matching when switching view modes.
+    pub fn current_diff_line_content(&self) -> Option<String> {
+        let row = self.layout.rows.get(self.scroll)?;
+        if let RowKind::DiffLine {
+            file_idx,
+            hunk_idx,
+            line_idx,
+        } = *row
+        {
+            let file = self.files.get(file_idx)?;
+            let DiffContent::Text(hunks) = &file.content else {
+                return None;
+            };
+            let line = hunks.get(hunk_idx)?.lines.get(line_idx)?;
+            if !matches!(line.kind, LineKind::Context) {
+                return Some(line.content.clone());
+            }
+        }
+        // If on a hunk header, grab the first changed line in the hunk.
+        if let RowKind::HunkHeader {
+            file_idx, hunk_idx, ..
+        } = *row
+        {
+            let file = self.files.get(file_idx)?;
+            let DiffContent::Text(hunks) = &file.content else {
+                return None;
+            };
+            for dl in &hunks.get(hunk_idx)?.lines {
+                if !matches!(dl.kind, LineKind::Context) {
+                    return Some(dl.content.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Scroll to a diff line in `path` whose content matches `needle`.
+    /// Returns `true` if a match was found and scrolled to.
+    pub fn scroll_to_diff_content(&mut self, path: &Path, needle: &str) -> bool {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            return false;
+        }
+        for (i, row) in self.layout.rows.iter().enumerate() {
+            if let RowKind::DiffLine {
+                file_idx,
+                hunk_idx,
+                line_idx,
+            } = *row
+            {
+                let Some(file) = self.files.get(file_idx) else {
+                    continue;
+                };
+                if file.path != path {
+                    continue;
+                }
+                let DiffContent::Text(hunks) = &file.content else {
+                    continue;
+                };
+                let Some(line) = hunks.get(hunk_idx).and_then(|h| h.lines.get(line_idx)) else {
+                    continue;
+                };
+                if line.content.trim() == needle {
+                    self.scroll_to(i);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn scroll_to_file(&mut self, path: &Path) {
         for (i, row) in self.layout.rows.iter().enumerate() {
             if let RowKind::FileHeader { file_idx } = row
