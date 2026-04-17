@@ -1568,7 +1568,7 @@ mod tests {
         let mut app = fake_app();
         app.files = files;
         // Match recompute_diff: mtime ascending (oldest first, newest last).
-        app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        app.files.sort_by_key(|a| a.mtime);
         // Replicate the bootstrap path without touching the real filesystem.
         app.build_layout();
         app.refresh_anchor();

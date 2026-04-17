@@ -1466,7 +1466,7 @@ impl App {
         // mode files need filesystem mtime for chronological sorting.
         if self.view_mode != ViewMode::Stream {
             self.populate_mtimes(&mut files);
-            files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+            files.sort_by_key(|a| a.mtime);
         }
         self.last_error = None;
         self.files = files;
@@ -4445,7 +4445,7 @@ mod tests {
             pinned_cursor_y: None,
         };
         app.files = files;
-        app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        app.files.sort_by_key(|a| a.mtime);
         app.build_layout();
         app.refresh_anchor();
         app
@@ -6097,7 +6097,7 @@ mod tests {
             ],
             400,
         );
-        app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        app.files.sort_by_key(|a| a.mtime);
         app.build_layout();
         app.refresh_anchor();
 
@@ -6194,7 +6194,7 @@ mod tests {
             vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
             50, // older than b.rs
         ));
-        app.files.sort_by(|x, y| x.mtime.cmp(&y.mtime));
+        app.files.sort_by_key(|x| x.mtime);
         app.build_layout();
         app.refresh_anchor();
 
