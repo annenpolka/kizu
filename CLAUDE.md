@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **kizu** は AI コーディングエージェント (Claude Code, Cursor, Codex, Qwen Code, Cline, Gemini 等) と並走させるリアルタイム diff 監視 + inline scar review TUI。Rust 製の単一バイナリ。
 
-現状は **v0.3 実装中** (feat/v0.3 ブランチ)。v0.2 までの scar + hook 層に加え、ストリームモード (Tab 切替の操作履歴ビュー)、`--attach` ターミナル自動分割、`~/.config/kizu/config.toml` 設定ファイル、Claude Code プラグインを実装中。
+現状は **v0.3** (feat/v0.3 ブランチで PR レビュー中 → main へのマージ待ち)。v0.2 までの scar + hook 層に加えて、ストリームモード (Tab 切替の操作履歴ビュー、`hook-log-event` が書き出す JSON を `git diff` snapshot の差分で per-operation diff 化)、`--attach` ターミナル自動分割 (tmux / zellij / kitty / Ghostty)、`~/.config/kizu/config.toml` (キーバインド・色・デバウンス・エディタ・分割先)、scar undo stack (`u`)、適応的 `j`/`k` ナビゲーション、Claude Code プラグイン (`plugin/`) を実装済み。
 
 ## 実装前に必ず読むもの
 
