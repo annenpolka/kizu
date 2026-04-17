@@ -1557,7 +1557,7 @@ mod tests {
             processed_event_paths: std::collections::HashSet::new(),
             session_start_ms: 0,
             bound_session_id: None,
-            diff_snapshots: std::collections::HashMap::new(),
+            diff_snapshots: crate::app::DiffSnapshots::default(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
             pinned_cursor_y: None,

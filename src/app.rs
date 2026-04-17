@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -9,6 +9,109 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// Duration of a single hunk-to-hunk scroll animation. 150 ms lands in
 /// the "noticeable but not slow" band and matches the research doc.
 const SCROLL_ANIM_DURATION: Duration = Duration::from_millis(150);
+
+/// Maximum number of per-file raw `git diff` snapshots retained in
+/// [`App::diff_snapshots`]. The entry cost is dominated by each diff
+/// string (commonly a few KB for a small edit, tens of KB for a large
+/// one). 500 paths is a comfortable upper bound for agent sessions
+/// that churn through many files, while capping peak memory at a few
+/// MB. When the cap is hit the least-recently-touched entry is
+/// evicted — the same discipline `prune_event_log` enforces for the
+/// on-disk event log.
+pub const DEFAULT_DIFF_SNAPSHOTS_CAP: usize = 500;
+
+/// LRU-ish cap for per-file raw `git diff` text. Each hook event
+/// touches a path (read its previous snapshot, write the new one); a
+/// touch moves the path to the "most recently used" end so the next
+/// eviction drops something the agent has stopped touching instead of
+/// a hot file.
+///
+/// Intentionally a thin wrapper over [`HashMap`] + [`VecDeque`]: the
+/// cardinality is bounded (<= `cap`) and the workload is "insert or
+/// refresh one entry per event", so the O(n) `VecDeque::retain` on
+/// re-insert is cheaper than pulling in `indexmap` or writing a
+/// doubly-linked LRU for a few hundred entries.
+#[derive(Debug, Clone)]
+pub struct DiffSnapshots {
+    map: HashMap<PathBuf, String>,
+    order: VecDeque<PathBuf>,
+    cap: usize,
+}
+
+impl Default for DiffSnapshots {
+    fn default() -> Self {
+        Self::with_cap(DEFAULT_DIFF_SNAPSHOTS_CAP)
+    }
+}
+
+impl DiffSnapshots {
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    pub fn get(&self, path: &Path) -> Option<&String> {
+        self.map.get(path)
+    }
+
+    pub fn insert(&mut self, path: PathBuf, diff: String) {
+        // Re-insert refreshes recency: pull the prior position out of
+        // `order` before appending to the back, otherwise `d` getting
+        // re-written would still look older than a `c` inserted once.
+        if self.map.contains_key(&path) {
+            self.order.retain(|p| p != &path);
+        }
+        self.order.push_back(path.clone());
+        self.map.insert(path, diff);
+        while self.map.len() > self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.map.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    pub fn contains_key(&self, path: &Path) -> bool {
+        self.map.contains_key(path)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn keys(&self) -> impl Iterator<Item = &PathBuf> {
+        self.map.keys()
+    }
+
+    /// Replace all entries with the ones from `map`, preserving the
+    /// configured cap. Iteration order of [`HashMap`] is unspecified,
+    /// so new entries land in whatever order the incoming map yields
+    /// — acceptable here because the caller only needs "recent after
+    /// bootstrap", not a precise total order.
+    pub fn replace_from_map(&mut self, map: HashMap<PathBuf, String>) {
+        self.clear();
+        for (path, diff) in map {
+            self.insert(path, diff);
+        }
+    }
+}
 
 use crate::git::{self, DiffContent, FileDiff, FileStatus, LineKind};
 use crate::hook::SanitizedEvent;
@@ -211,8 +314,10 @@ pub struct App {
     /// the session.
     pub bound_session_id: Option<String>,
     /// Per-file diff snapshots used to compute per-operation diffs.
-    /// Maps file path → most recent cumulative diff output.
-    pub diff_snapshots: std::collections::HashMap<PathBuf, String>,
+    /// Maps file path → most recent cumulative diff output. Capped
+    /// via [`DiffSnapshots`] so long sessions that touch many files
+    /// don't accumulate unbounded state.
+    pub diff_snapshots: DiffSnapshots,
     /// Session-scoped undo stack for scar insertions. Each successful
     /// [`crate::scar::insert_scar`] pushes an entry; the `u` key pops
     /// the top and calls [`crate::scar::remove_scar`], reversing only
@@ -913,15 +1018,25 @@ impl App {
         let current_branch_ref =
             git::current_branch_ref(&root).context("resolving current branch ref")?;
         let baseline_sha = git::head_sha(&root).context("capturing baseline HEAD")?;
-        let diff = git::compute_diff(&root, &baseline_sha);
-        Self::bootstrap_with_diff(
+        // One `git diff --no-renames <baseline>` gives us both the
+        // parsed FileDiff list **and** the per-file raw text. Routing
+        // the raw text straight into `diff_snapshots` collapses the
+        // old "compute_diff + N × diff_single_file" startup pattern
+        // into a single subprocess.
+        let (diff, snapshots) = match git::compute_diff_with_snapshots(&root, &baseline_sha) {
+            Ok((files, snaps)) => (Ok(files), snaps),
+            Err(e) => (Err(e), std::collections::HashMap::new()),
+        };
+        let mut app = Self::bootstrap_with_diff(
             root,
             git_dir,
             common_git_dir,
             current_branch_ref,
             baseline_sha,
             diff,
-        )
+        )?;
+        app.diff_snapshots.replace_from_map(snapshots);
+        Ok(app)
     }
 
     /// Inner bootstrap: takes already-resolved git layout plus the
@@ -983,7 +1098,7 @@ impl App {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
             bound_session_id: None,
-            diff_snapshots: std::collections::HashMap::new(),
+            diff_snapshots: DiffSnapshots::default(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
             pinned_cursor_y: None,
@@ -1289,20 +1404,6 @@ impl App {
         }
     }
 
-    /// Seed `diff_snapshots` with the current cumulative diff for every
-    /// file in `self.files`. Called once at startup so the first stream
-    /// event correctly shows only the per-operation delta, not the
-    /// entire session's cumulative diff.
-    pub fn seed_diff_snapshots(&mut self) {
-        for file in &self.files {
-            let diff = git::diff_single_file(&self.root, &self.baseline_sha, &file.path)
-                .unwrap_or_default();
-            if !diff.is_empty() {
-                self.diff_snapshots.insert(file.path.clone(), diff);
-            }
-        }
-    }
-
     /// Re-run `git diff`, populate per-file mtimes, sort files by mtime
     /// **ascending** (oldest first → newest last), rebuild the row layout,
     /// and restore the anchor. The ascending order is intentional so that
@@ -1490,8 +1591,19 @@ impl App {
                 return KeyEffect::None;
             }
         };
-        let diff = git::compute_diff(&self.root, &new_sha);
-        self.apply_reset(new_sha, new_branch, diff)
+        // Seed snapshots from the same `git diff` call that produces
+        // the FileDiff list. `apply_reset` clears the map on success;
+        // we populate it right after so the next event computes its
+        // op_diff against a correct pre-event reference.
+        let (diff, snapshots) = match git::compute_diff_with_snapshots(&self.root, &new_sha) {
+            Ok((files, snaps)) => (Ok(files), Some(snaps)),
+            Err(e) => (Err(e), None),
+        };
+        let effect = self.apply_reset(new_sha, new_branch, diff);
+        if let Some(snaps) = snapshots {
+            self.diff_snapshots.replace_from_map(snaps);
+        }
+        effect
     }
 
     /// Commit a freshly-resolved baseline + diff into the app. Split
@@ -1522,11 +1634,11 @@ impl App {
                 // comparing the next hook-log-event against that
                 // would misattribute lines that belong to the change
                 // between baselines (not to the agent's edit).
-                // Re-seeding against the new baseline restores the
-                // "prev" reference so subsequent op-diffs stay
-                // accurate.
+                // The caller (`reset_baseline`) repopulates the map
+                // from the same `compute_diff_with_snapshots` call
+                // that produced `files`, so there's no need to run
+                // a second per-file diff sweep here.
                 self.diff_snapshots.clear();
-                self.seed_diff_snapshots();
                 if branch_changed {
                     KeyEffect::ReconfigureWatcher
                 } else {
@@ -3916,9 +4028,10 @@ pub async fn run() -> Result<()> {
         // shared events directory. The delete path used to destroy a
         // concurrently-running kizu session's live history on the
         // same project; the filter approach is non-destructive.
-        // Seed diff snapshots so the first stream event shows only
-        // the per-operation delta, not the entire cumulative diff.
-        app.seed_diff_snapshots();
+        // Diff snapshots were already seeded inside `App::bootstrap`
+        // from the same `git diff` that produced the initial file
+        // list, so the first stream event shows only the per-op
+        // delta without an extra startup subprocess sweep.
 
         // Draw one static frame before watcher startup. On macOS the
         // PollWatcher fallback may take noticeable time to arm because it
@@ -4164,6 +4277,57 @@ mod tests {
     use crate::git::{DiffContent, DiffLine, FileStatus, Hunk, LineKind};
     use std::time::Duration;
 
+    #[test]
+    fn diff_snapshots_evicts_oldest_when_cap_exceeded() {
+        // Long agent sessions can pile up one snapshot per unique file
+        // touched. Without a cap the map grows unboundedly; a LRU-ish
+        // eviction keeps working-set size predictable. The eldest
+        // inserted key must be the first to go when the cap is hit.
+        let mut snaps = DiffSnapshots::with_cap(3);
+        snaps.insert(PathBuf::from("a"), "diff-a".into());
+        snaps.insert(PathBuf::from("b"), "diff-b".into());
+        snaps.insert(PathBuf::from("c"), "diff-c".into());
+        assert_eq!(snaps.len(), 3);
+
+        snaps.insert(PathBuf::from("d"), "diff-d".into());
+        assert_eq!(snaps.len(), 3, "cap must hold after overflow");
+        assert!(
+            !snaps.contains_key(&PathBuf::from("a")),
+            "eldest entry must be evicted first"
+        );
+        assert!(snaps.contains_key(&PathBuf::from("d")));
+    }
+
+    #[test]
+    fn diff_snapshots_reinsert_refreshes_recency() {
+        // When handle_event_log re-inserts the snapshot for a path it
+        // already knows about, that path must move to the "most
+        // recently used" end so a subsequent overflow drops an older
+        // path instead.
+        let mut snaps = DiffSnapshots::with_cap(3);
+        snaps.insert(PathBuf::from("a"), "diff-a".into());
+        snaps.insert(PathBuf::from("b"), "diff-b".into());
+        snaps.insert(PathBuf::from("c"), "diff-c".into());
+
+        // Touch "a" so it is no longer the eldest.
+        snaps.insert(PathBuf::from("a"), "diff-a-updated".into());
+
+        snaps.insert(PathBuf::from("d"), "diff-d".into());
+        assert!(
+            snaps.contains_key(&PathBuf::from("a")),
+            "recently-touched entry must survive the next overflow"
+        );
+        assert!(
+            !snaps.contains_key(&PathBuf::from("b")),
+            "after touching a, b is now the eldest and must be dropped"
+        );
+        assert_eq!(
+            snaps.get(&PathBuf::from("a")),
+            Some(&"diff-a-updated".to_string()),
+            "re-insert must keep the newer value",
+        );
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -4275,7 +4439,7 @@ mod tests {
             // tests that exercise the filter set this field explicitly.
             session_start_ms: 0,
             bound_session_id: None,
-            diff_snapshots: std::collections::HashMap::new(),
+            diff_snapshots: DiffSnapshots::default(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
             pinned_cursor_y: None,

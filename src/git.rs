@@ -221,6 +221,19 @@ fn synthesize_untracked_diff_text(root: &Path, rel: &Path) -> Result<String> {
 }
 
 pub fn compute_diff(root: &Path, baseline_sha: &str) -> Result<Vec<FileDiff>> {
+    compute_diff_with_snapshots(root, baseline_sha).map(|(files, _)| files)
+}
+
+/// Same as [`compute_diff`] but also returns per-file raw `git diff`
+/// text suitable for seeding `App::diff_snapshots`. Collapses the
+/// previous bootstrap pattern of "compute_diff + N × diff_single_file"
+/// into the single `git diff` invocation `compute_diff` already
+/// issued — the raw output was being discarded by the parser, so the
+/// seed loop was paying N subprocess startups for data we already had.
+pub fn compute_diff_with_snapshots(
+    root: &Path,
+    baseline_sha: &str,
+) -> Result<(Vec<FileDiff>, std::collections::HashMap<PathBuf, String>)> {
     let output = Command::new("git")
         .args(["diff", "--no-renames", baseline_sha, "--"])
         .current_dir(root)
@@ -243,9 +256,40 @@ pub fn compute_diff(root: &Path, baseline_sha: &str) -> Result<Vec<FileDiff>> {
     let raw = String::from_utf8_lossy(&output.stdout);
     let mut files = parse_unified_diff(&raw).context("parsing git diff output")?;
 
+    let mut snapshots: std::collections::HashMap<PathBuf, String> =
+        split_raw_diff_by_file(&raw, &files);
+
     for rel in list_untracked(root)? {
         match synthesize_untracked(root, &rel) {
-            Ok(synth) => files.push(synth),
+            Ok(synth) => {
+                // Synthesize the `git diff`-shaped text for this
+                // untracked file so its snapshot has the same shape
+                // that `diff_single_file` would produce — otherwise
+                // the first stream event for the file would compare
+                // against an empty string and mis-attribute the whole
+                // file as the operation's change.
+                match synthesize_untracked_diff_text(root, &rel) {
+                    Ok(text) => {
+                        snapshots.insert(synth.path.clone(), text);
+                    }
+                    Err(e) => {
+                        let vanished = e.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                        });
+                        if !vanished {
+                            return Err(e).with_context(|| {
+                                format!("synthesizing untracked snapshot {}", rel.display())
+                            });
+                        }
+                        // Vanished between status and read: skip the
+                        // snapshot entry; the FileDiff from the first
+                        // read still pushes so layout stays consistent.
+                    }
+                }
+                files.push(synth);
+            }
             // If the file genuinely vanished between `status` and our
             // read (an agent deleted it in the same burst), skip it.
             // Any other failure (pathname parse bug, decode bug, …)
@@ -266,7 +310,45 @@ pub fn compute_diff(root: &Path, baseline_sha: &str) -> Result<Vec<FileDiff>> {
         }
     }
 
-    Ok(files)
+    Ok((files, snapshots))
+}
+
+/// Split a concatenated `git diff` payload at each `diff --git` header
+/// and assign the resulting fragment to the `FileDiff.path` captured
+/// by the parser for that header. The fragment includes the header
+/// line itself and ends with a trailing newline, matching the byte
+/// shape `git diff --no-renames <baseline> -- <path>` produces when
+/// invoked for that single file.
+fn split_raw_diff_by_file(
+    raw: &str,
+    files: &[FileDiff],
+) -> std::collections::HashMap<PathBuf, String> {
+    let mut snapshots = std::collections::HashMap::new();
+    if files.is_empty() || raw.is_empty() {
+        return snapshots;
+    }
+
+    let mut file_idx = 0usize;
+    let mut current = String::new();
+
+    for line in raw.lines() {
+        if line.starts_with("diff --git ")
+            && !current.is_empty()
+            && let Some(file) = files.get(file_idx)
+        {
+            snapshots.insert(file.path.clone(), std::mem::take(&mut current));
+            file_idx += 1;
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.is_empty()
+        && let Some(file) = files.get(file_idx)
+    {
+        snapshots.insert(file.path.clone(), current);
+    }
+
+    snapshots
 }
 
 /// List untracked files reported by `git status --porcelain=v1 -z`.
@@ -1428,6 +1510,50 @@ index 1111111..2222222 100644
         assert_eq!(files[0].status, FileStatus::Modified);
         assert_eq!(files[0].added, 1);
         assert_eq!(files[0].deleted, 1);
+    }
+
+    #[test]
+    fn compute_diff_with_snapshots_pairs_each_filediff_with_its_raw_text() {
+        // compute_diff_with_snapshots must replace N subprocess calls
+        // (one diff_single_file per file) with the single diff already
+        // produced by compute_diff — so the returned snapshot map must
+        // have one entry per file and each value must be byte-identical
+        // to what diff_single_file would produce for that path alone.
+        let repo = init_repo();
+        fs::write(repo.path().join("a.txt"), "a-seed\n").expect("write a");
+        fs::write(repo.path().join("b.txt"), "b-seed\n").expect("write b");
+        run_git(repo.path(), &["add", "a.txt", "b.txt"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "initial"]);
+        let baseline = head_sha(repo.path()).expect("head_sha");
+
+        // Two dirty tracked files + one untracked file: all three kinds
+        // must land in the snapshot map.
+        fs::write(repo.path().join("a.txt"), "a-edit\n").expect("edit a");
+        fs::write(repo.path().join("b.txt"), "b-edit\n").expect("edit b");
+        fs::write(repo.path().join("c.md"), "new file\n").expect("write c");
+
+        let (files, snapshots) = compute_diff_with_snapshots(repo.path(), &baseline)
+            .expect("compute_diff_with_snapshots");
+
+        assert_eq!(files.len(), 3, "expected three files, got {files:?}");
+        assert_eq!(
+            snapshots.len(),
+            files.len(),
+            "snapshot map must have one entry per FileDiff"
+        );
+
+        for file in &files {
+            let reference = diff_single_file(repo.path(), &baseline, &file.path)
+                .expect("diff_single_file reference");
+            let snapshot = snapshots
+                .get(&file.path)
+                .unwrap_or_else(|| panic!("no snapshot for {:?}", file.path));
+            assert_eq!(
+                snapshot, &reference,
+                "snapshot for {:?} must match diff_single_file output",
+                file.path,
+            );
+        }
     }
 
     #[test]
