@@ -332,61 +332,123 @@ fn print_banner() {
     println!();
 }
 
-fn select_agents_interactive(detected: &[DetectedAgent]) -> Result<Vec<AgentKind>> {
-    use dialoguer::{MultiSelect, theme::ColorfulTheme};
+/// Short prompt-friendly label for a support level. The `SupportLevel`
+/// Display impl is intentionally verbose for error messages; here we
+/// pick terse labels that fit inside the fixed column of the picker.
+fn support_level_short(sl: SupportLevel) -> &'static str {
+    match sl {
+        SupportLevel::Full => "Full",
+        SupportLevel::StopOnly => "Stop only",
+        SupportLevel::PostToolOnlyBestEffort => "PostTool only",
+        SupportLevel::WriteSideOnly => "Write-side only",
+    }
+}
 
-    // dialoguer 0.11 uses byte length (not visible width) for line-
-    // clearing math, so ANSI escape sequences in items cause it to
-    // over-count and drift the display upward on every keystroke.
-    // Use plain text items to avoid this.
-    let items: Vec<String> = detected
+/// Render the support-level pill with an ANSI color + icon. Matches the
+/// pre-8b0f9dd design, now safely renderable because `src/prompt.rs`
+/// measures item width via `unicode-width` (see ADR-0019).
+fn support_level_colored(sl: SupportLevel) -> String {
+    let label = support_level_short(sl);
+    match sl {
+        SupportLevel::Full => c_green(&format!("● {label}")),
+        SupportLevel::StopOnly => c_yellow(&format!("◐ {label}")),
+        SupportLevel::PostToolOnlyBestEffort => c_yellow(&format!("◐ {label}")),
+        SupportLevel::WriteSideOnly => c_dim(&format!("○ {label}")),
+    }
+}
+
+/// Render the detection state (binary + config dir presence) with a
+/// single-glyph icon + color.
+fn detection_status_colored(d: &DetectedAgent) -> String {
+    if d.binary_found && d.config_dir_found {
+        c_green("✓ detected")
+    } else if d.binary_found {
+        c_yellow("~ bin only")
+    } else {
+        c_dim("✗ not found")
+    }
+}
+
+fn select_agents_interactive(detected: &[DetectedAgent]) -> Result<Vec<AgentKind>> {
+    // Item layout (visible cells, not bytes — every padding uses
+    // `pad_visible` so ANSI escapes inside colored spans don't inflate
+    // the count):
+    //
+    //   <agent name, 12>  <support-level pill, 18>  <detection status>
+    //
+    // 18 fits the widest short pill `○ Write-side only` (17 cells) with
+    // one trailing pad cell. The dialoguer era's `{:<N}` formatter
+    // counted bytes (including ANSI) and misaligned these columns —
+    // see ADR-0019.
+    let labels: Vec<String> = detected
         .iter()
         .map(|d| {
             let sl = support_level(d.kind);
-            let status = if d.binary_found && d.config_dir_found {
-                "detected"
-            } else if d.binary_found {
-                "bin only"
-            } else {
-                "not found"
-            };
-            format!("{:<12}  {:<36}  {}", d.kind, sl, status)
+            format!(
+                "{}  {}  {}",
+                pad_visible(&c_bold(&d.kind.to_string()), 12),
+                pad_visible(&support_level_colored(sl), 18),
+                detection_status_colored(d),
+            )
         })
         .collect();
-
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let defaults: Vec<bool> = detected.iter().map(|d| d.recommended).collect();
 
-    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select agents to install hooks for")
-        .items(&items)
-        .defaults(&defaults)
-        .interact()
-        .context("agent selection cancelled")?;
+    let selections = crate::prompt::run_multi_select(
+        "Select agents to install hooks for",
+        &label_refs,
+        &defaults,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("agent selection cancelled"))?;
 
     Ok(selections.into_iter().map(|i| detected[i].kind).collect())
 }
 
-fn select_scope_interactive() -> Result<Scope> {
-    use dialoguer::{Select, theme::ColorfulTheme};
-
-    let items = [
-        "project-local   (gitignored, personal) <- recommended",
-        "project-shared   (committed, team-shared)",
-        "user             (global, ~/.claude/settings.json)",
-    ];
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Install scope")
-        .items(items)
-        .default(0)
-        .interact()
-        .context("scope selection cancelled")?;
-
-    Ok(if selection == 0 {
-        Scope::ProjectLocal
-    } else if selection == 1 {
-        Scope::ProjectShared
+/// Pad `s` on the right with spaces so its **visible** width equals
+/// `target_cells`. Never truncates (returns `s` unchanged if it already
+/// exceeds the target). Uses the prompt module's visible-width helper
+/// so ANSI escapes don't inflate the pad count.
+fn pad_visible(s: &str, target_cells: usize) -> String {
+    let w = crate::prompt::visible_width(s);
+    if w >= target_cells {
+        s.to_string()
     } else {
-        Scope::User
+        let mut out = String::with_capacity(s.len() + (target_cells - w));
+        out.push_str(s);
+        for _ in 0..(target_cells - w) {
+            out.push(' ');
+        }
+        out
+    }
+}
+
+fn select_scope_interactive() -> Result<Scope> {
+    let items: [String; 3] = [
+        format!(
+            "{}  {}",
+            c_bold("project-local"),
+            c_dim("(gitignored, personal) ← recommended"),
+        ),
+        format!(
+            "{}  {}",
+            c_bold("project-shared"),
+            c_dim("(committed, team-shared)"),
+        ),
+        format!(
+            "{}  {}",
+            c_bold("user"),
+            c_dim("(global, ~/.claude/settings.json)"),
+        ),
+    ];
+    let item_refs: Vec<&str> = items.iter().map(String::as_str).collect();
+    let selection = crate::prompt::run_select_one("Install scope", &item_refs, 0)?
+        .ok_or_else(|| anyhow::anyhow!("scope selection cancelled"))?;
+
+    Ok(match selection {
+        0 => Scope::ProjectLocal,
+        1 => Scope::ProjectShared,
+        _ => Scope::User,
     })
 }
 
@@ -537,8 +599,6 @@ fn fallback_scope(kind: AgentKind) -> Scope {
 /// Interactively ask the user what to do when the chosen scope is
 /// unavailable for a specific agent. Returns `None` to skip.
 fn ask_scope_fallback(kind: AgentKind, requested: Scope) -> Result<Option<Scope>> {
-    use dialoguer::{Select, theme::ColorfulTheme};
-
     println!(
         "\n  {}  {} does not support {} scope",
         c_yellow("⚠"),
@@ -565,12 +625,9 @@ fn ask_scope_fallback(kind: AgentKind, requested: Scope) -> Result<Option<Scope>
     };
 
     let labels: Vec<&str> = choices.iter().map(|(l, _)| *l).collect();
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!("How to install {} hooks?", kind))
-        .items(&labels)
-        .default(0)
-        .interact()
-        .context("scope fallback selection cancelled")?;
+    let prompt_text = format!("How to install {} hooks?", kind);
+    let selection = crate::prompt::run_select_one(&prompt_text, &labels, 0)?
+        .ok_or_else(|| anyhow::anyhow!("scope fallback selection cancelled"))?;
 
     Ok(choices[selection].1)
 }
@@ -1457,5 +1514,56 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
         let hooks = doc["hooks"].as_object().unwrap();
         assert!(hooks.is_empty(), "all kizu entries should be gone");
+    }
+
+    /// The interactive agent picker pads two columns: agent name to 12
+    /// cells, support-level pill to 18 cells. Both paddings must be
+    /// done via `pad_visible` (not `{:<N}`) so ANSI escapes don't
+    /// inflate the count. Cf. ADR-0019.
+    #[test]
+    fn agent_label_columns_are_visually_aligned() {
+        use crate::prompt::visible_width;
+
+        let detected = AgentKind::all()
+            .iter()
+            .map(|&kind| DetectedAgent {
+                kind,
+                binary_found: matches!(kind, AgentKind::ClaudeCode),
+                config_dir_found: matches!(kind, AgentKind::ClaudeCode),
+                recommended: matches!(kind, AgentKind::ClaudeCode),
+            })
+            .collect::<Vec<_>>();
+
+        // Build the labels exactly as `select_agents_interactive` would.
+        let labels: Vec<String> = detected
+            .iter()
+            .map(|d| {
+                let sl = support_level(d.kind);
+                format!(
+                    "{}  {}  {}",
+                    pad_visible(&c_bold(&d.kind.to_string()), 12),
+                    pad_visible(&support_level_colored(sl), 18),
+                    detection_status_colored(d),
+                )
+            })
+            .collect();
+
+        // For each label, the prefix up to where the **third** column
+        // begins must land at exactly 12 + 2 + 18 + 2 = 34 cells.
+        let third_col_start_cells = 12 + 2 + 18 + 2;
+        for (d, label) in detected.iter().zip(labels.iter()) {
+            let status = detection_status_colored(d);
+            let total = visible_width(label);
+            let status_w = visible_width(&status);
+            assert_eq!(
+                total.checked_sub(status_w),
+                Some(third_col_start_cells),
+                "misaligned row for {:?}: total={} status_w={} label={:?}",
+                d.kind,
+                total,
+                status_w,
+                label,
+            );
+        }
     }
 }

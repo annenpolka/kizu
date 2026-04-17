@@ -9,6 +9,7 @@ mod highlight;
 mod hook;
 mod init;
 mod paths;
+mod prompt;
 mod scar;
 mod session;
 mod ui;
