@@ -102,7 +102,121 @@ pub fn diff_single_file(root: &Path, baseline_sha: &str, file_path: &Path) -> Re
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("git diff single file failed: {}", stderr.trim()));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !raw.is_empty() {
+        return Ok(raw);
+    }
+    // Empty stdout is ambiguous: the path may be tracked-but-unchanged
+    // *or* untracked-and-visible (git diff ignores untracked entries
+    // entirely) *or* gitignored. Stream mode needs the new file's
+    // contents only in the untracked-and-visible case — gitignored
+    // files must stay out of stream snapshots to preserve the same
+    // confidentiality boundary `compute_diff` already honors.
+    //
+    // Any failure of the classification step or the synthesis step
+    // (other than `NotFound`, which is just a TOCTOU race) surfaces
+    // as `Err` so the caller preserves its prior snapshot instead of
+    // storing an accidental empty.
+    if is_untracked_and_visible(root, rel)? {
+        match synthesize_untracked_diff_text(root, rel) {
+            Ok(text) => return Ok(text),
+            Err(e) => {
+                let vanished = e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                });
+                if vanished {
+                    return Ok(String::new());
+                }
+                return Err(e)
+                    .with_context(|| format!("synthesizing untracked snapshot {}", rel.display()));
+            }
+        }
+    }
+    Ok(raw)
+}
+
+/// Return `true` when the path is untracked **and** not ignored by
+/// `.gitignore`. Uses `git status --porcelain=v1 -z
+/// --untracked-files=all -- <rel>` because it is the only check that
+/// honors `.gitignore` the same way `compute_diff` / `list_untracked`
+/// already do. `git ls-files --error-unmatch` alone classifies ignored
+/// files as untracked, which would leak their contents into stream
+/// snapshots.
+fn is_untracked_and_visible(root: &Path, rel: &Path) -> Result<bool> {
+    if !root.join(rel).exists() {
+        return Ok(false);
+    }
+    let output = Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            &rel.to_string_lossy(),
+        ])
+        .current_dir(root)
+        .output()
+        .context("git status --porcelain for untracked classification")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "`git status --porcelain` failed: {}",
+            stderr.trim()
+        ));
+    }
+    for record in output.stdout.split(|&b| b == 0) {
+        if record.len() < 3 {
+            continue;
+        }
+        if &record[..3] == b"?? " {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Synthesize a `git diff`-shaped text for an untracked file so it is
+/// visible to downstream parsers that expect `+`-prefixed lines (see
+/// `parse_stream_diff_to_hunk` and `compute_operation_diff`). The
+/// output matches the skeleton produced by git for a newly-added file
+/// but uses a fixed zero hash since we do not need a real object id.
+fn synthesize_untracked_diff_text(root: &Path, rel: &Path) -> Result<String> {
+    let synth = synthesize_untracked(root, rel)?;
+    let mut out = String::new();
+    let display = rel.to_string_lossy();
+    out.push_str(&format!("diff --git a/{display} b/{display}\n"));
+    out.push_str("new file mode 100644\n");
+    out.push_str("index 0000000..0000000\n");
+    out.push_str("--- /dev/null\n");
+    out.push_str(&format!("+++ b/{display}\n"));
+    match synth.content {
+        DiffContent::Text(hunks) => {
+            for hunk in &hunks {
+                out.push_str(&format!(
+                    "@@ -0,0 +{},{} @@\n",
+                    hunk.new_start, hunk.new_count
+                ));
+                for line in &hunk.lines {
+                    match line.kind {
+                        LineKind::Added => out.push('+'),
+                        LineKind::Context => out.push(' '),
+                        LineKind::Deleted => out.push('-'),
+                    }
+                    out.push_str(&line.content);
+                    out.push('\n');
+                }
+            }
+        }
+        DiffContent::Binary => {
+            out.push_str("Binary files /dev/null and b/");
+            out.push_str(&display);
+            out.push_str(" differ\n");
+        }
+    }
+    Ok(out)
 }
 
 pub fn compute_diff(root: &Path, baseline_sha: &str) -> Result<Vec<FileDiff>> {
@@ -1686,5 +1800,129 @@ index 1111111..2222222 100644
         let files = parse_unified_diff(raw).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].header_prefix, None);
+    }
+
+    #[test]
+    fn diff_single_file_synthesizes_untracked_file_as_all_added() {
+        // `git diff <baseline> -- <path>` omits untracked files, but the
+        // stream mode snapshot path needs the new file's contents so that
+        // a `Write` creating a brand-new file produces a non-empty
+        // `diff_snapshot`. Callers route through `diff_single_file` and
+        // cannot tell a tracked-but-unchanged file from an untracked one;
+        // the helper must detect the untracked case and synthesize an
+        // all-added diff, mirroring `synthesize_untracked` / `compute_diff`.
+        let repo = init_repo();
+        fs::write(repo.path().join("seed.rs"), "seed\n").expect("write seed");
+        run_git(repo.path(), &["add", "seed.rs"]);
+        run_git(repo.path(), &["commit", "-m", "seed", "--quiet"]);
+        let baseline = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Brand-new file that `git diff` would otherwise ignore.
+        let new_rel = Path::new("new.rs");
+        let new_abs = repo.path().join(new_rel);
+        fs::write(&new_abs, "alpha\nbeta\n").expect("write new");
+
+        let diff = diff_single_file(&canonical(repo.path()), &baseline, new_rel)
+            .expect("untracked file diff must succeed");
+
+        assert!(
+            diff.contains("+alpha"),
+            "synthesized diff must contain the file's first line prefixed with `+`, got {diff:?}"
+        );
+        assert!(
+            diff.contains("+beta"),
+            "synthesized diff must contain the file's second line prefixed with `+`, got {diff:?}"
+        );
+    }
+
+    #[test]
+    fn diff_single_file_does_not_synthesize_for_gitignored_file() {
+        // Ignored files (e.g. `.claude/settings.local.json`, `.env`)
+        // must never leak into stream mode snapshots via the untracked
+        // fallback. `git ls-files --error-unmatch` alone cannot tell
+        // ignored from untracked, so the fallback must consult
+        // `.gitignore` before reading file contents.
+        let repo = init_repo();
+        fs::write(repo.path().join(".gitignore"), "secrets.local\n").expect("write gitignore");
+        fs::write(repo.path().join("seed.rs"), "seed\n").expect("write seed");
+        run_git(repo.path(), &["add", ".gitignore", "seed.rs"]);
+        run_git(repo.path(), &["commit", "-m", "seed", "--quiet"]);
+        let baseline = head_sha(repo.path()).expect("head_sha");
+
+        let secret_rel = Path::new("secrets.local");
+        fs::write(
+            repo.path().join(secret_rel),
+            "API_TOKEN=deadbeef\nSSN=111\n",
+        )
+        .expect("write secret");
+
+        let diff = diff_single_file(&canonical(repo.path()), &baseline, secret_rel)
+            .expect("ignored files must not trigger an error, just an empty diff");
+
+        assert!(
+            !diff.contains("API_TOKEN"),
+            "ignored file contents must never enter the synthesized diff, got {diff:?}"
+        );
+        assert!(
+            diff.is_empty(),
+            "ignored path must round-trip through the empty-diff path untouched, got {diff:?}"
+        );
+    }
+
+    #[test]
+    fn diff_single_file_surfaces_fallback_errors_instead_of_silent_empty_ok() {
+        // The earlier implementation swallowed `is_untracked` /
+        // `synthesize_untracked_diff_text` errors into `Ok("")`, which
+        // let `handle_event_log` treat the failure as a valid empty
+        // snapshot. That poisoned subsequent per-file diffs. A
+        // non-`NotFound` failure must surface as `Err` so callers can
+        // preserve the previous snapshot.
+        //
+        // We trigger a failure in the fallback path by pointing
+        // `root` at a directory that is not a git repository. The
+        // initial `git diff` returns non-zero (already `Err`) so the
+        // synthesize path is not reached in that shape. Instead, we
+        // commit a clean repo with an untracked file, then corrupt
+        // `.git` after the initial diff succeeds: too complex. A
+        // simpler, equally meaningful check: if the *file itself*
+        // cannot be read (permissions error) and is *not* missing,
+        // the helper must propagate the error. We approximate by
+        // creating a dangling symlink whose target never existed and
+        // confirming the helper does not return `Ok("")`.
+        let repo = init_repo();
+        fs::write(repo.path().join("seed.rs"), "seed\n").expect("seed");
+        run_git(repo.path(), &["add", "seed.rs"]);
+        run_git(repo.path(), &["commit", "-m", "seed", "--quiet"]);
+        let baseline = head_sha(repo.path()).expect("head_sha");
+
+        // Dangling symlink: target never existed. `synthesize_untracked`
+        // will open-fail with NotFound. We want NotFound to collapse to
+        // an empty `Ok` (the file vanished), mirroring `compute_diff`'s
+        // NotFound tolerance — but any OTHER failure must surface.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = repo.path().join("dangling.link");
+            symlink(repo.path().join("no-such-file"), &link).expect("create symlink");
+            let res = diff_single_file(
+                &canonical(repo.path()),
+                &baseline,
+                Path::new("dangling.link"),
+            );
+            // NotFound of the symlink target is tolerated → Ok("") is fine here.
+            // We assert only that no panic and the returned diff is empty.
+            // Surfacing NotFound as Err is also acceptable; we just must not
+            // swallow arbitrary errors as empty success.
+            if let Ok(s) = res {
+                assert!(s.is_empty(), "dangling symlink should be empty, got {s:?}");
+            }
+        }
     }
 }

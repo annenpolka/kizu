@@ -31,9 +31,13 @@ pub enum ViewMode {
 #[derive(Debug, Clone)]
 pub struct StreamEvent {
     pub metadata: SanitizedEvent,
-    /// Per-operation diff captured by the TUI in real-time.
-    /// `None` for events that occurred before the TUI was started.
-    pub diff_snapshot: Option<String>,
+    /// Per-file operation diffs captured by the TUI in real-time,
+    /// keyed by the same path entries as `metadata.file_paths`.
+    /// A `MultiEdit` or multi-file `Write` carries one entry per
+    /// touched path so the stream view can render per-path hunks
+    /// instead of collapsing everything onto the first path.
+    /// Empty for events that occurred before the TUI was started.
+    pub per_file_diffs: BTreeMap<PathBuf, String>,
 }
 
 /// Half-page scroll constant for `Ctrl-d` / `Ctrl-u`. M5+ may swap this for
@@ -1046,8 +1050,9 @@ impl App {
             return;
         }
 
-        // Capture per-operation diff for each affected file.
-        let mut operation_diff = String::new();
+        // Capture per-operation diff for each affected file separately
+        // so multi-file events keep one hunk set per path.
+        let mut per_file_diffs: BTreeMap<PathBuf, String> = BTreeMap::new();
 
         for file_path in &event.file_paths {
             // Preserve prior snapshot on transient git failure. An
@@ -1075,10 +1080,7 @@ impl App {
                 current_diff.clone()
             };
             if !op_diff.is_empty() {
-                if !operation_diff.is_empty() {
-                    operation_diff.push('\n');
-                }
-                operation_diff.push_str(&op_diff);
+                per_file_diffs.insert(file_path.clone(), op_diff);
             }
 
             self.diff_snapshots.insert(file_path.clone(), current_diff);
@@ -1086,11 +1088,7 @@ impl App {
 
         let stream_event = StreamEvent {
             metadata: event,
-            diff_snapshot: if operation_diff.is_empty() {
-                None
-            } else {
-                Some(operation_diff)
-            },
+            per_file_diffs,
         };
         self.stream_events.push(stream_event);
 
@@ -3576,37 +3574,49 @@ impl App {
 /// - `path`: the edited file path
 /// - `content`: parsed diff lines from the captured snapshot
 pub fn build_stream_files(events: &[StreamEvent]) -> Vec<FileDiff> {
-    events
-        .iter()
-        .enumerate()
-        .map(|(i, ev)| {
-            let ts = ev.metadata.timestamp_ms;
-            let time_str = crate::ui::format_local_time(ts);
-            let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
-            let prefix = format!("{time_str} {tool}");
-            let path = ev.metadata.file_paths.first().cloned().unwrap_or_default();
+    let mut out: Vec<FileDiff> = Vec::new();
+    for (i, ev) in events.iter().enumerate() {
+        let ts = ev.metadata.timestamp_ms;
+        let time_str = crate::ui::format_local_time(ts);
+        let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
+        let prefix = format!("{time_str} {tool}");
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_millis(ts);
 
-            // Use event index * 10000 as old_start so hunk anchors
-            // (keyed on path + old_start) stay unique even when
-            // multiple events edit the same file.
-            let (hunks, added, deleted) = match &ev.diff_snapshot {
-                Some(diff_text) if !diff_text.is_empty() => {
-                    parse_stream_diff_to_hunk(diff_text, i * 10000 + 1)
-                }
+        // Use `file_paths` order as the stable render order so a
+        // multi-file tool call presents files in the order the agent
+        // reported them, not in the BTreeMap's sort order.
+        let paths: Vec<PathBuf> = if ev.metadata.file_paths.is_empty() {
+            // Preserve the "empty placeholder" behavior for events
+            // whose file_paths could not be resolved — they still
+            // need to be visible in the stream as a metadata row.
+            vec![PathBuf::new()]
+        } else {
+            ev.metadata.file_paths.clone()
+        };
+
+        // Space each (event, path) pair's old_start apart so hunk
+        // anchors (keyed on path + old_start) stay unique across
+        // events and paths.
+        for (j, path) in paths.into_iter().enumerate() {
+            let anchor_base = (i * 10_000) + (j * 100) + 1;
+            let diff_text = ev.per_file_diffs.get(&path);
+            let (hunks, added, deleted) = match diff_text {
+                Some(t) if !t.is_empty() => parse_stream_diff_to_hunk(t, anchor_base),
                 _ => (vec![], 0, 0),
             };
 
-            FileDiff {
+            out.push(FileDiff {
                 path,
                 status: git::FileStatus::Modified,
                 added,
                 deleted,
                 content: git::DiffContent::Text(hunks),
-                mtime: SystemTime::UNIX_EPOCH + Duration::from_millis(ev.metadata.timestamp_ms),
-                header_prefix: Some(prefix),
-            }
-        })
-        .collect()
+                mtime,
+                header_prefix: Some(prefix.clone()),
+            });
+        }
+    }
+    out
 }
 
 /// Parse raw diff text (from a stream event snapshot) into a single
@@ -8307,6 +8317,10 @@ mod tests {
     // ---- stream mode tests ----
 
     fn make_stream_event(tool: &str, path: &str, diff: Option<&str>, ts: u64) -> StreamEvent {
+        let mut per_file = std::collections::BTreeMap::new();
+        if let Some(d) = diff {
+            per_file.insert(PathBuf::from(path), d.to_string());
+        }
         StreamEvent {
             metadata: crate::hook::SanitizedEvent {
                 session_id: None,
@@ -8316,7 +8330,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 timestamp_ms: ts,
             },
-            diff_snapshot: diff.map(String::from),
+            per_file_diffs: per_file,
         }
     }
 
@@ -8407,6 +8421,51 @@ mod tests {
         match &files[0].content {
             DiffContent::Text(hunks) => assert!(hunks.is_empty()),
             _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn build_stream_files_produces_one_entry_per_path_for_multi_file_event() {
+        // A single MultiEdit / multi-file Write touches several paths.
+        // Every path must get its own FileDiff so the stream view does
+        // not collapse secondary files onto the first path's header.
+        let mut per_file = std::collections::BTreeMap::new();
+        per_file.insert(
+            PathBuf::from("src/a.rs"),
+            "diff --git a/src/a.rs b/src/a.rs\n@@ -0,0 +1,1 @@\n+a\n".to_string(),
+        );
+        per_file.insert(
+            PathBuf::from("src/b.rs"),
+            "diff --git a/src/b.rs b/src/b.rs\n@@ -0,0 +1,1 @@\n+b\n".to_string(),
+        );
+        let events = vec![StreamEvent {
+            metadata: crate::hook::SanitizedEvent {
+                session_id: None,
+                hook_event_name: "PostToolUse".into(),
+                tool_name: Some("MultiEdit".into()),
+                file_paths: vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")],
+                cwd: PathBuf::from("/tmp"),
+                timestamp_ms: 1_700_000_000_000,
+            },
+            per_file_diffs: per_file,
+        }];
+        let files = build_stream_files(&events);
+        assert_eq!(files.len(), 2, "one FileDiff per touched path");
+        let paths: Vec<&PathBuf> = files.iter().map(|f| &f.path).collect();
+        assert!(paths.contains(&&PathBuf::from("src/a.rs")));
+        assert!(paths.contains(&&PathBuf::from("src/b.rs")));
+        // Each must carry a non-empty hunk (their own `+` line).
+        for f in &files {
+            match &f.content {
+                DiffContent::Text(hunks) => {
+                    assert!(
+                        !hunks.is_empty(),
+                        "per-path FileDiff must have its own hunk, got empty for {:?}",
+                        f.path
+                    );
+                }
+                _ => panic!("expected Text content"),
+            }
         }
     }
 

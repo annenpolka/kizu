@@ -697,6 +697,22 @@ struct HookCmd<'a> {
 /// Each event holds an array of **matcher groups**, each with a
 /// `matcher` string (tool name filter, `""` = match all) and a
 /// `hooks` sub-array of command objects.
+/// Extract the `hook-<name>` token from a kizu hook invocation so we
+/// can reconcile by subcommand instead of by full command string.
+/// Returns `None` when the command does not look like a kizu hook
+/// (e.g. a user's linter), so non-kizu entries are never matched.
+fn kizu_command_token(command: &str) -> Option<String> {
+    for token in command.split_whitespace() {
+        if let Some(rest) = token.strip_prefix("hook-") {
+            if rest.is_empty() {
+                continue;
+            }
+            return Some(format!("hook-{rest}"));
+        }
+    }
+    None
+}
+
 fn merge_hooks_into_settings(
     path: &Path,
     hooks: &[(&str, &str, &[HookCmd<'_>])], // (event_name, matcher, commands)
@@ -730,48 +746,99 @@ fn merge_hooks_into_settings(
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("hooks.{event_name} is not an array"))?;
 
-        // Check if any existing matcher group already has a kizu hook.
-        let already = arr.iter().any(|group| {
-            group
+        // Gather all existing commands on this event so we can
+        // reconcile per-command instead of per-matcher-group. This is
+        // the upgrade path: a config that already contains
+        // `hook-post-tool` from an older kizu install must still
+        // receive new commands like `hook-log-event`.
+        let existing_cmds: Vec<String> = arr
+            .iter()
+            .flat_map(|group| {
+                group
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|cmd| cmd.get("command").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .collect();
+
+        // Partition the requested commands into "already present" and
+        // "missing". `kizu_command_token` extracts the subcommand
+        // (`hook-post-tool`, `hook-log-event`, …) so `--agent`
+        // differences or binary-path differences do not spawn a
+        // duplicate entry.
+        let mut missing: Vec<&HookCmd<'_>> = Vec::new();
+        for cmd in commands.iter() {
+            let want_token = kizu_command_token(cmd.command);
+            let is_present = existing_cmds
+                .iter()
+                .any(|existing| want_token.is_some() && kizu_command_token(existing) == want_token);
+            if is_present {
+                skipped += 1;
+            } else {
+                missing.push(cmd);
+            }
+        }
+
+        if missing.is_empty() {
+            continue;
+        }
+
+        // Prefer appending to an existing matcher group that already
+        // holds a kizu command with the same `matcher`, so the
+        // upgraded config remains a single cohesive group instead of
+        // splitting kizu's hooks across two siblings.
+        let target_idx = arr.iter().position(|group| {
+            let matches_matcher = group
+                .get("matcher")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| m == *matcher);
+            let has_kizu = group
                 .get("hooks")
                 .and_then(|h| h.as_array())
                 .is_some_and(|cmds| {
                     cmds.iter().any(|cmd| {
                         cmd.get("command")
                             .and_then(|v| v.as_str())
-                            .is_some_and(|c| {
-                                c.contains("kizu hook-")
-                                    || c.contains(" hook-post-tool")
-                                    || c.contains(" hook-stop")
-                                    || c.contains(" hook-log-event")
-                                    || c.contains(" hook-log-event")
-                            })
+                            .and_then(kizu_command_token)
+                            .is_some()
                     })
-                })
+                });
+            matches_matcher && has_kizu
         });
 
-        if already {
-            skipped += 1;
+        let cmd_values: Vec<serde_json::Value> = missing
+            .iter()
+            .map(|cmd| {
+                let mut obj = serde_json::json!({
+                    "type": "command",
+                    "command": cmd.command,
+                });
+                if let Some(t) = cmd.timeout {
+                    obj["timeout"] = serde_json::json!(t);
+                }
+                if cmd.is_async {
+                    obj["async"] = serde_json::json!(true);
+                }
+                obj
+            })
+            .collect();
+
+        if let Some(idx) = target_idx {
+            let group_hooks = arr[idx]
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+                .ok_or_else(|| anyhow::anyhow!("hooks.{event_name}[{idx}].hooks is not array"))?;
+            for v in cmd_values {
+                group_hooks.push(v);
+                added += 1;
+            }
         } else {
-            let cmd_array: Vec<serde_json::Value> = commands
-                .iter()
-                .map(|cmd| {
-                    let mut obj = serde_json::json!({
-                        "type": "command",
-                        "command": cmd.command,
-                    });
-                    if let Some(t) = cmd.timeout {
-                        obj["timeout"] = serde_json::json!(t);
-                    }
-                    if cmd.is_async {
-                        obj["async"] = serde_json::json!(true);
-                    }
-                    obj
-                })
-                .collect();
             arr.push(serde_json::json!({
                 "matcher": matcher,
-                "hooks": cmd_array
+                "hooks": cmd_values
             }));
             added += 1;
         }
@@ -1363,6 +1430,63 @@ mod tests {
 
         assert_eq!(added, 0);
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn merge_hooks_adds_missing_commands_to_existing_kizu_group() {
+        // Upgrade path: a user installed kizu from main (which only had
+        // `hook-post-tool`), then re-runs `kizu init` on v0.3. The new
+        // async `hook-log-event` must be appended even though a kizu
+        // command is already present — otherwise stream mode stays
+        // inert after the upgrade.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write|MultiEdit","hooks":[{"type":"command","command":"kizu hook-post-tool --agent claude-code","timeout":10}]}]}}"#,
+        )
+        .unwrap();
+
+        merge_hooks_into_settings(
+            &path,
+            &[(
+                "PostToolUse",
+                "Edit|Write|MultiEdit",
+                &[
+                    HookCmd {
+                        command: "kizu hook-post-tool --agent claude-code",
+                        timeout: Some(10),
+                        is_async: false,
+                    },
+                    HookCmd {
+                        command: "kizu hook-log-event",
+                        timeout: None,
+                        is_async: true,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let post = doc["hooks"]["PostToolUse"].as_array().unwrap();
+        let cmds: Vec<&str> = post
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+            .filter_map(|c| c["command"].as_str())
+            .collect();
+        assert!(
+            cmds.iter().any(|c| c.contains("hook-post-tool")),
+            "pre-existing hook-post-tool must remain: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("hook-log-event")),
+            "missing hook-log-event must be appended on rerun: {cmds:?}"
+        );
+        // The duplicate `hook-post-tool` must not be added twice.
+        let post_tool_count = cmds.iter().filter(|c| c.contains("hook-post-tool")).count();
+        assert_eq!(post_tool_count, 1, "duplicate must be suppressed");
     }
 
     #[test]
