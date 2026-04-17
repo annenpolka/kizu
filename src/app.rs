@@ -202,6 +202,14 @@ pub struct App {
     /// (b) any other concurrent session's historical events that
     ///     existed before this session was bootstrapped.
     pub session_start_ms: u64,
+    /// Agent `session_id` this TUI is bound to. Populated on the
+    /// first `handle_event_log` ingest that carries a session_id;
+    /// later events with a different session_id are dropped so two
+    /// concurrent agents writing to the same repo cannot cross-
+    /// pollute `diff_snapshots` or the stream history. `None`
+    /// before the first bound ingest; stays bound for the rest of
+    /// the session.
+    pub bound_session_id: Option<String>,
     /// Per-file diff snapshots used to compute per-operation diffs.
     /// Maps file path → most recent cumulative diff output.
     pub diff_snapshots: std::collections::HashMap<PathBuf, String>,
@@ -966,6 +974,7 @@ impl App {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            bound_session_id: None,
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
@@ -1102,14 +1111,29 @@ impl App {
             Err(_) => return,
         };
 
-        // Session isolation: drop events that predate this session's
-        // start. The previous implementation used `clean_stale_events`
-        // to bulk-delete the shared per-project events directory,
-        // which destroyed a concurrently-running kizu session's live
-        // history. Filtering on `timestamp_ms` keeps our stream clean
-        // of leftover noise without touching other sessions' files.
+        // Session isolation — layer 1: drop events that predate this
+        // session's start. The previous implementation used
+        // `clean_stale_events` to bulk-delete the shared per-project
+        // events directory, which destroyed a concurrently-running
+        // kizu session's live history. Filtering on `timestamp_ms`
+        // keeps our stream clean of leftover noise without touching
+        // other sessions' files on disk.
         if event.timestamp_ms < self.session_start_ms {
             return;
+        }
+
+        // Session isolation — layer 2: bind to the first session_id
+        // we observe and reject events from other agent sessions.
+        // Wall-clock alone cannot distinguish concurrent sessions;
+        // ingesting both would cross-pollute `diff_snapshots`. A
+        // `None` session_id event (agent didn't provide one) is
+        // always accepted and does not change the binding.
+        if let Some(sid) = event.session_id.as_ref() {
+            match &self.bound_session_id {
+                Some(expected) if expected != sid => return,
+                Some(_) => {}
+                None => self.bound_session_id = Some(sid.clone()),
+            }
         }
 
         // Normalize every file path to repo-relative form **once**,
@@ -1199,22 +1223,44 @@ impl App {
         let Ok(read_dir) = std::fs::read_dir(dir) else {
             return;
         };
-        // Collect + sort by filename so older timestamps play back
-        // first. Filenames are `<ms>-<tool>-<uniq>.json`, and the
-        // lexicographic ordering of the `<ms>` prefix coincides with
-        // chronological order as long as ms values have the same
-        // digit count (true for all contemporary timestamps).
-        let mut entries: Vec<PathBuf> = Vec::new();
+        // Replay order is driven by the JSON payload's
+        // `timestamp_ms` (agent-side wall clock), with the on-disk
+        // file modification time as the tie-break for events that
+        // share a millisecond. The earlier implementation sorted by
+        // filename (`<ms>-<tool>-<uniq>.json`), which meant two
+        // same-millisecond events were reordered by tool name
+        // instead of by actual write sequence. Because
+        // `handle_event_log` mutates `diff_snapshots` in the order
+        // it receives events, out-of-order replay fabricated
+        // per-operation diffs and poisoned the baseline the next
+        // event diffed against.
+        //
+        // Tie-break chain: (timestamp_ms, mtime, path).
+        let mut entries: Vec<(u64, std::time::SystemTime, PathBuf)> = Vec::new();
         for entry in read_dir.flatten() {
             let name = entry.file_name();
             let s = name.to_string_lossy();
             if s.starts_with('.') || !s.ends_with(".json") {
                 continue;
             }
-            entries.push(entry.path());
+            let path = entry.path();
+            let ts_ms = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<SanitizedEvent>(&c).ok())
+                .map(|e| e.timestamp_ms)
+                .unwrap_or(0);
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            entries.push((ts_ms, mtime, path));
         }
-        entries.sort();
-        for path in entries {
+        entries.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        for (_, _, path) in entries {
             self.handle_event_log(path);
         }
     }
@@ -4210,6 +4256,7 @@ mod tests {
             // filter in `handle_event_log` is a no-op by default;
             // tests that exercise the filter set this field explicitly.
             session_start_ms: 0,
+            bound_session_id: None,
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
@@ -8779,6 +8826,75 @@ mod tests {
     }
 
     #[test]
+    fn handle_event_log_binds_to_first_seen_session_id() {
+        // Under concurrent agent activity on the same repo a second
+        // session's events must not pollute the first session's
+        // `diff_snapshots` / stream history. The TUI binds itself
+        // to the first session_id it observes; all later events
+        // with a different session_id are dropped without advancing
+        // the snapshot map.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+
+        // First event binds the TUI to session A.
+        let a = crate::hook::SanitizedEvent {
+            session_id: Some("session-A".into()),
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/a.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 10_000,
+        };
+        let a_path = events_dir.join("10000-Edit-aaa.json");
+        std::fs::write(&a_path, serde_json::to_string(&a).unwrap()).unwrap();
+        app.handle_event_log(a_path);
+        assert_eq!(app.stream_events.len(), 1, "first event must be ingested");
+
+        // Second event from a different session must be dropped.
+        let b = crate::hook::SanitizedEvent {
+            session_id: Some("session-B".into()),
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/a.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 11_000,
+        };
+        let b_path = events_dir.join("11000-Edit-bbb.json");
+        std::fs::write(&b_path, serde_json::to_string(&b).unwrap()).unwrap();
+        app.handle_event_log(b_path);
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "foreign-session event must not advance stream or diff_snapshots"
+        );
+
+        // A later event from the bound session must still be ingested.
+        let a2 = crate::hook::SanitizedEvent {
+            session_id: Some("session-A".into()),
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![root.join("src/a.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 12_000,
+        };
+        let a2_path = events_dir.join("12000-Write-aaa2.json");
+        std::fs::write(&a2_path, serde_json::to_string(&a2).unwrap()).unwrap();
+        app.handle_event_log(a2_path);
+        assert_eq!(
+            app.stream_events.len(),
+            2,
+            "bound-session event must still be accepted after the foreign reject"
+        );
+    }
+
+    #[test]
     fn handle_event_log_filters_out_events_predating_session_start() {
         // Two kizu sessions on the same repo: session B must not
         // ingest session A's historical events. The earlier
@@ -8867,6 +8983,80 @@ mod tests {
                 .iter()
                 .map(|e| e.metadata.tool_name.as_deref().unwrap_or("?"))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn replay_events_dir_orders_same_millisecond_events_chronologically() {
+        // Two events in the same millisecond must replay in the
+        // order they were written, not in alphabetical order by
+        // tool name. The previous implementation sorted the
+        // directory by filename, so `<ms>-<tool>-<uniq>.json`
+        // placed `Edit` before `Write` regardless of which event
+        // actually fired first. `handle_event_log` advances
+        // `diff_snapshots` as it goes, so an out-of-order replay
+        // fabricates the operation diff for whichever event lands
+        // on the wrong side of the split.
+        //
+        // Assertion: `handle_event_log` is called in write order so
+        // `stream_events` appears in the same order as the on-disk
+        // write sequence (which we control via the uniqueness
+        // suffix in the filename).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+
+        // Same millisecond, different tool names. The *intended*
+        // write order is `Write` first, then `Edit` — encoded by
+        // a monotonic uniqueness prefix `001` < `002`.
+        let first = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![root.join("src/x.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 20_000,
+        };
+        let second = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/x.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 20_000,
+        };
+        // Use the production filename layout `<ms>-<tool>-<uniq>.json`
+        // with tool names picked so filename lex sort disagrees with
+        // write order: `Edit` < `Write` alphabetically, but the
+        // intended chronological order is `Write` first. Replay
+        // must honour the write order (derived from on-disk mtime)
+        // rather than naïve filename sort.
+        let first_path = events_dir.join("20000-Write-aaa.json");
+        let second_path = events_dir.join("20000-Edit-zzz.json");
+        std::fs::write(&first_path, serde_json::to_string(&first).unwrap()).unwrap();
+        // Ensure distinct on-disk mtimes so the replay's tie-break
+        // reflects the actual sequence.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&second_path, serde_json::to_string(&second).unwrap()).unwrap();
+
+        app.replay_events_dir(&events_dir);
+
+        let tools: Vec<&str> = app
+            .stream_events
+            .iter()
+            .filter_map(|e| e.metadata.tool_name.as_deref())
+            .collect();
+        assert_eq!(
+            tools,
+            vec!["Write", "Edit"],
+            "replay must honour monotonic write order, got {tools:?}"
         );
     }
 
