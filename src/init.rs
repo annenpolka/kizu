@@ -217,6 +217,33 @@ fn kizu_bin_for_scope(scope: Scope) -> String {
     }
 }
 
+/// Build a hook `command` string that is safe to hand to the agent's
+/// shell-based hook runner. Project-local and user scopes embed an
+/// absolute `current_exe()` path, so paths containing spaces (e.g.
+/// `/Users/John Doe/.cargo/bin/kizu`) or shell metacharacters would
+/// break `sh -c` parsing and either exec the wrong argv[0] or trigger
+/// unintended expansion. Project-shared keeps the bare `kizu` token
+/// because the committed config must work on any machine where kizu
+/// is resolvable through PATH.
+fn kizu_hook_command(scope: Scope, rest: &str) -> String {
+    let bin = kizu_bin_for_scope(scope);
+    kizu_hook_command_with_bin(scope, &bin, rest)
+}
+
+/// Testable variant of [`kizu_hook_command`] that accepts an
+/// explicit `bin` path. The production call resolves the bin via
+/// `current_exe()`; tests pass fabricated paths to cover quoting
+/// edge cases (spaces, embedded quotes) without touching the
+/// filesystem or the process's own installation.
+fn kizu_hook_command_with_bin(scope: Scope, bin: &str, rest: &str) -> String {
+    match scope {
+        Scope::ProjectShared => format!("{bin} {rest}"),
+        Scope::ProjectLocal | Scope::User => {
+            format!("{} {}", shell_single_quote(bin), rest)
+        }
+    }
+}
+
 /// Run `kizu init` interactively or non-interactively.
 pub fn run_init(
     project_root: &Path,
@@ -930,10 +957,9 @@ fn merge_hooks_into_settings(
 
 fn install_claude_code(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::ClaudeCode, scope, project_root)?;
-    let bin = kizu_bin_for_scope(scope);
-    let post_cmd = format!("{bin} hook-post-tool --agent claude-code");
-    let log_cmd = format!("{bin} hook-log-event");
-    let stop_cmd = format!("{bin} hook-stop --agent claude-code");
+    let post_cmd = kizu_hook_command(scope, "hook-post-tool --agent claude-code");
+    let log_cmd = kizu_hook_command(scope, "hook-log-event");
+    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent claude-code");
     let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[
         (
             "PostToolUse",
@@ -993,9 +1019,8 @@ fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
         .and_then(|v| v.as_object_mut())
         .ok_or_else(|| anyhow::anyhow!("hooks is not an object in hooks.json"))?;
 
-    let bin = kizu_bin_for_scope(scope);
-    let post_cmd = format!("{bin} hook-post-tool --agent cursor");
-    let stop_cmd = format!("{bin} hook-stop --agent cursor");
+    let post_cmd = kizu_hook_command(scope, "hook-post-tool --agent cursor");
+    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent cursor");
     let entries = &[
         ("afterFileEdit", post_cmd.as_str()),
         ("stop", stop_cmd.as_str()),
@@ -1047,8 +1072,7 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
             .join("hooks.json"),
     };
     // Codex: Stop only (PreTool/PostTool is Bash-only).
-    let bin = kizu_bin_for_scope(scope);
-    let stop_cmd = format!("{bin} hook-stop --agent codex");
+    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent codex");
     let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[(
         "Stop",
         "",
@@ -1072,10 +1096,9 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
 
 fn install_qwen(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::QwenCode, scope, project_root)?;
-    let bin = kizu_bin_for_scope(scope);
-    let post_cmd = format!("{bin} hook-post-tool --agent qwen");
-    let log_cmd = format!("{bin} hook-log-event");
-    let stop_cmd = format!("{bin} hook-stop --agent qwen");
+    let post_cmd = kizu_hook_command(scope, "hook-post-tool --agent qwen");
+    let log_cmd = kizu_hook_command(scope, "hook-log-event");
+    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent qwen");
     let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[
         (
             "PostToolUse",
@@ -1234,6 +1257,24 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
                 agent_removed = true;
                 any_removed = true;
             }
+            // User-scope Cursor install lives at ~/.cursor/hooks.json,
+            // which `AgentKind::user_config_dir()` intentionally
+            // returns `None` for (Cursor uses hooks.json, not the
+            // settings.json shape the generic path handles). Install
+            // writes there; teardown must match.
+            if let Some(home) = dirs::home_dir()
+                && teardown_cursor_user_hooks(&home)?
+            {
+                let path = home.join(".cursor").join("hooks.json");
+                println!(
+                    "  {}  {}  {}",
+                    c_bold(&format!("{:<12}", "Cursor")),
+                    c_green("✓ removed"),
+                    c_dim(&format!("→ {}", path.display())),
+                );
+                agent_removed = true;
+                any_removed = true;
+            }
         }
         if agent.kind == AgentKind::Codex {
             // Codex project-scoped install writes to <repo>/.codex/hooks.json
@@ -1344,6 +1385,16 @@ fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+/// Scrub kizu hook entries from `<home>/.cursor/hooks.json`,
+/// covering the user-scope install path that `install_cursor` uses
+/// when `Scope::User`. Split out of `run_teardown` so tests can
+/// inject a fake home directory without monkey-patching
+/// `dirs::home_dir()`. Returns `true` if anything was removed.
+fn teardown_cursor_user_hooks(home: &Path) -> Result<bool> {
+    let path = home.join(".cursor").join("hooks.json");
+    remove_kizu_hooks_from_json(&path)
 }
 
 /// Remove kizu hook entries from a JSON settings file. Returns
@@ -1854,6 +1905,50 @@ mod tests {
     }
 
     #[test]
+    fn kizu_hook_command_quotes_path_for_local_and_user_scopes() {
+        // Agent hook backends run `command` through a shell. If the
+        // kizu binary lives at `/Users/John Doe/.cargo/bin/kizu`,
+        // emitting the raw path into `format!("{bin} hook-...")`
+        // yields a command where `sh` word-splits on the space and
+        // tries to exec the wrong argv[0]. Generated commands must
+        // therefore shell-quote the path for project-local / user
+        // scopes; project-shared keeps the bare `kizu` token since
+        // the binary is expected on PATH.
+        let with_space = "/Users/John Doe/.cargo/bin/kizu";
+        let local = super::kizu_hook_command_with_bin(
+            super::Scope::ProjectLocal,
+            with_space,
+            "hook-post-tool --agent claude-code",
+        );
+        assert!(
+            local.starts_with(r"'/Users/John Doe/.cargo/bin/kizu'"),
+            "project-local path with space must be single-quoted, got {local}"
+        );
+        assert!(
+            local.ends_with(" hook-post-tool --agent claude-code"),
+            "subcommand must follow the quoted path unchanged, got {local}"
+        );
+
+        // A single quote inside the path must get the `'\''` escape.
+        let with_quote = "/home/ev'an/kizu";
+        let user =
+            super::kizu_hook_command_with_bin(super::Scope::User, with_quote, "hook-log-event");
+        assert!(
+            user.starts_with(r"'/home/ev'\''an/kizu'"),
+            "embedded single quote must use `'\\''` escape, got {user}"
+        );
+
+        // Project-shared stays bare — this path is committed and is
+        // expected to resolve via PATH on every contributor's box.
+        let shared = super::kizu_hook_command_with_bin(
+            super::Scope::ProjectShared,
+            "kizu",
+            "hook-stop --agent claude-code",
+        );
+        assert_eq!(shared, "kizu hook-stop --agent claude-code");
+    }
+
+    #[test]
     fn shell_single_quote_wraps_and_escapes_embedded_quotes() {
         // Plain path: wrapped only.
         assert_eq!(
@@ -1893,6 +1988,49 @@ mod tests {
         let shim = super::pre_commit_shim_body("/p with space/kizu", true);
         assert!(shim.contains("'/p with space/kizu' hook-pre-commit"));
         assert!(shim.contains("pre-commit.user"));
+    }
+
+    #[test]
+    fn teardown_removes_cursor_user_scope_hooks_json() {
+        // `install_cursor` writes to `~/.cursor/hooks.json` for
+        // `Scope::User`, but the earlier teardown path only scrubbed
+        // `<project>/.cursor/hooks.json`. A user who installed Cursor
+        // hooks globally was told teardown found nothing while the
+        // global afterFileEdit/stop hooks kept firing in every later
+        // Cursor session. Teardown must remove the user-scope file
+        // too, using the same path install wrote to.
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+        let cursor_dir = fake_home.join(".cursor");
+        fs::create_dir_all(&cursor_dir).unwrap();
+        let hooks_path = cursor_dir.join("hooks.json");
+        fs::write(
+            &hooks_path,
+            r#"{"version":1,"hooks":{"afterFileEdit":[{"command":"kizu hook-post-tool --agent cursor","timeout":10}],"stop":[{"command":"kizu hook-stop --agent cursor","timeout":10}]}}"#,
+        )
+        .unwrap();
+
+        let removed =
+            super::teardown_cursor_user_hooks(fake_home).expect("user-scope teardown must succeed");
+        assert!(
+            removed,
+            "teardown must report removal of the user-scope cursor hooks file"
+        );
+
+        // After removal, the file no longer carries kizu entries.
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let all_cmds: Vec<String> = doc["hooks"]
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.values())
+            .flat_map(|v| v.as_array().cloned().unwrap_or_default())
+            .filter_map(|c| c["command"].as_str().map(String::from))
+            .collect();
+        assert!(
+            !all_cmds.iter().any(|c| c.contains("kizu hook-")),
+            "no kizu command must remain in user-scope Cursor hooks, got {all_cmds:?}"
+        );
     }
 
     #[test]

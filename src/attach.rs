@@ -67,10 +67,7 @@ pub fn split_and_launch(terminal: TerminalKind, kizu_bin: &Path) -> Result<()> {
         TerminalKind::Ghostty => {
             #[cfg(target_os = "macos")]
             {
-                let bin_escaped = escape_applescript_string(&bin);
-                let script = format!(
-                    r#"tell application "Ghostty" to tell front window to split horizontally with command "{bin_escaped}""#,
-                );
+                let script = build_ghostty_split_script(&bin);
                 let mut cmd = Command::new("osascript");
                 cmd.args(["-e", &script]);
                 run_split_command(cmd, "Ghostty AppleScript split")?;
@@ -114,6 +111,34 @@ fn run_split_command(mut cmd: Command, context: &str) -> Result<()> {
     } else {
         Err(anyhow!("{context} exited with status {code}: {stderr}"))
     }
+}
+
+/// Build the AppleScript command body for Ghostty's horizontal
+/// split. Ghostty treats the `command` argument as a shell command
+/// string, so the kizu binary path must be **shell-quoted** (POSIX
+/// single-quote) first, **then** AppleScript-escaped for embedding
+/// in the outer double-quoted literal. Applying only AppleScript
+/// escaping leaves a path like `/Users/John Doe/kizu` exposed to
+/// shell word-splitting, which either runs the wrong binary or
+/// fails outright; worse, shell metacharacters in the path become
+/// a command-injection boundary.
+#[cfg(target_os = "macos")]
+fn build_ghostty_split_script(bin: &str) -> String {
+    let bin_shell = shell_single_quote(bin);
+    let bin_escaped = escape_applescript_string(&bin_shell);
+    format!(
+        r#"tell application "Ghostty" to tell front window to split horizontally with command "{bin_escaped}""#,
+    )
+}
+
+/// Wrap a string in POSIX single quotes, escaping any interior single
+/// quotes with the standard `'\''` sequence. Kept in-module so the
+/// Ghostty builder does not reach across crates for the same quoting
+/// contract `init.rs` already uses.
+#[cfg(target_os = "macos")]
+fn shell_single_quote(s: &str) -> String {
+    let escaped = s.replace('\'', r"'\''");
+    format!("'{escaped}'")
 }
 
 /// Escape a string for embedding inside an AppleScript double-quoted
@@ -217,6 +242,36 @@ mod tests {
         let mut cmd = cmd;
         cmd.args(["-c", "exit 0"]);
         run_split_command(cmd, "sh ok").expect("success must be Ok");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ghostty_script_shell_quotes_path_with_spaces() {
+        // Ghostty treats the `command` argument of `split horizontally
+        // with command "..."` as a shell command string. If the kizu
+        // binary lives at `/Users/John Doe/kizu`, embedding the raw
+        // path breaks Ghostty's shell parse and either runs the wrong
+        // command or fails. The script builder must shell-quote
+        // first, then AppleScript-escape the quoted form.
+        let script = build_ghostty_split_script("/Users/John Doe/kizu");
+        assert!(
+            script.contains(r#""'/Users/John Doe/kizu'""#),
+            "Ghostty script must embed the bin path inside a shell-safe single-quoted token, got {script}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ghostty_script_preserves_single_quote_via_shell_escape() {
+        // A path containing `'` needs the shell `'\''` escape. The
+        // resulting backslash in turn needs AppleScript doubling
+        // (`\\`), so the final literal shows `'\\''` inside the
+        // double-quoted AppleScript argument.
+        let script = build_ghostty_split_script("/home/ev'an/kizu");
+        assert!(
+            script.contains(r"'/home/ev'\\''an/kizu'"),
+            "single quote in path must survive shell + AppleScript escape, got {script}"
+        );
     }
 
     #[cfg(target_os = "macos")]
