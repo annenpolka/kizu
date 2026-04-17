@@ -197,6 +197,16 @@ pub struct App {
     /// back to the hunk header. Cleared as soon as the user presses
     /// any navigation key.
     pub scar_focus: Option<(PathBuf, usize)>,
+    /// Viewport pin: when `Some(y)`, the renderer forces the viewport
+    /// top so the cursor lands at visual row `y` on screen, overriding
+    /// the placement-derived default. Set by `apply_computed_files`
+    /// when a watcher-driven recompute relocates the anchored hunk
+    /// (e.g. the anchored file floats to the end of the mtime-sorted
+    /// list after being edited) — the pin keeps the user's focused
+    /// hunk at the same screen row instead of sliding with the
+    /// layout. Cleared on any user-initiated cursor move (`scroll_to`,
+    /// `scroll_by`, `follow_restore`, `open_file_view`, ...).
+    pub pinned_cursor_y: Option<usize>,
 }
 
 /// One entry on the scar undo stack: the path that was edited, plus
@@ -933,6 +943,7 @@ impl App {
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
+            pinned_cursor_y: None,
         };
         app.apply_computed_files(initial);
         Ok(app)
@@ -1149,7 +1160,41 @@ impl App {
     /// any prior error, rebuild layout, and refresh the anchor. Shared
     /// between [`Self::bootstrap_with_diff`] (initial load) and
     /// [`Self::recompute_diff`] (watcher-driven refreshes).
+    ///
+    /// Also decides whether to set [`Self::pinned_cursor_y`]: when the
+    /// user is in manual mode and had the cursor on-screen before this
+    /// recompute, we preserve the cursor's screen row so a watcher-
+    /// driven reorder (edited file floats to the tail of the mtime
+    /// sort) does not slide the viewport out from under the user.
     fn apply_computed_files(&mut self, mut files: Vec<FileDiff>) {
+        // Snapshot pre-state BEFORE any mutation. `visual_top` is the
+        // Cell the renderer updates each frame, so subtracting the
+        // cursor's visual y from it yields the screen row we last
+        // drew the cursor at.
+        let pre_had_layout = !self.layout.rows.is_empty();
+        let pre_scroll = self.scroll;
+        let pre_visual_top = self.visual_top.get();
+        let pre_body_height = self.last_body_height.get();
+        let pre_body_width = self.last_body_width.get();
+        let pre_cursor_visual_y: usize = match pre_body_width {
+            None => pre_scroll,
+            Some(_) => {
+                let vi = VisualIndex::build(&self.layout, &self.files, pre_body_width);
+                vi.visual_y(pre_scroll) + self.cursor_sub_row
+            }
+        };
+        let pre_screen_y_f = pre_cursor_visual_y as f32 - pre_visual_top;
+        let pre_in_viewport =
+            pre_had_layout && pre_screen_y_f >= 0.0 && (pre_screen_y_f as usize) < pre_body_height;
+        let pre_screen_y = pre_screen_y_f.max(0.0) as usize;
+
+        // Snapshot the cursor's "content identity" — `(abs_path,
+        // new_file_line)` when the cursor is on a DiffLine. Used as a
+        // fallback when `refresh_anchor` can only offer a HunkHeader
+        // row (its anchor lookup resolves hunks, not individual
+        // lines) and `scar_focus` is unavailable or invalid.
+        let pre_cursor_content = self.scroll_cursor_new_line();
+
         let picker_selected_path = self.picker_selected_path();
         // Stream mode files are already ordered by event timestamp and
         // must not have their mtime overwritten by the filesystem. Diff
@@ -1168,20 +1213,74 @@ impl App {
         // hunk if possible; the sub-row offset starts fresh there.
         self.cursor_sub_row = 0;
         self.refresh_anchor();
+
         // Sticky scar focus: if a scar op recently set a focus
         // target, re-apply it after `refresh_anchor` so the
         // asynchronous watcher-driven recompute doesn't snap the
         // cursor back to the hunk header. If the target line is no
-        // longer representable in the layout (e.g. the file was
-        // deleted or the scar was manually removed), clear the
-        // focus so subsequent recomputes follow normal anchoring.
+        // longer representable in the layout (e.g. the surrounding
+        // code was edited so the scar's new-file line number is
+        // gone or now points at different content), clear the
+        // focus and fall through to the pin path below so the
+        // cursor doesn't jump to the hunk header.
+        let mut scar_focus_applied = false;
         if let Some((abs, line)) = self.scar_focus.clone() {
             if let Some(row) = self.find_new_file_line_row(&abs, line) {
+                // `scroll_to` clears `pinned_cursor_y` — scar focus
+                // takes precedence over the pin, which is the right
+                // call since the user's explicit action was the scar.
                 self.scroll_to(row);
+                scar_focus_applied = true;
             } else {
                 self.scar_focus = None;
             }
         }
+
+        // Content-preservation fallback: `refresh_anchor` can only
+        // resolve `(path, hunk_old_start)` — if that resolves, the
+        // cursor lands on the hunk's `@@` header row, not on the
+        // specific DiffLine the user was inspecting. When the user
+        // was on a DiffLine before the recompute, re-target the
+        // cursor to the DiffLine at (or nearest to) the pre-recompute
+        // new-file line. This avoids the "cursor snaps to @@" the
+        // user sees when a scar is edited away and `scar_focus`
+        // falls through.
+        //
+        // Uses direct `self.scroll = row` instead of `scroll_to`
+        // because the pin below still needs to fire — `scroll_to`
+        // would clear it.
+        if !scar_focus_applied
+            && let Some((abs, pre_line)) = pre_cursor_content.clone()
+            && matches!(
+                self.layout.rows.get(self.scroll),
+                Some(RowKind::HunkHeader { .. })
+            )
+            && let Some(row) = self.find_nearest_new_file_line_row(&abs, pre_line)
+        {
+            self.scroll = row;
+            self.update_anchor_from_scroll();
+        }
+
+        // Viewport pin: preserve the cursor's screen row when this
+        // recompute is not user-initiated **and** scar focus didn't
+        // already relocate the cursor. Sequenced after the scar
+        // path so that a scar_focus whose line was edited away
+        // (anchor falls back to the hunk header in `refresh_anchor`)
+        // still gets its screen row preserved — otherwise the
+        // cursor would visibly jump to the HunkHeader row.
+        let should_pin = !self.follow_mode && !scar_focus_applied && pre_in_viewport;
+        if should_pin {
+            self.pinned_cursor_y = Some(pre_screen_y);
+            // A pin is a snap, not a slide: cancel any in-flight
+            // viewport tween so the next frame redraws at the pinned
+            // target directly. Otherwise the animation would
+            // interpolate from the stale pre-recompute viewport top
+            // to the new pinned target, visibly undoing the pin.
+            self.anim = None;
+        }
+        // else: pin is either already cleared by scroll_to above
+        // (scar_focus_applied = true) or was never set (bootstrap
+        // / follow mode / cursor off-screen) — nothing to do.
     }
 
     /// Drop any pending scar-focus target. Called from navigation
@@ -1683,6 +1782,9 @@ impl App {
     /// pass a speculative value without risking an out-of-range
     /// cursor.
     pub(crate) fn scroll_to_visual(&mut self, row: usize, sub_row: usize, vi: &VisualIndex) {
+        // Any explicit cursor move drops the watcher-set pin so
+        // subsequent renders fall back to normal placement.
+        self.pinned_cursor_y = None;
         let last = self.last_row_index();
         let target_row = row.min(last);
         let row_height = vi.visual_height(target_row).max(1);
@@ -1712,6 +1814,9 @@ impl App {
     /// **intra-row** walks go through [`Self::scroll_to_visual`]
     /// instead.
     pub fn scroll_to(&mut self, row: usize) {
+        // Any explicit cursor move drops the watcher-set pin so
+        // subsequent renders fall back to normal placement.
+        self.pinned_cursor_y = None;
         let last = self.last_row_index();
         let target = self.normalize_row_target(row.min(last), 1);
         if target != self.scroll || self.cursor_sub_row != 0 {
@@ -1836,6 +1941,15 @@ impl App {
             return 0;
         }
         let max_top_y = total_visual - viewport_height;
+
+        // Viewport pin: matches nowrap `viewport_top`. When a watcher-
+        // driven recompute relocates the cursor, hold the cursor's
+        // visual y at the pre-recompute screen row so the viewport
+        // doesn't slide.
+        if let Some(pinned_y) = self.pinned_cursor_y {
+            let cursor_y = vi.visual_y(self.scroll) + self.cursor_sub_row;
+            return cursor_y.saturating_sub(pinned_y).min(max_top_y);
+        }
 
         // Hunk-fits-in-viewport case: anchor the entire hunk at the
         // placement target so the user always sees the full selected
@@ -2332,6 +2446,81 @@ impl App {
             }
         }
         None
+    }
+
+    /// Content identity of the cursor's current row, when (and only
+    /// when) it's on a `RowKind::DiffLine`. Returns `(absolute_path,
+    /// new_file_line)` so it can be fed back into
+    /// [`Self::find_new_file_line_row`] /
+    /// [`Self::find_nearest_new_file_line_row`] after a layout
+    /// rebuild. Distinct from [`Self::scar_target_line`] which also
+    /// covers hunk headers and file-view; this one intentionally
+    /// returns `None` on any non-DiffLine row so callers can
+    /// detect "we were on a specific line" versus "we were on a
+    /// structural row".
+    fn scroll_cursor_new_line(&self) -> Option<(PathBuf, usize)> {
+        let row = self.layout.rows.get(self.scroll)?;
+        let RowKind::DiffLine {
+            file_idx,
+            hunk_idx,
+            line_idx,
+        } = *row
+        else {
+            return None;
+        };
+        let file = self.files.get(file_idx)?;
+        let DiffContent::Text(hunks) = &file.content else {
+            return None;
+        };
+        let hunk = hunks.get(hunk_idx)?;
+        let mut new_line = hunk.new_start;
+        for (i, dl) in hunk.lines.iter().enumerate() {
+            if i == line_idx {
+                return Some((self.root.join(&file.path), new_line));
+            }
+            if !matches!(dl.kind, LineKind::Deleted) {
+                new_line += 1;
+            }
+        }
+        None
+    }
+
+    /// Layout row of the DiffLine in `abs` whose new-file line
+    /// number is closest to `target_line`. Breaks ties toward the
+    /// earliest occurrence (first hunk, earliest line within the
+    /// hunk). Returns `None` when the file is absent or has no
+    /// non-deleted lines in the diff (binary, pure-deletion hunks).
+    fn find_nearest_new_file_line_row(&self, abs: &Path, target_line: usize) -> Option<usize> {
+        let rel = abs.strip_prefix(&self.root).unwrap_or(abs);
+        let file_idx = self.files.iter().position(|f| f.path == rel)?;
+        let DiffContent::Text(hunks) = &self.files[file_idx].content else {
+            return None;
+        };
+        let mut best: Option<(usize, usize, usize)> = None; // (distance, hunk_idx, line_idx)
+        for (hunk_idx, hunk) in hunks.iter().enumerate() {
+            let mut new_line = hunk.new_start;
+            for (offset, dl) in hunk.lines.iter().enumerate() {
+                if matches!(dl.kind, LineKind::Deleted) {
+                    continue;
+                }
+                let distance = new_line.abs_diff(target_line);
+                if best.is_none_or(|(d, _, _)| distance < d) {
+                    best = Some((distance, hunk_idx, offset));
+                }
+                new_line += 1;
+            }
+        }
+        let (_, hunk_idx, line_idx) = best?;
+        self.layout.rows.iter().position(|r| {
+            matches!(
+                r,
+                RowKind::DiffLine {
+                    file_idx: f,
+                    hunk_idx: h,
+                    line_idx: l,
+                } if *f == file_idx && *h == hunk_idx && *l == line_idx,
+            )
+        })
     }
 
     /// Reverse the most recent scar insertion on the session's undo
@@ -3085,6 +3274,13 @@ impl App {
             return 0;
         }
         let max_top = total - viewport_height;
+
+        // Viewport pin: keep the cursor at the screen row captured by
+        // the most recent `apply_computed_files`. Overrides both the
+        // hunk-fit anchoring and the placement-mode cursor rule.
+        if let Some(pinned_y) = self.pinned_cursor_y {
+            return self.scroll.saturating_sub(pinned_y).min(max_top);
+        }
 
         if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
             let hunk_size = hunk_end - hunk_top;
@@ -3892,6 +4088,7 @@ mod tests {
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
+            pinned_cursor_y: None,
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
@@ -5692,6 +5889,163 @@ mod tests {
         assert_eq!(
             hunk_idx, 1,
             "manual fallback should stay near the previously viewed hunk, not jump to the file's first hunk"
+        );
+    }
+
+    #[test]
+    fn apply_computed_files_pins_cursor_screen_row_across_reorder() {
+        // Scenario: user is parked on a hunk in b.rs. A watcher-driven
+        // recompute fires because b.rs was edited, bumping its mtime so
+        // it now sorts to the end of the ascending list. Without the
+        // pin, `refresh_anchor` follows the hunk to its new row index,
+        // which slides the viewport — jarring when the user was only
+        // reviewing that one change.
+        //
+        // Expected: cursor continues to point at the same hunk identity
+        // AND the viewport top shifts so the cursor lands at the same
+        // screen row as before the recompute.
+        let mut body_lines = Vec::new();
+        for i in 0..30 {
+            body_lines.push(diff_line(LineKind::Context, &format!("ctx {i}")));
+        }
+        body_lines.push(diff_line(LineKind::Added, "y"));
+        let mut app = fake_app(vec![
+            make_file(
+                "a.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                200,
+            ),
+            make_file("b.rs", vec![hunk(42, body_lines.clone())], 100),
+        ]);
+
+        // fake_app sorts ascending by mtime, so a.rs (200) is at the
+        // bottom and b.rs (100) is at the top. Park on b.rs's only
+        // hunk and pin the app into manual mode.
+        let b = file_idx(&app, "b.rs");
+        app.jump_to_file_first_hunk(b);
+        app.follow_mode = false;
+        app.update_anchor_from_scroll();
+
+        // Skip populate_mtimes / sort in apply_computed_files so the
+        // test controls the post-recompute order deterministically.
+        app.view_mode = ViewMode::Stream;
+
+        // Simulate one render cycle: pick a viewport height, let the
+        // renderer resolve viewport_top, and stash that top as
+        // visual_top (the Cell the renderer updates every frame).
+        let body_height = 24;
+        app.last_body_height.set(body_height);
+        let initial_top = app.viewport_top(body_height);
+        app.visual_top.set(initial_top as f32);
+        let initial_screen_row = app
+            .scroll
+            .checked_sub(initial_top)
+            .expect("cursor above viewport_top — test setup wrong");
+
+        // Fresh file set: same two files, but b.rs has been edited
+        // and its mtime bumped past a.rs's, so its position in the
+        // layout moves from first to last.
+        let fresh = vec![
+            make_file(
+                "a.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                200,
+            ),
+            make_file("b.rs", vec![hunk(42, body_lines.clone())], 400),
+        ];
+        app.apply_computed_files(fresh);
+
+        // Anchor still points at the same hunk in b.rs.
+        assert_eq!(app.current_file_path(), Some(Path::new("b.rs")));
+
+        // Viewport top is chosen so the cursor lands at the same
+        // screen row it was on before the recompute — the hallmark
+        // of the pin.
+        let new_top = app.viewport_top(body_height);
+        let new_screen_row = app
+            .scroll
+            .checked_sub(new_top)
+            .expect("cursor above viewport_top after recompute");
+        assert_eq!(
+            new_screen_row, initial_screen_row,
+            "cursor must stay at the same screen row across a \
+             reorder-driven apply_computed_files"
+        );
+    }
+
+    #[test]
+    fn scar_line_edited_away_does_not_snap_cursor_to_hunk_header() {
+        // Reproduces the user-reported bug: user inserts a scar, then
+        // edits the scar away (or shifts it). The watcher-driven
+        // recompute should leave the cursor on a DiffLine near the
+        // scar's position, not on the hunk's `@@` header row.
+        //
+        // Current chain:
+        //   - refresh_anchor maps anchor → HunkHeader row
+        //   - scar_focus's `find_new_file_line_row` returns None because
+        //     the scar line is gone → scar_focus cleared
+        //   - pin preserves screen row, but the LOGICAL cursor is still
+        //     on HunkHeader (placed by refresh_anchor)
+        // Expected: cursor lands on a DiffLine at (or near) the
+        // pre-edit new-file line.
+        let pre_edit_body = vec![
+            diff_line(LineKind::Added, "line one"),
+            diff_line(LineKind::Added, "scar target"),
+            diff_line(LineKind::Added, "line three"),
+        ];
+        let mut app = fake_app(vec![make_file("b.rs", vec![hunk(1, pre_edit_body)], 100)]);
+
+        // Park cursor on the "scar target" DiffLine (hunk_idx=0,
+        // line_idx=1) and pretend a scar was just inserted there —
+        // scar_focus points at new-file line 2.
+        let scar_target_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::DiffLine {
+                        file_idx: 0,
+                        hunk_idx: 0,
+                        line_idx: 1,
+                    },
+                )
+            })
+            .expect("scar target DiffLine row must exist");
+        app.scroll_to(scar_target_row);
+        app.follow_mode = false;
+        let abs = app.root.join("b.rs");
+        app.scar_focus = Some((abs, 2));
+
+        // Prime visual_top as a render would.
+        let body_height = 20;
+        app.last_body_height.set(body_height);
+        let initial_top = app.viewport_top(body_height);
+        app.visual_top.set(initial_top as f32);
+
+        // Edit: scar target is removed. The hunk now has only two
+        // lines. find_new_file_line_row(path, 2) will still find a
+        // line ("line three" at new-line 2) OR the hunk may have
+        // shrunk — depends on the edit. To reliably reproduce the
+        // "line gone" branch we cut the hunk down to one line so
+        // new-line 2 is past the end.
+        let edited_body = vec![diff_line(LineKind::Added, "line one")];
+        let fresh = vec![make_file("b.rs", vec![hunk(1, edited_body)], 100)];
+        app.view_mode = ViewMode::Stream;
+        app.apply_computed_files(fresh);
+
+        // The bug: cursor on HunkHeader row after the recompute.
+        let landed = app
+            .layout
+            .rows
+            .get(app.scroll)
+            .cloned()
+            .expect("cursor on some row");
+        assert!(
+            !matches!(landed, RowKind::HunkHeader { .. }),
+            "cursor must not land on a @@ HunkHeader after the scar line is edited away; \
+             landed on {landed:?}"
         );
     }
 

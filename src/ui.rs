@@ -1487,6 +1487,7 @@ mod tests {
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
+            pinned_cursor_y: None,
         }
     }
 
