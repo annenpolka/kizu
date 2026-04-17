@@ -193,6 +193,15 @@ pub struct App {
     /// path, which is stable because `hook::write_event` uses a
     /// uniqueness suffix.
     pub processed_event_paths: std::collections::HashSet<PathBuf>,
+    /// Unix epoch millisecond at which this kizu TUI session started.
+    /// `handle_event_log` rejects events whose `timestamp_ms` is
+    /// earlier than this value so stream mode never ingests:
+    /// (a) leftover events from a previous kizu session on the
+    ///     same project (replacing the destructive bulk-delete of
+    ///     `clean_stale_events`), or
+    /// (b) any other concurrent session's historical events that
+    ///     existed before this session was bootstrapped.
+    pub session_start_ms: u64,
     /// Per-file diff snapshots used to compute per-operation diffs.
     /// Maps file path → most recent cumulative diff output.
     pub diff_snapshots: std::collections::HashMap<PathBuf, String>,
@@ -953,6 +962,10 @@ impl App {
             saved_stream_scroll: 0,
             stream_events: Vec::new(),
             processed_event_paths: std::collections::HashSet::new(),
+            session_start_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
@@ -1089,6 +1102,16 @@ impl App {
             Err(_) => return,
         };
 
+        // Session isolation: drop events that predate this session's
+        // start. The previous implementation used `clean_stale_events`
+        // to bulk-delete the shared per-project events directory,
+        // which destroyed a concurrently-running kizu session's live
+        // history. Filtering on `timestamp_ms` keeps our stream clean
+        // of leftover noise without touching other sessions' files.
+        if event.timestamp_ms < self.session_start_ms {
+            return;
+        }
+
         // Normalize every file path to repo-relative form **once**,
         // up front. Downstream snapshot lookups, per-file diff keys,
         // and the stored `metadata.file_paths` must all agree on the
@@ -1158,33 +1181,9 @@ impl App {
         }
     }
 
-    /// Remove stale event-log files from `<state_dir>/events/`.
-    /// Called once at TUI startup so the stream view starts clean —
-    /// events from before this session cannot carry a per-operation
-    /// diff and would only show "[diff not captured]" noise.
-    pub fn clean_stale_events(&self) {
-        let dir = match crate::paths::events_dir(&self.root) {
-            Some(d) if d.is_dir() => d,
-            _ => return,
-        };
-        let Ok(read_dir) = std::fs::read_dir(&dir) else {
-            return;
-        };
-        for entry in read_dir.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') {
-                continue;
-            }
-            if name_str.ends_with(".json") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-
     /// Scan an events directory in timestamp order and feed each
     /// `.json` file through [`Self::handle_event_log`]. Closes the
-    /// gap between `clean_stale_events` and `watcher::start`: any
+    /// gap between session startup and `watcher::start`: any
     /// `hook-log-event` written in that window lands on disk but is
     /// never delivered by the notify backend because the watcher is
     /// not yet armed. Calling this once after watcher startup drains
@@ -3848,9 +3847,11 @@ pub async fn run() -> Result<()> {
             eprintln!("warning: failed to write kizu session file: {e}");
         }
 
-        // Clean stale events from before this session so stream
-        // mode starts fresh — old events can't carry diffs.
-        app.clean_stale_events();
+        // Session isolation: older events are now filtered on ingest
+        // via `session_start_ms` rather than by bulk-deleting the
+        // shared events directory. The delete path used to destroy a
+        // concurrently-running kizu session's live history on the
+        // same project; the filter approach is non-destructive.
         // Seed diff snapshots so the first stream event shows only
         // the per-operation delta, not the entire cumulative diff.
         app.seed_diff_snapshots();
@@ -4204,6 +4205,11 @@ mod tests {
             saved_stream_scroll: 0,
             stream_events: Vec::new(),
             processed_event_paths: std::collections::HashSet::new(),
+            // Tests use small timestamps (1000, 2000, …) for events.
+            // Leave `session_start_ms` at 0 so the session-isolation
+            // filter in `handle_event_log` is a no-op by default;
+            // tests that exercise the filter set this field explicitly.
+            session_start_ms: 0,
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
@@ -8769,6 +8775,52 @@ mod tests {
             app.diff_snapshots.get(&file),
             Some(&prev_diff),
             "snapshot must survive a failing `git diff` so the next event is still accurate"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_filters_out_events_predating_session_start() {
+        // Two kizu sessions on the same repo: session B must not
+        // ingest session A's historical events. The earlier
+        // implementation used `clean_stale_events` to delete the
+        // shared per-project events directory at startup, which
+        // destroyed session A's live history. The replacement is a
+        // timestamp filter: events whose `timestamp_ms` is older
+        // than this session's start are silently dropped without
+        // touching the shared files on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+        app.session_start_ms = 5_000;
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let old_event = crate::hook::SanitizedEvent {
+            session_id: Some("other-agent-session".into()),
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/a.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 1_000, // earlier than session_start_ms
+        };
+        let old_path = events_dir.join("1000-Edit-xyz.json");
+        std::fs::write(&old_path, serde_json::to_string(&old_event).unwrap()).unwrap();
+
+        app.handle_event_log(old_path.clone());
+
+        assert!(
+            app.stream_events.is_empty(),
+            "pre-session events must be filtered out of stream mode"
+        );
+        // The file itself must not be deleted — other sessions may
+        // still own it. Only the ingest is suppressed.
+        assert!(
+            old_path.exists(),
+            "filter must be non-destructive: leave the event file in place"
         );
     }
 

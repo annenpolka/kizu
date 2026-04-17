@@ -1346,8 +1346,16 @@ fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Remove all hook entries whose `command` starts with `kizu hook-`
-/// from a JSON settings file. Returns `true` if anything was removed.
+/// Remove kizu hook entries from a JSON settings file. Returns
+/// `true` if anything was removed.
+///
+/// Removal is **command-level**, not group-level: a matcher group
+/// that mixes kizu and user commands keeps its non-kizu entries
+/// intact. This is the rollback-safety boundary — a user who ran
+/// `kizu teardown` without ever migrating via `kizu init` would
+/// otherwise lose their hand-added linter from any matcher group
+/// that happened to also contain a kizu hook. Groups left empty
+/// after scrubbing are pruned so the schema stays tidy.
 fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -1359,39 +1367,47 @@ fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
         return Ok(false);
     };
 
+    let is_kizu_cmd = |cmd: &serde_json::Value| -> bool {
+        cmd.get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| {
+                c.contains("kizu hook-")
+                    || c.contains(" hook-post-tool")
+                    || c.contains(" hook-stop")
+                    || c.contains(" hook-log-event")
+            })
+    };
+
     let mut removed = false;
     for (_event, entries) in hooks.iter_mut() {
         if let Some(arr) = entries.as_array_mut() {
+            // Pass 1: scrub kizu entries inside every nested matcher
+            // group, preserving user commands that shared the group.
+            for group in arr.iter_mut() {
+                if let Some(nested) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    let before = nested.len();
+                    nested.retain(|cmd| !is_kizu_cmd(cmd));
+                    if nested.len() < before {
+                        removed = true;
+                    }
+                }
+            }
+            // Pass 2: flat old-schema entries and now-empty matcher
+            // groups both drop out here. Flat entries have no nested
+            // `hooks` array, so they're filtered by the direct
+            // `command` check; groups whose `hooks` just emptied out
+            // in pass 1 are discarded now.
             let before = arr.len();
-            // New schema: each element is a matcher group with a
-            // `hooks` sub-array. Remove groups that contain kizu commands.
             arr.retain(|group| {
-                // Old flat schema: { "command": "kizu hook-..." }
-                let flat_kizu = group
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|c| {
-                        c.contains("kizu hook-")
-                            || c.contains(" hook-post-tool")
-                            || c.contains(" hook-stop")
-                    });
-                // New nested schema: { "matcher": "...", "hooks": [{ "command": "kizu hook-..." }] }
-                let nested_kizu =
-                    group
-                        .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .is_some_and(|cmds| {
-                            cmds.iter().any(|cmd| {
-                                cmd.get("command")
-                                    .and_then(|v| v.as_str())
-                                    .is_some_and(|c| {
-                                        c.contains("kizu hook-")
-                                            || c.contains(" hook-post-tool")
-                                            || c.contains(" hook-stop")
-                                    })
-                            })
-                        });
-                !flat_kizu && !nested_kizu
+                // Flat legacy shape: { "command": "kizu hook-..." }.
+                if is_kizu_cmd(group) {
+                    return false;
+                }
+                // Empty matcher group (no hooks or hooks:[]).
+                !matches!(
+                    group.get("hooks").and_then(|h| h.as_array()),
+                    Some(h) if h.is_empty()
+                )
             });
             if arr.len() < before {
                 removed = true;
@@ -1559,6 +1575,52 @@ mod tests {
         // The duplicate `hook-post-tool` must not be added twice.
         let post_tool_count = cmds.iter().filter(|c| c.contains("hook-post-tool")).count();
         assert_eq!(post_tool_count, 1, "duplicate must be suppressed");
+    }
+
+    #[test]
+    fn teardown_only_preserves_user_hooks_in_legacy_mixed_group() {
+        // Rollback path: a user upgraded from an older kizu that
+        // did not split mixed groups. They then run `kizu teardown`
+        // *without* first running `kizu init`, so the migration
+        // pre-pass never touches the file. `remove_kizu_hooks_from_json`
+        // must still scrub only kizu commands and leave the user's
+        // linter intact — dropping the whole group would silently
+        // delete user config.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write","hooks":[
+                {"type":"command","command":"kizu hook-post-tool --agent claude-code","timeout":10},
+                {"type":"command","command":"my-user-linter","timeout":5}
+            ]}]}}"#,
+        )
+        .unwrap();
+
+        let removed = remove_kizu_hooks_from_json(&path).unwrap();
+        assert!(removed, "teardown must report that something was removed");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = doc
+            .get("hooks")
+            .and_then(|h| h.get("PostToolUse"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let all_cmds: Vec<String> = arr
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|c| c["command"].as_str().map(String::from))
+            .collect();
+        assert!(
+            all_cmds.iter().any(|c| c.contains("my-user-linter")),
+            "user linter must survive direct teardown of a legacy mixed group, remaining: {all_cmds:?}"
+        );
+        assert!(
+            !all_cmds.iter().any(|c| c.contains("kizu hook-")),
+            "no kizu command must remain after teardown, remaining: {all_cmds:?}"
+        );
     }
 
     #[test]

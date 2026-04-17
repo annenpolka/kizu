@@ -1551,6 +1551,7 @@ mod tests {
             saved_stream_scroll: 0,
             stream_events: Vec::new(),
             processed_event_paths: std::collections::HashSet::new(),
+            session_start_ms: 0,
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,

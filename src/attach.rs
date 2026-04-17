@@ -50,22 +50,19 @@ pub fn split_and_launch(terminal: TerminalKind, kizu_bin: &Path) -> Result<()> {
     let bin = kizu_bin.to_string_lossy();
     match terminal {
         TerminalKind::Tmux => {
-            Command::new("tmux")
-                .args(["split-window", "-h", &bin])
-                .status()
-                .context("tmux split-window")?;
+            let mut cmd = Command::new("tmux");
+            cmd.args(["split-window", "-h", &bin]);
+            run_split_command(cmd, "tmux split-window")?;
         }
         TerminalKind::Zellij => {
-            Command::new("zellij")
-                .args(["run", "--floating", "--", &*bin])
-                .status()
-                .context("zellij run")?;
+            let mut cmd = Command::new("zellij");
+            cmd.args(["run", "--floating", "--", &*bin]);
+            run_split_command(cmd, "zellij run")?;
         }
         TerminalKind::Kitty => {
-            Command::new("kitty")
-                .args(["@", "launch", "--type=window", &*bin])
-                .status()
-                .context("kitty @ launch")?;
+            let mut cmd = Command::new("kitty");
+            cmd.args(["@", "launch", "--type=window", &*bin]);
+            run_split_command(cmd, "kitty @ launch")?;
         }
         TerminalKind::Ghostty => {
             #[cfg(target_os = "macos")]
@@ -74,10 +71,9 @@ pub fn split_and_launch(terminal: TerminalKind, kizu_bin: &Path) -> Result<()> {
                 let script = format!(
                     r#"tell application "Ghostty" to tell front window to split horizontally with command "{bin_escaped}""#,
                 );
-                Command::new("osascript")
-                    .args(["-e", &script])
-                    .status()
-                    .context("Ghostty AppleScript split")?;
+                let mut cmd = Command::new("osascript");
+                cmd.args(["-e", &script]);
+                run_split_command(cmd, "Ghostty AppleScript split")?;
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -88,6 +84,36 @@ pub fn split_and_launch(terminal: TerminalKind, kizu_bin: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run a terminal-split command, check its exit status, and surface
+/// a non-zero exit as an `Err` that carries the backend name and the
+/// child's stderr. The pre-existing `.status()?` calls silently
+/// accepted non-zero exits from tmux / zellij / kitty / osascript,
+/// which meant a failed split still returned `Ok(())` and the parent
+/// process exited 0 — leaving wrappers blind to the failure.
+///
+/// Uses `output()` rather than `status()` so stderr is captured; the
+/// split command's stdout is already consumed by the terminal itself.
+fn run_split_command(mut cmd: Command, context: &str) -> Result<()> {
+    let output = cmd
+        .output()
+        .with_context(|| format!("spawning {context}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = output
+        .status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        Err(anyhow!("{context} exited with status {code}"))
+    } else {
+        Err(anyhow!("{context} exited with status {code}: {stderr}"))
+    }
 }
 
 /// Escape a string for embedding inside an AppleScript double-quoted
@@ -161,6 +187,36 @@ mod tests {
     fn resolve_terminal_rejects_invalid_config() {
         let err = resolve_terminal("invalid").unwrap_err();
         assert!(err.to_string().contains("unknown terminal"));
+    }
+
+    #[test]
+    fn run_split_command_surfaces_nonzero_exit_as_err() {
+        // The terminal split backends used to call `.status()?`
+        // without asserting `ExitStatus::success()`, so a tmux /
+        // zellij / kitty failure (missing binary, invalid args,
+        // out-of-session invocation) returned `Ok(())` and `main`
+        // happily exited 0. A non-zero child must now surface as
+        // `Err` so the caller and any CI wrapper can react.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf 'split failed\\n' >&2; exit 42"]);
+        let err = run_split_command(cmd, "sh failing split").expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sh failing split"),
+            "error must carry the context tag, got {msg}"
+        );
+        assert!(
+            msg.contains("split failed") || msg.contains("42"),
+            "error must surface stderr or exit code, got {msg}"
+        );
+    }
+
+    #[test]
+    fn run_split_command_accepts_successful_exit() {
+        let cmd = Command::new("/bin/sh");
+        let mut cmd = cmd;
+        cmd.args(["-c", "exit 0"]);
+        run_split_command(cmd, "sh ok").expect("success must be Ok");
     }
 
     #[cfg(target_os = "macos")]
