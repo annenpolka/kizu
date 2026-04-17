@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -10,9 +10,138 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// the "noticeable but not slow" band and matches the research doc.
 const SCROLL_ANIM_DURATION: Duration = Duration::from_millis(150);
 
+/// Maximum number of per-file raw `git diff` snapshots retained in
+/// [`App::diff_snapshots`]. The entry cost is dominated by each diff
+/// string (commonly a few KB for a small edit, tens of KB for a large
+/// one). 500 paths is a comfortable upper bound for agent sessions
+/// that churn through many files, while capping peak memory at a few
+/// MB. When the cap is hit the least-recently-touched entry is
+/// evicted — the same discipline `prune_event_log` enforces for the
+/// on-disk event log.
+pub const DEFAULT_DIFF_SNAPSHOTS_CAP: usize = 500;
+
+/// LRU-ish cap for per-file raw `git diff` text. Each hook event
+/// touches a path (read its previous snapshot, write the new one); a
+/// touch moves the path to the "most recently used" end so the next
+/// eviction drops something the agent has stopped touching instead of
+/// a hot file.
+///
+/// Intentionally a thin wrapper over [`HashMap`] + [`VecDeque`]: the
+/// cardinality is bounded (<= `cap`) and the workload is "insert or
+/// refresh one entry per event", so the O(n) `VecDeque::retain` on
+/// re-insert is cheaper than pulling in `indexmap` or writing a
+/// doubly-linked LRU for a few hundred entries.
+#[derive(Debug, Clone)]
+pub struct DiffSnapshots {
+    map: HashMap<PathBuf, String>,
+    order: VecDeque<PathBuf>,
+    cap: usize,
+}
+
+impl Default for DiffSnapshots {
+    fn default() -> Self {
+        Self::with_cap(DEFAULT_DIFF_SNAPSHOTS_CAP)
+    }
+}
+
+impl DiffSnapshots {
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    pub fn get(&self, path: &Path) -> Option<&String> {
+        self.map.get(path)
+    }
+
+    pub fn insert(&mut self, path: PathBuf, diff: String) {
+        // Re-insert refreshes recency: pull the prior position out of
+        // `order` before appending to the back, otherwise `d` getting
+        // re-written would still look older than a `c` inserted once.
+        if self.map.contains_key(&path) {
+            self.order.retain(|p| p != &path);
+        }
+        self.order.push_back(path.clone());
+        self.map.insert(path, diff);
+        while self.map.len() > self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.map.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    pub fn contains_key(&self, path: &Path) -> bool {
+        self.map.contains_key(path)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn keys(&self) -> impl Iterator<Item = &PathBuf> {
+        self.map.keys()
+    }
+
+    /// Replace all entries with the ones from `map`, preserving the
+    /// configured cap. Iteration order of [`HashMap`] is unspecified,
+    /// so new entries land in whatever order the incoming map yields
+    /// — acceptable here because the caller only needs "recent after
+    /// bootstrap", not a precise total order.
+    pub fn replace_from_map(&mut self, map: HashMap<PathBuf, String>) {
+        self.clear();
+        for (path, diff) in map {
+            self.insert(path, diff);
+        }
+    }
+}
+
 use crate::git::{self, DiffContent, FileDiff, FileStatus, LineKind};
+use crate::hook::SanitizedEvent;
 use crate::scar::ScarKind;
 use crate::watcher::{self, WatchEvent, WatchSource};
+
+/// Which TUI view is currently active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// Main diff view — filesystem-based state view ("what does the repo look like now?").
+    #[default]
+    Diff,
+    /// Stream mode — event-log-based operation history ("what did the agent do?").
+    Stream,
+}
+
+/// One entry in the stream mode view. Combines the sanitized event
+/// metadata (from `hook-log-event`) with optionally captured diff
+/// snapshots for per-operation diff display.
+#[derive(Debug, Clone)]
+pub struct StreamEvent {
+    pub metadata: SanitizedEvent,
+    /// Per-file operation diffs captured by the TUI in real-time,
+    /// keyed by the same path entries as `metadata.file_paths`.
+    /// A `MultiEdit` or multi-file `Write` carries one entry per
+    /// touched path so the stream view can render per-path hunks
+    /// instead of collapsing everything onto the first path.
+    /// Empty for events that occurred before the TUI was started.
+    pub per_file_diffs: BTreeMap<PathBuf, String>,
+}
 
 /// Half-page scroll constant for `Ctrl-d` / `Ctrl-u`. M5+ may swap this for
 /// the real viewport height once we plumb it through; until then a fixed
@@ -145,6 +274,84 @@ pub struct App {
     /// Lazy-initialized syntax highlighter. Loaded on first render
     /// to avoid paying syntect's SyntaxSet load cost at startup.
     pub highlighter: std::cell::OnceCell<crate::highlight::Highlighter>,
+    /// User configuration loaded from `~/.config/kizu/config.toml`.
+    /// Controls keybindings, colors, debounce timing, editor command,
+    /// and terminal auto-split preferences.
+    pub config: crate::config::KizuConfig,
+    /// Active view mode: Diff (default) or Stream.
+    pub view_mode: ViewMode,
+    /// Saved scroll position for the diff view, restored when Tab
+    /// switches back from stream mode.
+    pub saved_diff_scroll: usize,
+    /// Saved scroll position for the stream view, restored when Tab
+    /// switches back from diff mode.
+    pub saved_stream_scroll: usize,
+    /// Stream mode events, ordered by timestamp ascending.
+    pub stream_events: Vec<StreamEvent>,
+    /// Event-log file paths that have already been ingested by
+    /// [`Self::handle_event_log`]. Prevents double-processing when
+    /// `replay_events_dir` scans startup-gap files and the watcher
+    /// later re-delivers the same path (some notify backends fire
+    /// pre-existing files on arm). Keyed on absolute event-file
+    /// path, which is stable because `hook::write_event` uses a
+    /// uniqueness suffix.
+    pub processed_event_paths: std::collections::HashSet<PathBuf>,
+    /// Unix epoch millisecond at which this kizu TUI session started.
+    /// `handle_event_log` rejects events whose `timestamp_ms` is
+    /// earlier than this value so stream mode never ingests:
+    /// (a) leftover events from a previous kizu session on the
+    ///     same project (replacing the destructive bulk-delete of
+    ///     `clean_stale_events`), or
+    /// (b) any other concurrent session's historical events that
+    ///     existed before this session was bootstrapped.
+    pub session_start_ms: u64,
+    /// Agent `session_id` this TUI is bound to. Populated on the
+    /// first `handle_event_log` ingest that carries a session_id;
+    /// later events with a different session_id are dropped so two
+    /// concurrent agents writing to the same repo cannot cross-
+    /// pollute `diff_snapshots` or the stream history. `None`
+    /// before the first bound ingest; stays bound for the rest of
+    /// the session.
+    pub bound_session_id: Option<String>,
+    /// Per-file diff snapshots used to compute per-operation diffs.
+    /// Maps file path → most recent cumulative diff output. Capped
+    /// via [`DiffSnapshots`] so long sessions that touch many files
+    /// don't accumulate unbounded state.
+    pub diff_snapshots: DiffSnapshots,
+    /// Session-scoped undo stack for scar insertions. Each successful
+    /// [`crate::scar::insert_scar`] pushes an entry; the `u` key pops
+    /// the top and calls [`crate::scar::remove_scar`], reversing only
+    /// that one write. Receipts capture the post-insert line number and
+    /// rendered line so undo refuses to delete content the user edited
+    /// in the meantime (scar.rs `ScarRemove::Mismatch`).
+    pub scar_undo_stack: Vec<ScarUndoEntry>,
+    /// Sticky cursor target set when a scar is inserted or undone.
+    /// Persists across watcher-driven `recompute_diff` calls so the
+    /// asynchronous filesystem notification can't snap the cursor
+    /// back to the hunk header. Cleared as soon as the user presses
+    /// any navigation key.
+    pub scar_focus: Option<(PathBuf, usize)>,
+    /// Viewport pin: when `Some(y)`, the renderer forces the viewport
+    /// top so the cursor lands at visual row `y` on screen, overriding
+    /// the placement-derived default. Set by `apply_computed_files`
+    /// when a watcher-driven recompute relocates the anchored hunk
+    /// (e.g. the anchored file floats to the end of the mtime-sorted
+    /// list after being edited) — the pin keeps the user's focused
+    /// hunk at the same screen row instead of sliding with the
+    /// layout. Cleared on any user-initiated cursor move (`scroll_to`,
+    /// `scroll_by`, `follow_restore`, `open_file_view`, ...).
+    pub pinned_cursor_y: Option<usize>,
+}
+
+/// One entry on the scar undo stack: the path that was edited, plus
+/// the receipt returned by `insert_scar`. The pair `(line, rendered)`
+/// is what `remove_scar` uses to verify the line still matches before
+/// deleting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScarUndoEntry {
+    pub path: PathBuf,
+    pub line_1indexed: usize,
+    pub rendered: String,
 }
 
 /// Tracks whether the underlying notify debouncers are still pushing
@@ -280,6 +487,16 @@ fn uses_plus_line_format(basename: &str) -> bool {
     )
 }
 
+/// Linear membership probe for [`App::seen_hunks`] that takes the
+/// path by reference, so the renderer can check every visible hunk
+/// header without allocating a `PathBuf` per frame. The set size is
+/// bounded by user toggles (typically tens of entries), so the scan
+/// is cheaper than the clone it replaces.
+pub fn is_hunk_seen(seen: &BTreeSet<(PathBuf, usize)>, path: &Path, old_start: usize) -> bool {
+    seen.iter()
+        .any(|(p, o)| *o == old_start && p.as_path() == path)
+}
+
 /// Insert a single character at `cursor_pos` (char index) and advance
 /// the cursor. Works correctly with multi-byte characters.
 fn edit_insert_char(text: &mut String, cursor_pos: &mut usize, c: char) {
@@ -388,6 +605,17 @@ pub struct ScrollLayout {
 /// Default body height assumed before the first render has had a chance
 /// to update [`App::last_body_height`]. 24 is the classic VT100 height.
 const DEFAULT_BODY_HEIGHT: usize = 24;
+
+/// Threshold for treating a change run as "long" in adaptive motion.
+/// Long runs get walked chunk-by-chunk so their body isn't teleported
+/// past; short runs are atomic landings (one press per run). A run is
+/// long when its visual height exceeds this fraction of the viewport —
+/// so a run filling 80% of the screen or more is considered long.
+const LONG_RUN_RATIO: f32 = 0.8;
+
+fn is_long_run(run_visual: usize, viewport: usize) -> bool {
+    run_visual as f32 > viewport as f32 * LONG_RUN_RATIO
+}
 
 /// Per-render map from logical row index → visual y offset, computed
 /// against the current wrap body width. Every frame the renderer
@@ -514,11 +742,15 @@ impl VisualIndex {
         let Some(line) = hunk.lines.get(*line_idx) else {
             return 1;
         };
-        let chars = line.content.chars().count();
-        if chars == 0 {
+        // Visual row count = ceil(display-width(content) / body_width).
+        // CJK / emoji consume 2 cells each, so counting chars would
+        // under-estimate the height and ratatui's scroll math would
+        // push the cursor off-screen in wrap mode.
+        let cells = unicode_width::UnicodeWidthStr::width(line.content.as_str());
+        if cells == 0 {
             1
         } else {
-            chars.div_ceil(width.max(1))
+            cells.div_ceil(width.max(1))
         }
     }
 }
@@ -703,14 +935,18 @@ pub fn find_matches(layout: &ScrollLayout, files: &[FileDiff], query: &str) -> V
 /// slice.
 #[derive(Debug, Clone)]
 pub struct FileViewState {
-    #[allow(dead_code)]
-    pub file_idx: usize,
     pub path: PathBuf,
     pub return_scroll: usize,
     pub lines: Vec<String>,
     pub line_bg: std::collections::HashMap<usize, ratatui::style::Color>,
     pub cursor: usize,
     pub scroll_top: usize,
+    /// Easing tween for the file view's scroll_top, matching the
+    /// main diff view's 150ms ease-out cubic animation.
+    pub anim: Option<ScrollAnim>,
+    /// Last rendered scroll position (in row units). Used as the
+    /// tween's start point when a new animation begins.
+    pub visual_top: f32,
 }
 
 /// Confirmation overlay for hunk revert (`x` key). Holds the
@@ -782,15 +1018,25 @@ impl App {
         let current_branch_ref =
             git::current_branch_ref(&root).context("resolving current branch ref")?;
         let baseline_sha = git::head_sha(&root).context("capturing baseline HEAD")?;
-        let diff = git::compute_diff(&root, &baseline_sha);
-        Self::bootstrap_with_diff(
+        // One `git diff --no-renames <baseline>` gives us both the
+        // parsed FileDiff list **and** the per-file raw text. Routing
+        // the raw text straight into `diff_snapshots` collapses the
+        // old "compute_diff + N × diff_single_file" startup pattern
+        // into a single subprocess.
+        let (diff, snapshots) = match git::compute_diff_with_snapshots(&root, &baseline_sha) {
+            Ok((files, snaps)) => (Ok(files), snaps),
+            Err(e) => (Err(e), std::collections::HashMap::new()),
+        };
+        let mut app = Self::bootstrap_with_diff(
             root,
             git_dir,
             common_git_dir,
             current_branch_ref,
             baseline_sha,
             diff,
-        )
+        )?;
+        app.diff_snapshots.replace_from_map(snapshots);
+        Ok(app)
     }
 
     /// Inner bootstrap: takes already-resolved git layout plus the
@@ -809,6 +1055,7 @@ impl App {
     ) -> Result<Self> {
         let initial =
             diff.with_context(|| format!("initial git diff against baseline {baseline_sha}"))?;
+        let config = crate::config::load_config();
         let mut app = Self {
             root,
             git_dir,
@@ -840,7 +1087,34 @@ impl App {
             wrap_lines: false,
             watcher_health: WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
+            config,
+            view_mode: ViewMode::default(),
+            saved_diff_scroll: 0,
+            saved_stream_scroll: 0,
+            stream_events: Vec::new(),
+            processed_event_paths: std::collections::HashSet::new(),
+            session_start_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            bound_session_id: None,
+            diff_snapshots: DiffSnapshots::default(),
+            scar_undo_stack: Vec::new(),
+            scar_focus: None,
+            pinned_cursor_y: None,
         };
+        // If the agent handing off to kizu published its session id
+        // via the `KIZU_SESSION_ID` environment variable, pre-bind
+        // the TUI to it. That shuts the first-writer-wins window
+        // where a foreign concurrent agent could capture the
+        // binding before our own agent's first event landed,
+        // silently hiding every edit we were supposed to review.
+        if let Ok(sid) = std::env::var("KIZU_SESSION_ID") {
+            let trimmed = sid.trim();
+            if !trimmed.is_empty() {
+                app.bound_session_id = Some(trimmed.to_string());
+            }
+        }
         app.apply_computed_files(initial);
         Ok(app)
     }
@@ -883,6 +1157,253 @@ impl App {
         self.cursor_sub_row = 0;
     }
 
+    /// Toggle between Diff and Stream view modes. Rebuilds `files`
+    /// and `layout` from the appropriate data source so the existing
+    /// scroll/render infrastructure handles both modes identically.
+    pub fn toggle_view_mode(&mut self) {
+        match self.view_mode {
+            ViewMode::Diff => {
+                // Save diff scroll, restore stream scroll.
+                self.saved_diff_scroll = self.scroll;
+                self.view_mode = ViewMode::Stream;
+                let stream_files = build_stream_files(&self.stream_events);
+                self.apply_computed_files(stream_files);
+                let max = self.last_row_index();
+                self.scroll_to(self.saved_stream_scroll.min(max));
+            }
+            ViewMode::Stream => {
+                // Save stream scroll, restore diff scroll.
+                self.saved_stream_scroll = self.scroll;
+                self.view_mode = ViewMode::Diff;
+                self.recompute_diff();
+                let max = self.last_row_index();
+                self.scroll_to(self.saved_diff_scroll.min(max));
+            }
+        }
+    }
+
+    /// Canonicalize an agent-supplied path and project it onto the
+    /// repo-relative form used by `git::compute_diff` outputs. Returns
+    /// `None` when the path does not resolve inside `self.root`.
+    ///
+    /// `self.root` is canonicalized by `git::find_root`
+    /// (`git rev-parse --show-toplevel`), so on macOS it lives on the
+    /// `/private/...` side of the `/tmp` → `/private/tmp` symlink.
+    /// Agent-provided file paths often follow the symlinked side
+    /// instead; `canonicalize` resolves both to the same absolute
+    /// path so downstream keys (`diff_snapshots`, `per_file_diffs`,
+    /// `StreamEvent.metadata.file_paths`) stay stable regardless of
+    /// symlink spelling.
+    ///
+    /// Falls back to the raw path when the file no longer exists
+    /// (deleted between the hook write and this handler); in that
+    /// case we still try to strip `self.root` so a fresh path that
+    /// already starts with the canonical root becomes repo-relative.
+    fn normalize_event_path(&self, p: &Path) -> Option<PathBuf> {
+        let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if let Ok(rel) = canon.strip_prefix(&self.root) {
+            return Some(rel.to_path_buf());
+        }
+        if let Ok(rel) = p.strip_prefix(&self.root) {
+            return Some(rel.to_path_buf());
+        }
+        // Already repo-relative? Accept only when every component is
+        // forward-only (no `..` traversal) AND the resolved absolute
+        // form still lives inside `self.root`. Checking parent
+        // components is required because
+        // `root.join("../outside.rs").starts_with(root)` is true
+        // lexically — the filesystem escape happens only at resolve
+        // time. This is the security boundary for stream mode's
+        // repo filter.
+        if p.is_relative()
+            && p.components()
+                .all(|c| !matches!(c, std::path::Component::ParentDir))
+            && self.root.join(p).starts_with(&self.root)
+        {
+            return Some(p.to_path_buf());
+        }
+        None
+    }
+
+    /// Handle a new event-log file notification. Reads the event file,
+    /// captures the per-operation diff snapshot, and appends to
+    /// `stream_events`. Failures are silently ignored (non-critical).
+    ///
+    /// Idempotent per-path: if this exact event file was already
+    /// ingested (e.g. replayed at startup and then re-delivered by
+    /// the watcher), the call is a no-op. The path key is stable
+    /// because `hook::write_event` embeds a uniqueness suffix.
+    pub fn handle_event_log(&mut self, path: PathBuf) {
+        if !self.processed_event_paths.insert(path.clone()) {
+            return;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut event: SanitizedEvent = match serde_json::from_str(&content) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        // Session isolation — layer 1: drop events that predate this
+        // session's start. The previous implementation used
+        // `clean_stale_events` to bulk-delete the shared per-project
+        // events directory, which destroyed a concurrently-running
+        // kizu session's live history. Filtering on `timestamp_ms`
+        // keeps our stream clean of leftover noise without touching
+        // other sessions' files on disk.
+        if event.timestamp_ms < self.session_start_ms {
+            return;
+        }
+
+        // Session isolation — layer 2: if an **explicit** expected
+        // session_id was set at bootstrap (from `KIZU_SESSION_ID`
+        // or a future CLI flag), drop events that carry a
+        // different session_id. Auto-binding to the first observed
+        // session was intentionally removed: under concurrent
+        // agent activity it locked the TUI onto whichever session
+        // happened to fire first, which could easily be a foreign
+        // agent and would silently hide the edits the user was
+        // attached to review. Unbound sessions accept all events
+        // (round-5 behavior) so the default path is non-trapping
+        // when no explicit binding is provided.
+        if let (Some(expected), Some(sid)) =
+            (self.bound_session_id.as_ref(), event.session_id.as_ref())
+            && expected != sid
+        {
+            return;
+        }
+
+        // Normalize every file path to repo-relative form **once**,
+        // up front. Downstream snapshot lookups, per-file diff keys,
+        // and the stored `metadata.file_paths` must all agree on the
+        // same key shape — otherwise an event on `/abs/src/foo.rs`
+        // misses the seeded `src/foo.rs` entry and the first event
+        // for a pre-existing dirty file is rendered as the entire
+        // cumulative diff instead of only the tool call's delta.
+        // Paths that do not resolve inside the repo root are dropped
+        // from the event (edits to `~/.config`, `/tmp`, etc.) so
+        // they never appear as empty noise in the stream.
+        let normalized: Vec<PathBuf> = event
+            .file_paths
+            .iter()
+            .filter_map(|p| self.normalize_event_path(p))
+            .collect();
+        if normalized.is_empty() {
+            return;
+        }
+        event.file_paths = normalized;
+
+        // Capture per-operation diff for each affected file separately
+        // so multi-file events keep one hunk set per path.
+        let mut per_file_diffs: BTreeMap<PathBuf, String> = BTreeMap::new();
+
+        for file_path in &event.file_paths {
+            // Preserve prior snapshot on transient git failure. An
+            // `Err` here (e.g. the baseline object was pruned by a
+            // rebase, or the index is locked mid-operation) must not
+            // clobber `diff_snapshots[file_path]` — otherwise the
+            // *next* event for this file would diff against an empty
+            // baseline and spuriously emit the entire cumulative diff
+            // as the next operation's op_diff.
+            let Ok(current_diff) = git::diff_single_file(&self.root, &self.baseline_sha, file_path)
+            else {
+                continue;
+            };
+
+            let op_diff = if let Some(prev) = self.diff_snapshots.get(file_path) {
+                // Previous snapshot exists — compute delta.
+                compute_operation_diff(prev, &current_diff)
+            } else {
+                // No previous snapshot (first event for this file).
+                // Use the cumulative diff as the operation diff — this
+                // is accurate when seed_diff_snapshots ran at startup
+                // (the seed captured the pre-event state so current_diff
+                // minus seed = this operation's change). For truly new
+                // files, current_diff IS the operation's change.
+                current_diff.clone()
+            };
+            if !op_diff.is_empty() {
+                per_file_diffs.insert(file_path.clone(), op_diff);
+            }
+
+            self.diff_snapshots.insert(file_path.clone(), current_diff);
+        }
+
+        let stream_event = StreamEvent {
+            metadata: event,
+            per_file_diffs,
+        };
+        self.stream_events.push(stream_event);
+
+        // If in stream mode, rebuild files/layout to include the new event.
+        if self.view_mode == ViewMode::Stream {
+            let stream_files = build_stream_files(&self.stream_events);
+            self.apply_computed_files(stream_files);
+        }
+    }
+
+    /// Scan an events directory in timestamp order and feed each
+    /// `.json` file through [`Self::handle_event_log`]. Closes the
+    /// gap between session startup and `watcher::start`: any
+    /// `hook-log-event` written in that window lands on disk but is
+    /// never delivered by the notify backend because the watcher is
+    /// not yet armed. Calling this once after watcher startup drains
+    /// those files before the main loop begins.
+    ///
+    /// Dedup is handled by [`Self::handle_event_log`]: if the watcher
+    /// later re-delivers one of these paths (some notify backends
+    /// fire pre-existing entries on arm), the call becomes a no-op.
+    pub fn replay_events_dir(&mut self, dir: &Path) {
+        if !dir.is_dir() {
+            return;
+        }
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return;
+        };
+        // Replay order is driven by the JSON payload's
+        // `timestamp_ms` (agent-side wall clock), with the on-disk
+        // file modification time as the tie-break for events that
+        // share a millisecond. The earlier implementation sorted by
+        // filename (`<ms>-<tool>-<uniq>.json`), which meant two
+        // same-millisecond events were reordered by tool name
+        // instead of by actual write sequence. Because
+        // `handle_event_log` mutates `diff_snapshots` in the order
+        // it receives events, out-of-order replay fabricated
+        // per-operation diffs and poisoned the baseline the next
+        // event diffed against.
+        //
+        // Tie-break chain: (timestamp_ms, mtime, path).
+        let mut entries: Vec<(u64, std::time::SystemTime, PathBuf)> = Vec::new();
+        for entry in read_dir.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if s.starts_with('.') || !s.ends_with(".json") {
+                continue;
+            }
+            let path = entry.path();
+            let ts_ms = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<SanitizedEvent>(&c).ok())
+                .map(|e| e.timestamp_ms)
+                .unwrap_or(0);
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            entries.push((ts_ms, mtime, path));
+        }
+        entries.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        for (_, _, path) in entries {
+            self.handle_event_log(path);
+        }
+    }
+
     /// Re-run `git diff`, populate per-file mtimes, sort files by mtime
     /// **ascending** (oldest first → newest last), rebuild the row layout,
     /// and restore the anchor. The ascending order is intentional so that
@@ -904,10 +1425,49 @@ impl App {
     /// any prior error, rebuild layout, and refresh the anchor. Shared
     /// between [`Self::bootstrap_with_diff`] (initial load) and
     /// [`Self::recompute_diff`] (watcher-driven refreshes).
+    ///
+    /// Also decides whether to set [`Self::pinned_cursor_y`]: when the
+    /// user is in manual mode and had the cursor on-screen before this
+    /// recompute, we preserve the cursor's screen row so a watcher-
+    /// driven reorder (edited file floats to the tail of the mtime
+    /// sort) does not slide the viewport out from under the user.
     fn apply_computed_files(&mut self, mut files: Vec<FileDiff>) {
+        // Snapshot pre-state BEFORE any mutation. `visual_top` is the
+        // Cell the renderer updates each frame, so subtracting the
+        // cursor's visual y from it yields the screen row we last
+        // drew the cursor at.
+        let pre_had_layout = !self.layout.rows.is_empty();
+        let pre_scroll = self.scroll;
+        let pre_visual_top = self.visual_top.get();
+        let pre_body_height = self.last_body_height.get();
+        let pre_body_width = self.last_body_width.get();
+        let pre_cursor_visual_y: usize = match pre_body_width {
+            None => pre_scroll,
+            Some(_) => {
+                let vi = VisualIndex::build(&self.layout, &self.files, pre_body_width);
+                vi.visual_y(pre_scroll) + self.cursor_sub_row
+            }
+        };
+        let pre_screen_y_f = pre_cursor_visual_y as f32 - pre_visual_top;
+        let pre_in_viewport =
+            pre_had_layout && pre_screen_y_f >= 0.0 && (pre_screen_y_f as usize) < pre_body_height;
+        let pre_screen_y = pre_screen_y_f.max(0.0) as usize;
+
+        // Snapshot the cursor's "content identity" — `(abs_path,
+        // new_file_line)` when the cursor is on a DiffLine. Used as a
+        // fallback when `refresh_anchor` can only offer a HunkHeader
+        // row (its anchor lookup resolves hunks, not individual
+        // lines) and `scar_focus` is unavailable or invalid.
+        let pre_cursor_content = self.scroll_cursor_new_line();
+
         let picker_selected_path = self.picker_selected_path();
-        self.populate_mtimes(&mut files);
-        files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        // Stream mode files are already ordered by event timestamp and
+        // must not have their mtime overwritten by the filesystem. Diff
+        // mode files need filesystem mtime for chronological sorting.
+        if self.view_mode != ViewMode::Stream {
+            self.populate_mtimes(&mut files);
+            files.sort_by_key(|a| a.mtime);
+        }
         self.last_error = None;
         self.files = files;
         self.build_layout();
@@ -918,6 +1478,82 @@ impl App {
         // hunk if possible; the sub-row offset starts fresh there.
         self.cursor_sub_row = 0;
         self.refresh_anchor();
+
+        // Sticky scar focus: if a scar op recently set a focus
+        // target, re-apply it after `refresh_anchor` so the
+        // asynchronous watcher-driven recompute doesn't snap the
+        // cursor back to the hunk header. If the target line is no
+        // longer representable in the layout (e.g. the surrounding
+        // code was edited so the scar's new-file line number is
+        // gone or now points at different content), clear the
+        // focus and fall through to the pin path below so the
+        // cursor doesn't jump to the hunk header.
+        let mut scar_focus_applied = false;
+        if let Some((abs, line)) = self.scar_focus.clone() {
+            if let Some(row) = self.find_new_file_line_row(&abs, line) {
+                // `scroll_to` clears `pinned_cursor_y` — scar focus
+                // takes precedence over the pin, which is the right
+                // call since the user's explicit action was the scar.
+                self.scroll_to(row);
+                scar_focus_applied = true;
+            } else {
+                self.scar_focus = None;
+            }
+        }
+
+        // Content-preservation fallback: `refresh_anchor` can only
+        // resolve `(path, hunk_old_start)` — if that resolves, the
+        // cursor lands on the hunk's `@@` header row, not on the
+        // specific DiffLine the user was inspecting. When the user
+        // was on a DiffLine before the recompute, re-target the
+        // cursor to the DiffLine at (or nearest to) the pre-recompute
+        // new-file line. This avoids the "cursor snaps to @@" the
+        // user sees when a scar is edited away and `scar_focus`
+        // falls through.
+        //
+        // Uses direct `self.scroll = row` instead of `scroll_to`
+        // because the pin below still needs to fire — `scroll_to`
+        // would clear it.
+        if !scar_focus_applied
+            && let Some((abs, pre_line)) = pre_cursor_content.clone()
+            && matches!(
+                self.layout.rows.get(self.scroll),
+                Some(RowKind::HunkHeader { .. })
+            )
+            && let Some(row) = self.find_nearest_new_file_line_row(&abs, pre_line)
+        {
+            self.scroll = row;
+            self.update_anchor_from_scroll();
+        }
+
+        // Viewport pin: preserve the cursor's screen row when this
+        // recompute is not user-initiated **and** scar focus didn't
+        // already relocate the cursor. Sequenced after the scar
+        // path so that a scar_focus whose line was edited away
+        // (anchor falls back to the hunk header in `refresh_anchor`)
+        // still gets its screen row preserved — otherwise the
+        // cursor would visibly jump to the HunkHeader row.
+        let should_pin = !self.follow_mode && !scar_focus_applied && pre_in_viewport;
+        if should_pin {
+            self.pinned_cursor_y = Some(pre_screen_y);
+            // A pin is a snap, not a slide: cancel any in-flight
+            // viewport tween so the next frame redraws at the pinned
+            // target directly. Otherwise the animation would
+            // interpolate from the stale pre-recompute viewport top
+            // to the new pinned target, visibly undoing the pin.
+            self.anim = None;
+        }
+        // else: pin is either already cleared by scroll_to above
+        // (scar_focus_applied = true) or was never set (bootstrap
+        // / follow mode / cursor off-screen) — nothing to do.
+    }
+
+    /// Drop any pending scar-focus target. Called from navigation
+    /// key dispatch so the user's explicit movement "sticks" — the
+    /// next watcher-driven recompute won't yank them back to the
+    /// scar line they've since moved past.
+    pub(crate) fn clear_scar_focus_on_nav(&mut self) {
+        self.scar_focus = None;
     }
 
     /// Re-capture HEAD as the new baseline (R key).
@@ -955,8 +1591,19 @@ impl App {
                 return KeyEffect::None;
             }
         };
-        let diff = git::compute_diff(&self.root, &new_sha);
-        self.apply_reset(new_sha, new_branch, diff)
+        // Seed snapshots from the same `git diff` call that produces
+        // the FileDiff list. `apply_reset` clears the map on success;
+        // we populate it right after so the next event computes its
+        // op_diff against a correct pre-event reference.
+        let (diff, snapshots) = match git::compute_diff_with_snapshots(&self.root, &new_sha) {
+            Ok((files, snaps)) => (Ok(files), Some(snaps)),
+            Err(e) => (Err(e), None),
+        };
+        let effect = self.apply_reset(new_sha, new_branch, diff);
+        if let Some(snaps) = snapshots {
+            self.diff_snapshots.replace_from_map(snaps);
+        }
+        effect
     }
 
     /// Commit a freshly-resolved baseline + diff into the app. Split
@@ -981,6 +1628,17 @@ impl App {
                 self.current_branch_ref = new_branch;
                 self.head_dirty = false;
                 self.apply_computed_files(files);
+                // Drop stream-mode snapshots captured against the
+                // previous baseline. Every entry in `diff_snapshots`
+                // was `git diff <old_baseline> -- <path>` output;
+                // comparing the next hook-log-event against that
+                // would misattribute lines that belong to the change
+                // between baselines (not to the agent's edit).
+                // The caller (`reset_baseline`) repopulates the map
+                // from the same `compute_diff_with_snapshots` call
+                // that produced `files`, so there's no need to run
+                // a second per-file diff sweep here.
+                self.diff_snapshots.clear();
                 if branch_changed {
                     KeyEffect::ReconfigureWatcher
                 } else {
@@ -990,11 +1648,11 @@ impl App {
             Err(e) => {
                 self.last_error = Some(format!("R: {e:#}"));
                 // baseline_sha / current_branch_ref / head_dirty /
-                // files intentionally untouched: the HEAD* warning
-                // stays visible and the user keeps seeing the same
-                // diff they had before R. Watcher also stays pinned
-                // to the old branch, which is the correct behavior
-                // for an aborted reset.
+                // files / diff_snapshots intentionally untouched:
+                // the HEAD* warning stays visible and the user keeps
+                // seeing the same diff they had before R. Watcher
+                // also stays pinned to the old branch, which is the
+                // correct behavior for an aborted reset.
                 KeyEffect::None
             }
         }
@@ -1031,6 +1689,9 @@ impl App {
                 WatchEvent::GitHead(source) => {
                     head = true;
                     recovered_sources.push(source);
+                }
+                WatchEvent::EventLog(path) => {
+                    self.handle_event_log(path);
                 }
                 WatchEvent::Error { source, message } => {
                     failed_sources.insert(source, message);
@@ -1093,6 +1754,13 @@ impl App {
             self.should_quit = true;
             return KeyEffect::None;
         }
+
+        // Any user keypress drops the sticky scar-focus target. Scar
+        // actions (`a`/`r`/`c`/`u`) re-establish the focus later in
+        // this frame via `refresh_after_scar_write`, so clearing here
+        // costs nothing for them but protects every other key from
+        // leaving the cursor pinned to the last scar.
+        self.clear_scar_focus_on_nav();
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -1162,61 +1830,59 @@ impl App {
                 self.scroll_to(self.last_row_index());
                 self.follow_mode = false;
             }
-            KeyCode::Char('f') => {
-                self.follow_restore();
-            }
-            KeyCode::Char('s') => {
-                self.open_picker();
-            }
-            // v0.2 M4 scar dispatch. `a` and `r` insert the two
-            // canned scars; the free-text `c`, hunk-revert `x`,
-            // external-editor `e`, and "seen" Space will land in
-            // later M4 slices. Picker mode is already handled
-            // upstream so these arms only fire in normal mode.
-            KeyCode::Char('a') => {
-                self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
-            }
-            KeyCode::Char('r') => {
-                self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
-            }
-            KeyCode::Char('c') => {
-                self.open_scar_comment();
-            }
-            KeyCode::Char('x') => {
-                self.open_revert_confirm();
-            }
-            KeyCode::Char(' ') => {
-                self.toggle_seen_current_hunk();
-            }
-            KeyCode::Char('/') => {
-                self.open_search_input();
-            }
-            KeyCode::Char('n') => {
-                self.search_jump_next();
-            }
-            KeyCode::Char('N') => {
-                self.search_jump_prev();
+            KeyCode::Tab => {
+                self.toggle_view_mode();
             }
             KeyCode::Enter => {
                 self.open_file_view();
             }
-            KeyCode::Char('e') => {
-                // Read `$EDITOR` at dispatch time (not at bootstrap)
-                // so users who `export EDITOR=` mid-session pick up
-                // the new value without restarting kizu.
-                let env = std::env::var("EDITOR").ok();
-                if let Some(inv) = self.open_in_editor(env.as_deref()) {
-                    return KeyEffect::OpenEditor(inv);
+            KeyCode::Char(ch) => {
+                // Remappable keys resolved via config. Navigation
+                // keys (j/k/J/K/h/l/g/G) are handled above; these
+                // are the action keys that users can remap in
+                // ~/.config/kizu/config.toml.
+                let k = &self.config.keys;
+                if ch == k.follow {
+                    self.follow_restore();
+                } else if ch == k.picker {
+                    self.open_picker();
+                } else if ch == k.ask {
+                    self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+                } else if ch == k.reject {
+                    self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+                } else if ch == k.comment {
+                    self.open_scar_comment();
+                } else if ch == k.revert {
+                    self.open_revert_confirm();
+                } else if ch == k.seen {
+                    self.toggle_seen_current_hunk();
+                } else if ch == k.search {
+                    self.open_search_input();
+                } else if ch == k.search_next {
+                    self.search_jump_next();
+                } else if ch == k.search_prev {
+                    self.search_jump_prev();
+                } else if ch == k.editor {
+                    // Read `$EDITOR` at dispatch time (not at bootstrap)
+                    // so users who `export EDITOR=` mid-session pick up
+                    // the new value without restarting kizu.
+                    let editor_cmd = if self.config.editor.command.is_empty() {
+                        std::env::var("EDITOR").ok()
+                    } else {
+                        Some(self.config.editor.command.clone())
+                    };
+                    if let Some(inv) = self.open_in_editor(editor_cmd.as_deref()) {
+                        return KeyEffect::OpenEditor(inv);
+                    }
+                } else if ch == k.reset_baseline {
+                    return self.reset_baseline();
+                } else if ch == k.cursor_placement {
+                    self.toggle_cursor_placement();
+                } else if ch == k.wrap_toggle {
+                    self.toggle_wrap_lines();
+                } else if ch == k.undo {
+                    self.undo_scar();
                 }
-            }
-            KeyCode::Char('R') => {
-                return self.reset_baseline();
-            }
-            KeyCode::Char('z') => {
-                self.toggle_cursor_placement();
-            }
-            KeyCode::Char('w') => {
-                self.toggle_wrap_lines();
             }
             _ => {}
         }
@@ -1392,6 +2058,9 @@ impl App {
     /// pass a speculative value without risking an out-of-range
     /// cursor.
     pub(crate) fn scroll_to_visual(&mut self, row: usize, sub_row: usize, vi: &VisualIndex) {
+        // Any explicit cursor move drops the watcher-set pin so
+        // subsequent renders fall back to normal placement.
+        self.pinned_cursor_y = None;
         let last = self.last_row_index();
         let target_row = row.min(last);
         let row_height = vi.visual_height(target_row).max(1);
@@ -1421,6 +2090,9 @@ impl App {
     /// **intra-row** walks go through [`Self::scroll_to_visual`]
     /// instead.
     pub fn scroll_to(&mut self, row: usize) {
+        // Any explicit cursor move drops the watcher-set pin so
+        // subsequent renders fall back to normal placement.
+        self.pinned_cursor_y = None;
         let last = self.last_row_index();
         let target = self.normalize_row_target(row.min(last), 1);
         if target != self.scroll || self.cursor_sub_row != 0 {
@@ -1546,6 +2218,15 @@ impl App {
         }
         let max_top_y = total_visual - viewport_height;
 
+        // Viewport pin: matches nowrap `viewport_top`. When a watcher-
+        // driven recompute relocates the cursor, hold the cursor's
+        // visual y at the pre-recompute screen row so the viewport
+        // doesn't slide.
+        if let Some(pinned_y) = self.pinned_cursor_y {
+            let cursor_y = vi.visual_y(self.scroll) + self.cursor_sub_row;
+            return cursor_y.saturating_sub(pinned_y).min(max_top_y);
+        }
+
         // Hunk-fits-in-viewport case: anchor the entire hunk at the
         // placement target so the user always sees the full selected
         // change as a single block, matching nowrap behaviour.
@@ -1622,88 +2303,184 @@ impl App {
         }
     }
 
-    /// `J` — adaptive forward motion that switches between scroll and
-    /// hunk jump based on the current hunk's size.
+    /// `j` — adaptive forward motion. Only lands on **reviewable
+    /// rows**: change-run starts, long-run bodies (chunk-walked), or
+    /// the next hunk's header (via [`Self::next_hunk`]). Never parks
+    /// the cursor mid-context.
     ///
-    /// - **Short hunk** (fits in the viewport): instant jump to the next
-    ///   hunk's first row, same as `j`. No chunk-scroll mid-hunk, so
-    ///   walking dense edit clusters doesn't fragment into micro-presses.
-    /// - **Long hunk** (taller than the viewport): scroll forward by
-    ///   [`Self::chunk_size`] rows, clamped to the hunk's last row. Once
-    ///   the cursor lands on the last row, the next `J` flows into the
-    ///   next hunk's first row, so walking through a 200-line hunk ends
-    ///   at the next hunk without any extra key press.
-    /// - Crosses file boundaries the same way [`Self::next_hunk`] does,
-    ///   so `J` keeps flowing through the whole scroll.
+    /// Decision ladder:
+    ///
+    /// 1. **Inside a long run, not at its last row** — chunk-scroll
+    ///    forward by [`Self::chunk_size`], clamped to the run's last
+    ///    row. A 30-line Added block gets walked top-to-bottom in a
+    ///    few presses instead of teleporting past its body.
+    /// 2. **Next run exists within this hunk** — land on its start.
+    ///    (The jump is visually tweened by [`ScrollAnim`] so the
+    ///    motion feels gradual even though the cursor doesn't stop
+    ///    on any intermediate context rows.)
+    /// 3. **No more runs in this hunk** — hand off to
+    ///    [`Self::next_hunk`].
+    ///
+    /// A change run is a maximal stretch of non-`Context` rows — `-`
+    /// and `+` lines share a run because a typical one-line edit
+    /// (`-old\n+new`) is reviewed as a single unit.
     pub fn next_change(&mut self) {
         let cursor = self.scroll;
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
-        if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
-            let last_row = hunk_end.saturating_sub(1);
-            // Measure hunk size in **visual** rows so a single
-            // wrapped long line doesn't falsely register as "short
-            // hunk, just jump". Under nowrap the VisualIndex is the
-            // identity and this collapses to the old logical-row
-            // check.
-            let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-            let hunk_visual = vi.visual_y(hunk_end).saturating_sub(vi.visual_y(hunk_top));
-            // Visual position inside the hunk: logical row y plus
-            // intra-row offset. The cursor can now walk through a
-            // single wrapped diff line (ADR-0009 fix), so we must
-            // compare against the hunk's visual *last line*, not
-            // its last logical row.
-            let cur_y = vi.visual_y(cursor) + self.cursor_sub_row;
-            let hunk_last_y = vi
-                .visual_y(hunk_end)
-                .saturating_sub(1)
-                .max(vi.visual_y(hunk_top));
-            let at_hunk_end = cur_y >= hunk_last_y;
-            if hunk_visual > viewport && !at_hunk_end {
-                // Advance by a visual chunk, clamp to the hunk's
-                // last visual line so the cursor never escapes the
-                // current hunk on an intra-hunk step. `scroll_to_visual`
-                // preserves the resolved sub-row so a walk inside a
-                // long wrapped line actually moves the visible
-                // cursor.
-                let target_y = (cur_y + self.chunk_size()).min(hunk_last_y);
-                let (target_row, target_sub) = vi.logical_at(target_y);
-                let clamped_row = target_row.min(last_row);
-                if body_width.is_some() {
-                    self.scroll_to_visual(clamped_row, target_sub, &vi);
-                } else {
-                    self.scroll_to(clamped_row);
-                }
+
+        let Some((_, hunk_end)) = self.current_hunk_range() else {
+            self.next_hunk();
+            return;
+        };
+
+        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
+
+        // Inside a long run, not at its last row → chunk forward
+        // within the run so its body isn't teleported past.
+        if let Some(&(run_start, run_end)) = self
+            .layout
+            .change_runs
+            .iter()
+            .find(|(s, e)| *s <= cursor && cursor < *e)
+        {
+            let run_visual = vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start));
+            if is_long_run(run_visual, viewport) && cursor + 1 < run_end {
+                let last_row = run_end.saturating_sub(1);
+                let target = (cursor + self.chunk_size()).min(last_row);
+                self.scroll_to(target);
                 return;
             }
         }
+
+        // Next run start in this hunk → jump (never lands on the
+        // intervening context).
+        if let Some(&(run_start, _)) = self
+            .layout
+            .change_runs
+            .iter()
+            .find(|(s, _)| *s > cursor && *s < hunk_end)
+        {
+            self.scroll_to(run_start);
+            return;
+        }
+
         self.next_hunk();
     }
 
-    /// `K` — adaptive backward motion. Mirror of [`Self::next_change`].
+    /// `k` — adaptive backward motion. Mirror of [`Self::next_change`].
+    /// Only lands on change-run starts, long-run bodies, or the prev
+    /// hunk's last run start (via [`Self::prev_hunk_last_run_start`]).
     pub fn prev_change(&mut self) {
         let cursor = self.scroll;
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
-        if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
-            let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-            let hunk_visual = vi.visual_y(hunk_end).saturating_sub(vi.visual_y(hunk_top));
-            let cur_y = vi.visual_y(cursor) + self.cursor_sub_row;
-            let hunk_top_y = vi.visual_y(hunk_top);
-            let at_hunk_top = cur_y <= hunk_top_y;
-            if hunk_visual > viewport && !at_hunk_top {
-                let target_y = cur_y.saturating_sub(self.chunk_size()).max(hunk_top_y);
-                let (target_row, target_sub) = vi.logical_at(target_y);
-                let clamped_row = target_row.max(hunk_top);
-                if body_width.is_some() {
-                    self.scroll_to_visual(clamped_row, target_sub, &vi);
-                } else {
-                    self.scroll_to(clamped_row);
-                }
+
+        let Some((hunk_top, _)) = self.current_hunk_range() else {
+            self.prev_hunk_last_run_start();
+            return;
+        };
+
+        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
+
+        // Inside a long run, not at its start → chunk back within.
+        if let Some(&(run_start, run_end)) = self
+            .layout
+            .change_runs
+            .iter()
+            .find(|(s, e)| *s <= cursor && cursor < *e)
+        {
+            let run_visual = vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start));
+            if is_long_run(run_visual, viewport) && cursor > run_start {
+                let target = cursor.saturating_sub(self.chunk_size()).max(run_start);
+                self.scroll_to(target);
                 return;
             }
         }
-        self.prev_hunk();
+
+        // Prev run start in this hunk → jump.
+        if let Some(&(run_start, _)) = self
+            .layout
+            .change_runs
+            .iter()
+            .rev()
+            .find(|(s, _)| *s < cursor && *s >= hunk_top)
+        {
+            self.scroll_to(run_start);
+            return;
+        }
+
+        self.prev_hunk_last_run_start();
+    }
+
+    /// Land the cursor on the **start of the last change run** inside
+    /// the hunk immediately before the current one. Used by
+    /// [`Self::prev_change`] as the boundary-crossing handoff.
+    ///
+    /// Landing on the last run's start (rather than the hunk's literal
+    /// last row) keeps the cursor parked on reviewable code. A hunk
+    /// frequently ends with trailing `Context` lines; landing there
+    /// would drop the reader on unchanged code. From the last run's
+    /// start, subsequent `k` presses walk backward through the hunk's
+    /// runs naturally.
+    ///
+    /// "Prev hunk" is defined relative to the *current hunk's header*,
+    /// not the scroll position — otherwise, when the cursor sits past
+    /// the current hunk's header (e.g. on its first change run), this
+    /// helper would pick the current hunk's own header as the "prev"
+    /// and bounce the cursor back inside the same hunk. When there is
+    /// no preceding hunk, this is a no-op.
+    fn prev_hunk_last_run_start(&mut self) {
+        let threshold = self
+            .current_hunk_range()
+            .map(|(top, _)| top)
+            .unwrap_or(self.scroll);
+        let Some(&prev_start) = self
+            .layout
+            .hunk_starts
+            .iter()
+            .rev()
+            .find(|&&s| s < threshold)
+        else {
+            return;
+        };
+        // Extract the (file_idx, hunk_idx) of the prev hunk so we can
+        // scope the run search to it.
+        let (target_file, target_hunk) = match self.layout.rows.get(prev_start) {
+            Some(RowKind::HunkHeader { file_idx, hunk_idx }) => (*file_idx, *hunk_idx),
+            _ => {
+                self.scroll_to(prev_start);
+                return;
+            }
+        };
+        // Walk forward from the prev hunk's header to find its
+        // exclusive end row (first row that no longer belongs to it).
+        let mut prev_hunk_end = prev_start + 1;
+        for (i, row) in self.layout.rows.iter().enumerate().skip(prev_start + 1) {
+            let belongs = match row {
+                RowKind::HunkHeader { file_idx, hunk_idx }
+                | RowKind::DiffLine {
+                    file_idx, hunk_idx, ..
+                } => *file_idx == target_file && *hunk_idx == target_hunk,
+                _ => false,
+            };
+            if belongs {
+                prev_hunk_end = i + 1;
+            } else {
+                break;
+            }
+        }
+        // Last change-run start inside the prev hunk. Defensive
+        // fallback to the hunk header if (somehow) no runs exist.
+        let landing = self
+            .layout
+            .change_runs
+            .iter()
+            .rev()
+            .find(|(s, _)| *s >= prev_start && *s < prev_hunk_end)
+            .map(|(s, _)| *s)
+            .unwrap_or(prev_start);
+        self.scroll_to(landing);
     }
 
     pub fn jump_to_file_first_hunk(&mut self, file_idx: usize) {
@@ -1719,45 +2496,29 @@ impl App {
         }
     }
 
-    /// Row that "follow mode" parks the scroll cursor on: the **last
-    /// visible content row** of the newest file (files are sorted
-    /// mtime-ascending, so the last file is the most recently touched
-    /// one). Walks `layout.rows` from the end and returns the first
-    /// non-Spacer row whose `file_of_row` matches the newest file.
-    /// This lands on the actual last diff line of the last hunk, the
-    /// place a `tail -f`-style monitor expects to see.
-    ///
-    /// ADR-0009 fix: the previous implementation returned the newest
-    /// hunk's **header** row (`layout.hunk_starts.last()`), which for
-    /// any hunk taller than the viewport pinned follow mode to the
-    /// top of the hunk and hid the newest added / deleted lines. That
-    /// broke the core monitoring contract exactly when large edits
-    /// were landing.
+    /// Row that "follow mode" parks the scroll cursor on: the
+    /// **last hunk header** of the newest file (files are sorted
+    /// mtime-ascending, so the last file is the most recently
+    /// touched one). Landing on the last @@ header lets the user
+    /// see the most recent change's context and diff body below.
     fn follow_target_row(&self) -> Option<usize> {
         if self.files.is_empty() {
             return None;
         }
         let newest = self.files.len() - 1;
-        // Walk from the end of the layout to find the last content
-        // row belonging to the newest file. `file_of_row[i]` carries
-        // the owning file for every row type; Spacer rows are
-        // excluded because they are cosmetic inter-file padding and
-        // do not belong to any file's change set.
-        for (i, &file_idx) in self.layout.file_of_row.iter().enumerate().rev() {
-            if file_idx == newest && !matches!(self.layout.rows.get(i), Some(RowKind::Spacer)) {
+        // Walk from the end to find the last HunkHeader of the newest file.
+        for (i, row) in self.layout.rows.iter().enumerate().rev() {
+            if matches!(row, RowKind::HunkHeader { file_idx, .. } if *file_idx == newest) {
                 return Some(i);
             }
         }
-        // Fallbacks mirror the legacy behaviour: if the walk above
-        // turns up nothing (file has no diffable content — binary,
-        // empty, …), try the file's first-hunk entry, then the
-        // absolute last row. Either is preferable to returning None.
-        self.layout
-            .file_first_hunk
-            .last()
-            .copied()
-            .flatten()
-            .or_else(|| self.layout.rows.len().checked_sub(1))
+        // Fallback: try file header, then the absolute last row.
+        for (i, row) in self.layout.rows.iter().enumerate() {
+            if matches!(row, RowKind::FileHeader { file_idx } if *file_idx == newest) {
+                return Some(i);
+            }
+        }
+        self.layout.rows.len().checked_sub(1)
     }
 
     /// File index that the row at `self.scroll` belongs to.
@@ -1785,6 +2546,8 @@ impl App {
         }
     }
 
+    /// Scroll to the first row of the file matching `path`. No-op if
+    /// the file is not in the current layout.
     /// Insert a scar of the given `kind` with `body` as the human
     /// text, at the cursor's current position. No-op when the
     /// cursor is not on a diff row (file header, hunk header,
@@ -1794,11 +2557,33 @@ impl App {
     /// picks up the resulting write on its next tick and re-runs
     /// `compute_diff`, which shows the new scar line in place.
     pub fn insert_canned_scar(&mut self, kind: ScarKind, body: &str) {
+        // Stream mode shows historical diffs with synthetic line numbers;
+        // scar insertion would target nonsensical positions. Switch to
+        // diff mode to scar the current file state.
+        if self.view_mode == ViewMode::Stream {
+            return;
+        }
         let Some((path, line)) = self.scar_target_line() else {
             return;
         };
-        if let Err(err) = crate::scar::insert_scar(&path, line, kind, body) {
-            self.last_error = Some(format!("scar: {err:#}"));
+        match crate::scar::insert_scar(&path, line, kind, body) {
+            Ok(Some(receipt)) => {
+                let focus = Some((path.clone(), receipt.line_1indexed));
+                self.scar_undo_stack.push(ScarUndoEntry {
+                    path,
+                    line_1indexed: receipt.line_1indexed,
+                    rendered: receipt.rendered,
+                });
+                self.refresh_after_scar_write(focus);
+            }
+            Ok(None) => {
+                // Idempotent no-op (same scar already above target).
+                // Nothing to undo; don't pollute the stack with a
+                // phantom entry.
+            }
+            Err(err) => {
+                self.last_error = Some(format!("scar: {err:#}"));
+            }
         }
     }
 
@@ -1807,6 +2592,9 @@ impl App {
     /// while the user is typing cannot retarget the write. No-op
     /// when the cursor is not on a scar-able row.
     pub fn open_scar_comment(&mut self) {
+        if self.view_mode == ViewMode::Stream {
+            return;
+        }
         let Some((target_path, target_line)) = self.scar_target_line() else {
             return;
         };
@@ -1836,10 +2624,209 @@ impl App {
         if body.is_empty() {
             return;
         }
-        if let Err(err) =
-            crate::scar::insert_scar(&state.target_path, state.target_line, ScarKind::Free, body)
+        match crate::scar::insert_scar(&state.target_path, state.target_line, ScarKind::Free, body)
         {
-            self.last_error = Some(format!("scar: {err:#}"));
+            Ok(Some(receipt)) => {
+                let focus = Some((state.target_path.clone(), receipt.line_1indexed));
+                self.scar_undo_stack.push(ScarUndoEntry {
+                    path: state.target_path,
+                    line_1indexed: receipt.line_1indexed,
+                    rendered: receipt.rendered,
+                });
+                self.refresh_after_scar_write(focus);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.last_error = Some(format!("scar: {err:#}"));
+            }
+        }
+    }
+
+    /// Sync the on-screen diff + file view with the on-disk state
+    /// after a scar write or undo. Without this, the user would wait
+    /// for the watcher debounce (~300ms) before seeing their scar
+    /// appear. We run `git diff` synchronously and re-read the file
+    /// view's line buffer — cheap on any normal repo, and eliminates
+    /// the visible input lag.
+    ///
+    /// `focus` is an optional `(absolute path, 1-indexed new-file
+    /// line)` pair. After the diff rebuild, the cursor is snapped to
+    /// the layout row that represents that line. This is what keeps
+    /// the user parked on the scar they just inserted (otherwise
+    /// `refresh_anchor` re-targets to the hunk header in follow mode).
+    ///
+    /// Best-effort: a git-diff failure here is swallowed. The scar
+    /// write itself already succeeded, the watcher will retry on its
+    /// next tick, and this keeps `last_error` from being polluted by
+    /// the refresh attempt (tests running against a non-git scratch
+    /// dir also benefit).
+    fn refresh_after_scar_write(&mut self, focus: Option<(PathBuf, usize)>) {
+        // Pin the focus target *before* the recompute so
+        // `apply_computed_files`'s tail will honour it. The pin then
+        // persists through the asynchronous watcher tick that fires
+        // ~300ms later — without it, that second recompute would snap
+        // the cursor back to the hunk header.
+        self.scar_focus = focus;
+        if let Ok(files) = git::compute_diff(&self.root, &self.baseline_sha) {
+            self.apply_computed_files(files);
+        }
+        if let Some(fv) = self.file_view.as_mut() {
+            let abs = self.root.join(&fv.path);
+            if let Ok(content) = std::fs::read_to_string(&abs) {
+                fv.lines = content.lines().map(String::from).collect();
+                // line_bg stays stale until the next full rebuild;
+                // reopening file view (Esc → Enter) refreshes it.
+                // Clamp cursor so a shortened file doesn't point past
+                // the end.
+                let max = fv.lines.len().saturating_sub(1);
+                if fv.cursor > max {
+                    fv.cursor = max;
+                }
+            }
+        }
+    }
+
+    /// Find the layout row that renders the given new-file line
+    /// (1-indexed) in the file whose **absolute** path matches `abs`.
+    /// Returns `None` if the file isn't in the current diff, or the
+    /// line isn't currently part of any hunk's new-side window.
+    fn find_new_file_line_row(&self, abs: &Path, line_1indexed: usize) -> Option<usize> {
+        let rel = abs.strip_prefix(&self.root).unwrap_or(abs);
+        let file_idx = self.files.iter().position(|f| f.path == rel)?;
+        let DiffContent::Text(hunks) = &self.files[file_idx].content else {
+            return None;
+        };
+        for (hunk_idx, hunk) in hunks.iter().enumerate() {
+            let mut new_line = hunk.new_start;
+            for (offset, dl) in hunk.lines.iter().enumerate() {
+                if matches!(dl.kind, LineKind::Deleted) {
+                    continue;
+                }
+                if new_line == line_1indexed {
+                    return self.layout.rows.iter().position(|r| {
+                        matches!(
+                            r,
+                            RowKind::DiffLine {
+                                file_idx: f,
+                                hunk_idx: hi,
+                                line_idx: li,
+                            } if *f == file_idx && *hi == hunk_idx && *li == offset,
+                        )
+                    });
+                }
+                new_line += 1;
+            }
+        }
+        None
+    }
+
+    /// Content identity of the cursor's current row, when (and only
+    /// when) it's on a `RowKind::DiffLine`. Returns `(absolute_path,
+    /// new_file_line)` so it can be fed back into
+    /// [`Self::find_new_file_line_row`] /
+    /// [`Self::find_nearest_new_file_line_row`] after a layout
+    /// rebuild. Distinct from [`Self::scar_target_line`] which also
+    /// covers hunk headers and file-view; this one intentionally
+    /// returns `None` on any non-DiffLine row so callers can
+    /// detect "we were on a specific line" versus "we were on a
+    /// structural row".
+    fn scroll_cursor_new_line(&self) -> Option<(PathBuf, usize)> {
+        let row = self.layout.rows.get(self.scroll)?;
+        let RowKind::DiffLine {
+            file_idx,
+            hunk_idx,
+            line_idx,
+        } = *row
+        else {
+            return None;
+        };
+        let file = self.files.get(file_idx)?;
+        let DiffContent::Text(hunks) = &file.content else {
+            return None;
+        };
+        let hunk = hunks.get(hunk_idx)?;
+        let mut new_line = hunk.new_start;
+        for (i, dl) in hunk.lines.iter().enumerate() {
+            if i == line_idx {
+                return Some((self.root.join(&file.path), new_line));
+            }
+            if !matches!(dl.kind, LineKind::Deleted) {
+                new_line += 1;
+            }
+        }
+        None
+    }
+
+    /// Layout row of the DiffLine in `abs` whose new-file line
+    /// number is closest to `target_line`. Breaks ties toward the
+    /// earliest occurrence (first hunk, earliest line within the
+    /// hunk). Returns `None` when the file is absent or has no
+    /// non-deleted lines in the diff (binary, pure-deletion hunks).
+    fn find_nearest_new_file_line_row(&self, abs: &Path, target_line: usize) -> Option<usize> {
+        let rel = abs.strip_prefix(&self.root).unwrap_or(abs);
+        let file_idx = self.files.iter().position(|f| f.path == rel)?;
+        let DiffContent::Text(hunks) = &self.files[file_idx].content else {
+            return None;
+        };
+        let mut best: Option<(usize, usize, usize)> = None; // (distance, hunk_idx, line_idx)
+        for (hunk_idx, hunk) in hunks.iter().enumerate() {
+            let mut new_line = hunk.new_start;
+            for (offset, dl) in hunk.lines.iter().enumerate() {
+                if matches!(dl.kind, LineKind::Deleted) {
+                    continue;
+                }
+                let distance = new_line.abs_diff(target_line);
+                if best.is_none_or(|(d, _, _)| distance < d) {
+                    best = Some((distance, hunk_idx, offset));
+                }
+                new_line += 1;
+            }
+        }
+        let (_, hunk_idx, line_idx) = best?;
+        self.layout.rows.iter().position(|r| {
+            matches!(
+                r,
+                RowKind::DiffLine {
+                    file_idx: f,
+                    hunk_idx: h,
+                    line_idx: l,
+                } if *f == file_idx && *h == hunk_idx && *l == line_idx,
+            )
+        })
+    }
+
+    /// Reverse the most recent scar insertion on the session's undo
+    /// stack. No-op when the stack is empty. If the target file has
+    /// been edited such that the captured line no longer matches,
+    /// the op is popped (so repeated `u` presses walk further back)
+    /// and an informational message is placed on `last_error`.
+    pub fn undo_scar(&mut self) {
+        let Some(entry) = self.scar_undo_stack.pop() else {
+            return;
+        };
+        match crate::scar::remove_scar(&entry.path, entry.line_1indexed, &entry.rendered) {
+            Ok(crate::scar::ScarRemove::Removed) => {
+                // The scar is gone; focus the line that now sits at
+                // its old position (the code the scar was annotating).
+                self.refresh_after_scar_write(Some((entry.path.clone(), entry.line_1indexed)));
+            }
+            Ok(crate::scar::ScarRemove::Mismatch) => {
+                self.last_error = Some(format!(
+                    "undo: line {} in {} was edited — skipped",
+                    entry.line_1indexed,
+                    entry.path.display(),
+                ));
+            }
+            Ok(crate::scar::ScarRemove::OutOfRange) => {
+                self.last_error = Some(format!(
+                    "undo: {} has fewer than {} lines — skipped",
+                    entry.path.display(),
+                    entry.line_1indexed,
+                ));
+            }
+            Err(err) => {
+                self.last_error = Some(format!("undo: {err:#}"));
+            }
         }
     }
 
@@ -1869,9 +2856,12 @@ impl App {
 
     /// Open the full-file zoom view for the cursor's current hunk.
     /// Reads the worktree file, builds a line_bg map from diff
-    /// hunks, and parks the viewport so the hunk's first line is
-    /// visible. No-op when the cursor is not on a text hunk, or
-    /// the file cannot be read.
+    /// hunks, and parks the viewport so the **cursor's current
+    /// new-file line** is visible (not the hunk header). That way
+    /// zooming into a hunk keeps the reader on whatever row they
+    /// were already inspecting instead of snapping back to the top
+    /// of the hunk. No-op when the cursor is not on a text hunk,
+    /// or the file cannot be read.
     pub fn open_file_view(&mut self) {
         use ratatui::style::Color;
         use std::collections::HashMap;
@@ -1903,7 +2893,7 @@ impl App {
                 match dl.kind {
                     LineKind::Added => {
                         if new_line >= 1 && (new_line - 1) < lines.len() {
-                            line_bg.insert(new_line - 1, Color::Rgb(10, 50, 10));
+                            line_bg.insert(new_line - 1, self.config.colors.bg_added_color());
                         }
                         new_line += 1;
                     }
@@ -1918,22 +2908,35 @@ impl App {
             }
         }
 
-        // Find cursor's hunk new_start to center the initial viewport.
-        let initial_cursor = self
-            .current_hunk()
-            .and_then(|(_, hi)| hunks.get(hi))
-            .map(|h| h.new_start.saturating_sub(1))
-            .unwrap_or(0)
+        // Inherit the cursor's current new-file line instead of
+        // snapping to the hunk header: `scar_target_line` already
+        // does this mapping (DiffLine → new-file line, HunkHeader →
+        // first changed line). Fall back to the hunk's `new_start`
+        // when the cursor is on a row with no mapping, e.g. a file
+        // header.
+        let target_1indexed = self
+            .scar_target_line()
+            .map(|(_, line)| line)
+            .or_else(|| {
+                self.current_hunk()
+                    .and_then(|(_, hi)| hunks.get(hi))
+                    .map(|h| h.new_start)
+            })
+            .unwrap_or(1);
+        let initial_cursor = target_1indexed
+            .saturating_sub(1)
             .min(lines.len().saturating_sub(1));
 
+        let scroll_top = initial_cursor.saturating_sub(self.last_body_height.get() / 2);
         self.file_view = Some(FileViewState {
-            file_idx,
             path: file.path.clone(),
             return_scroll: self.scroll,
             lines,
             line_bg,
             cursor: initial_cursor,
-            scroll_top: initial_cursor.saturating_sub(self.last_body_height.get() / 2),
+            scroll_top,
+            anim: None,
+            visual_top: scroll_top as f32,
         });
     }
 
@@ -1956,14 +2959,17 @@ impl App {
             self.should_quit = true;
             return KeyEffect::None;
         }
+        // Same sticky-focus discipline as normal mode: every keypress
+        // drops the scar-focus pin; scar action keys re-establish it.
+        self.clear_scar_focus_on_nav();
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('d') => {
-                    self.file_view_scroll_by(HALF_PAGE as isize);
+                    self.file_view_scroll_by(HALF_PAGE as isize, true);
                     return KeyEffect::None;
                 }
                 KeyCode::Char('u') => {
-                    self.file_view_scroll_by(-(HALF_PAGE as isize));
+                    self.file_view_scroll_by(-(HALF_PAGE as isize), true);
                     return KeyEffect::None;
                 }
                 _ => {}
@@ -1975,17 +2981,17 @@ impl App {
             // adaptive-motion feel. J/K: exact 1-row move.
             KeyCode::Char('j') | KeyCode::Down => {
                 let chunk = self.chunk_size() as isize;
-                self.file_view_scroll_by(chunk);
+                self.file_view_scroll_by(chunk, true);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 let chunk = self.chunk_size() as isize;
-                self.file_view_scroll_by(-chunk);
+                self.file_view_scroll_by(-chunk, true);
             }
             KeyCode::Char('J') => {
-                self.file_view_scroll_by(1);
+                self.file_view_scroll_by(1, false);
             }
             KeyCode::Char('K') => {
-                self.file_view_scroll_by(-1);
+                self.file_view_scroll_by(-1, false);
             }
             KeyCode::Char('g') => {
                 self.file_view_goto(0);
@@ -2012,12 +3018,28 @@ impl App {
                     }
                 }
             }
+            // Scar operations reuse the diff-view handlers, which
+            // already consult `scar_target_line()` — and that function
+            // is now file-view aware. Config bindings apply (so a user
+            // who remaps `ask` to `A` gets the new key here too).
+            KeyCode::Char(ch) => {
+                let k = &self.config.keys;
+                if ch == k.ask {
+                    self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+                } else if ch == k.reject {
+                    self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+                } else if ch == k.comment {
+                    self.open_scar_comment();
+                } else if ch == k.undo {
+                    self.undo_scar();
+                }
+            }
             _ => {}
         }
         KeyEffect::None
     }
 
-    fn file_view_scroll_by(&mut self, delta: isize) {
+    fn file_view_scroll_by(&mut self, delta: isize, animate: bool) {
         let Some(fv) = self.file_view.as_mut() else {
             return;
         };
@@ -2025,10 +3047,38 @@ impl App {
         let new = (fv.cursor as isize + delta).clamp(0, max as isize) as usize;
         fv.cursor = new;
         let vh = self.last_body_height.get();
+        let old_top = fv.scroll_top;
         if fv.cursor < fv.scroll_top {
             fv.scroll_top = fv.cursor;
         } else if fv.cursor >= fv.scroll_top + vh {
             fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
+        }
+        if animate && fv.scroll_top != old_top {
+            fv.anim = Some(ScrollAnim {
+                from: fv.visual_top,
+                start: Instant::now(),
+                dur: SCROLL_ANIM_DURATION,
+            });
+        } else if !animate {
+            // Snap: clear any in-flight animation (J/K 1-row moves).
+            fv.anim = None;
+            fv.visual_top = fv.scroll_top as f32;
+        }
+    }
+
+    /// Advance the file-view scroll animation by one frame.
+    /// Updates `visual_top` and clears `anim` when the tween finishes.
+    pub fn tick_file_view_anim(&mut self) {
+        let Some(fv) = self.file_view.as_mut() else {
+            return;
+        };
+        let Some(anim) = &fv.anim else {
+            return;
+        };
+        let (v, done) = anim.sample(fv.scroll_top as f32, Instant::now());
+        fv.visual_top = v;
+        if done {
+            fv.anim = None;
         }
     }
 
@@ -2044,6 +3094,9 @@ impl App {
         } else if fv.cursor >= fv.scroll_top + vh {
             fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
         }
+        // g/G are instant jumps — no animation.
+        fv.anim = None;
+        fv.visual_top = fv.scroll_top as f32;
     }
 
     /// Enter the `/` search-query composer. Any previously
@@ -2191,8 +3244,7 @@ impl App {
         let Some(hunk) = hunks.get(hunk_idx) else {
             return false;
         };
-        self.seen_hunks
-            .contains(&(file.path.clone(), hunk.old_start))
+        is_hunk_seen(&self.seen_hunks, &file.path, hunk.old_start)
     }
 
     /// Resolve the cursor's current target (path + 1-indexed line)
@@ -2202,6 +3254,9 @@ impl App {
     /// editor configured — in either case the `e` key should be a
     /// silent no-op.
     pub fn open_in_editor(&self, editor_env: Option<&str>) -> Option<EditorInvocation> {
+        if self.view_mode == ViewMode::Stream {
+            return None;
+        }
         let (path, line) = self.scar_target_line()?;
         build_editor_invocation(editor_env, line, &path)
     }
@@ -2210,6 +3265,9 @@ impl App {
     /// cursor is not inside a diff hunk (file headers, spacers,
     /// binary notices) or when the enclosing file is not text.
     pub fn open_revert_confirm(&mut self) {
+        if self.view_mode == ViewMode::Stream {
+            return;
+        }
         let Some((file_idx, hunk_idx)) = self.current_hunk() else {
             return;
         };
@@ -2378,6 +3436,13 @@ impl App {
     ///   hunk tail we fall through to the same offset, which matches
     ///   "insert the scar right after the deletion block".
     pub fn scar_target_line(&self) -> Option<(PathBuf, usize)> {
+        // File-view override: when the user is zoomed into a whole file,
+        // the cursor addresses a direct worktree line. Every line is
+        // scar-able, so there's no hunk/deletion mapping to do — just
+        // return `(path, cursor + 1)` (1-indexed).
+        if let Some(fv) = &self.file_view {
+            return Some((self.root.join(&fv.path), fv.cursor + 1));
+        }
         let row = self.layout.rows.get(self.scroll)?;
         let (file_idx, hunk_idx, diff_line_idx) = match *row {
             RowKind::DiffLine {
@@ -2479,6 +3544,13 @@ impl App {
             return 0;
         }
         let max_top = total - viewport_height;
+
+        // Viewport pin: keep the cursor at the screen row captured by
+        // the most recent `apply_computed_files`. Overrides both the
+        // hunk-fit anchoring and the placement-mode cursor rule.
+        if let Some(pinned_y) = self.pinned_cursor_y {
+            return self.scroll.saturating_sub(pinned_y).min(max_top);
+        }
 
         if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
             let hunk_size = hunk_end - hunk_top;
@@ -2767,6 +3839,137 @@ impl App {
 }
 
 /// Async event loop. See ADR-0003 / ADR-0005.
+/// Convert stream events into virtual [`FileDiff`] entries so the
+/// existing scroll infrastructure can render them identically to
+/// git diff output. Each event becomes one `FileDiff` with:
+/// - `header_prefix`: "HH:MM:SS Tool" for display in the file header
+/// - `path`: the edited file path
+/// - `content`: parsed diff lines from the captured snapshot
+pub fn build_stream_files(events: &[StreamEvent]) -> Vec<FileDiff> {
+    let mut out: Vec<FileDiff> = Vec::new();
+    for (i, ev) in events.iter().enumerate() {
+        let ts = ev.metadata.timestamp_ms;
+        let time_str = crate::ui::format_local_time(ts);
+        let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
+        let prefix = format!("{time_str} {tool}");
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_millis(ts);
+
+        // Use `file_paths` order as the stable render order so a
+        // multi-file tool call presents files in the order the agent
+        // reported them, not in the BTreeMap's sort order.
+        let paths: Vec<PathBuf> = if ev.metadata.file_paths.is_empty() {
+            // Preserve the "empty placeholder" behavior for events
+            // whose file_paths could not be resolved — they still
+            // need to be visible in the stream as a metadata row.
+            vec![PathBuf::new()]
+        } else {
+            ev.metadata.file_paths.clone()
+        };
+
+        // Space each (event, path) pair's old_start apart so hunk
+        // anchors (keyed on path + old_start) stay unique across
+        // events and paths.
+        for (j, path) in paths.into_iter().enumerate() {
+            let anchor_base = (i * 10_000) + (j * 100) + 1;
+            let diff_text = ev.per_file_diffs.get(&path);
+            let (hunks, added, deleted) = match diff_text {
+                Some(t) if !t.is_empty() => parse_stream_diff_to_hunk(t, anchor_base),
+                _ => (vec![], 0, 0),
+            };
+
+            out.push(FileDiff {
+                path,
+                status: git::FileStatus::Modified,
+                added,
+                deleted,
+                content: git::DiffContent::Text(hunks),
+                mtime,
+                header_prefix: Some(prefix.clone()),
+            });
+        }
+    }
+    out
+}
+
+/// Parse raw diff text (from a stream event snapshot) into a single
+/// `Hunk` with `DiffLine` entries. Hunk header lines (`@@`) are
+/// skipped; `+`/`-`/` ` prefix determines `LineKind`.
+fn parse_stream_diff_to_hunk(diff_text: &str, old_start: usize) -> (Vec<git::Hunk>, usize, usize) {
+    let mut lines = Vec::new();
+    let mut added = 0usize;
+    let mut deleted = 0usize;
+    for raw in diff_text.lines() {
+        if raw.starts_with("@@")
+            || raw.starts_with("diff ")
+            || raw.starts_with("---")
+            || raw.starts_with("+++")
+            || raw.starts_with("index ")
+        {
+            continue;
+        }
+        let (kind, content) = if let Some(rest) = raw.strip_prefix('+') {
+            added += 1;
+            (LineKind::Added, rest.to_string())
+        } else if let Some(rest) = raw.strip_prefix('-') {
+            deleted += 1;
+            (LineKind::Deleted, rest.to_string())
+        } else if let Some(rest) = raw.strip_prefix(' ') {
+            (LineKind::Context, rest.to_string())
+        } else {
+            (LineKind::Context, raw.to_string())
+        };
+        lines.push(git::DiffLine {
+            kind,
+            content,
+            has_trailing_newline: true,
+        });
+    }
+    if lines.is_empty() {
+        return (vec![], 0, 0);
+    }
+    let hunk = git::Hunk {
+        old_start,
+        old_count: deleted,
+        new_start: old_start,
+        new_count: added,
+        lines,
+        context: None,
+    };
+    (vec![hunk], added, deleted)
+}
+
+/// Compute the "operation diff" — the lines in `current` that were
+/// not already present in `previous`, counted as a **multiset** so
+/// duplicate lines (e.g. two blank `+` lines, or two identical
+/// closing-brace context rows) survive when `current` has more copies
+/// than `previous`.
+///
+/// This is not a true diff-of-diff — hunk boundaries, line numbers,
+/// and ordering drift are ignored. In practice the cumulative
+/// snapshots differ by the lines one Write/Edit operation added or
+/// re-shaped, so a multiset difference gives a readable approximation.
+/// Limitations and design rationale are documented in ADR-0016.
+fn compute_operation_diff(previous: &str, current: &str) -> String {
+    use std::collections::HashMap;
+    let mut prev_counts: HashMap<&str, usize> = HashMap::new();
+    for line in previous.lines() {
+        *prev_counts.entry(line).or_insert(0) += 1;
+    }
+    let mut result = String::new();
+    for line in current.lines() {
+        match prev_counts.get_mut(line) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+            }
+            _ => {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+    }
+    result
+}
+
 pub async fn run() -> Result<()> {
     use std::io::Write;
     let log_path = std::env::var("KIZU_STARTUP_TIMING_FILE").ok();
@@ -2820,6 +4023,16 @@ pub async fn run() -> Result<()> {
             eprintln!("warning: failed to write kizu session file: {e}");
         }
 
+        // Session isolation: older events are now filtered on ingest
+        // via `session_start_ms` rather than by bulk-deleting the
+        // shared events directory. The delete path used to destroy a
+        // concurrently-running kizu session's live history on the
+        // same project; the filter approach is non-destructive.
+        // Diff snapshots were already seeded inside `App::bootstrap`
+        // from the same `git diff` that produced the initial file
+        // list, so the first stream event shows only the per-op
+        // delta without an extra startup subprocess sweep.
+
         // Draw one static frame before watcher startup. On macOS the
         // PollWatcher fallback may take noticeable time to arm because it
         // performs an initial scan; showing the bootstrap snapshot first
@@ -2838,7 +4051,18 @@ pub async fn run() -> Result<()> {
             app.current_branch_ref.as_deref(),
         )?;
         stage("watcher::start", t_watcher);
-        stage("total before loop", t_total);
+
+        // Replay any event files that were written in the gap
+        // between `clean_stale_events` and `watcher::start`. Without
+        // this the next event for the same file would absorb the
+        // dropped operation's contents into its op_diff because the
+        // seeded snapshot is still the pre-edit state. Dedup inside
+        // `handle_event_log` makes this safe even when the watcher
+        // later re-delivers the same file.
+        if let Some(events_dir) = crate::paths::events_dir(&app.root) {
+            app.replay_events_dir(&events_dir);
+        }
+        stage("replay startup-gap events", t_total);
         let result = run_loop(&mut terminal, &mut app, &mut watch).await;
         crate::session::remove_session(&app.root);
         result
@@ -2890,6 +4114,7 @@ async fn run_loop(
         // final position — the next frame will then draw the static
         // target without another tween sample.
         app.tick_anim(Instant::now());
+        app.tick_file_view_anim();
 
         tokio::select! {
             event = events.next() => {
@@ -2936,7 +4161,12 @@ async fn run_loop(
                     let (need_recompute, need_head_dirty) = app.handle_watch_burst(burst);
                     if need_recompute {
                         watch.refresh_worktree_watches();
-                        app.recompute_diff();
+                        // In stream mode, don't overwrite files/layout with
+                        // git diff — the scroll view shows stream events.
+                        // The diff will be refreshed when the user tabs back.
+                        if app.view_mode != ViewMode::Stream {
+                            app.recompute_diff();
+                        }
                     }
                     if need_head_dirty {
                         app.mark_head_dirty();
@@ -2948,9 +4178,11 @@ async fn run_loop(
             }
             _ = &mut startup_refresh, if startup_refresh_pending => {
                 startup_refresh_pending = false;
-                app.recompute_diff();
+                if app.view_mode != ViewMode::Stream {
+                    app.recompute_diff();
+                }
             }
-            _ = frame.tick(), if app.anim.is_some() => {
+            _ = frame.tick(), if app.anim.is_some() || app.file_view.as_ref().is_some_and(|fv| fv.anim.is_some()) => {
                 // The tick itself carries no payload — falling through
                 // the bottom of the select! loops back to the `draw`
                 // call at the top, which is the whole point.
@@ -3045,6 +4277,57 @@ mod tests {
     use crate::git::{DiffContent, DiffLine, FileStatus, Hunk, LineKind};
     use std::time::Duration;
 
+    #[test]
+    fn diff_snapshots_evicts_oldest_when_cap_exceeded() {
+        // Long agent sessions can pile up one snapshot per unique file
+        // touched. Without a cap the map grows unboundedly; a LRU-ish
+        // eviction keeps working-set size predictable. The eldest
+        // inserted key must be the first to go when the cap is hit.
+        let mut snaps = DiffSnapshots::with_cap(3);
+        snaps.insert(PathBuf::from("a"), "diff-a".into());
+        snaps.insert(PathBuf::from("b"), "diff-b".into());
+        snaps.insert(PathBuf::from("c"), "diff-c".into());
+        assert_eq!(snaps.len(), 3);
+
+        snaps.insert(PathBuf::from("d"), "diff-d".into());
+        assert_eq!(snaps.len(), 3, "cap must hold after overflow");
+        assert!(
+            !snaps.contains_key(&PathBuf::from("a")),
+            "eldest entry must be evicted first"
+        );
+        assert!(snaps.contains_key(&PathBuf::from("d")));
+    }
+
+    #[test]
+    fn diff_snapshots_reinsert_refreshes_recency() {
+        // When handle_event_log re-inserts the snapshot for a path it
+        // already knows about, that path must move to the "most
+        // recently used" end so a subsequent overflow drops an older
+        // path instead.
+        let mut snaps = DiffSnapshots::with_cap(3);
+        snaps.insert(PathBuf::from("a"), "diff-a".into());
+        snaps.insert(PathBuf::from("b"), "diff-b".into());
+        snaps.insert(PathBuf::from("c"), "diff-c".into());
+
+        // Touch "a" so it is no longer the eldest.
+        snaps.insert(PathBuf::from("a"), "diff-a-updated".into());
+
+        snaps.insert(PathBuf::from("d"), "diff-d".into());
+        assert!(
+            snaps.contains_key(&PathBuf::from("a")),
+            "recently-touched entry must survive the next overflow"
+        );
+        assert!(
+            !snaps.contains_key(&PathBuf::from("b")),
+            "after touching a, b is now the eldest and must be dropped"
+        );
+        assert_eq!(
+            snaps.get(&PathBuf::from("a")),
+            Some(&"diff-a-updated".to_string()),
+            "re-insert must keep the newer value",
+        );
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -3092,6 +4375,7 @@ mod tests {
             deleted,
             content: DiffContent::Text(hunks),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 
@@ -3103,6 +4387,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Binary,
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 
@@ -3142,9 +4427,25 @@ mod tests {
             wrap_lines: false,
             watcher_health: WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
+            config: crate::config::KizuConfig::default(),
+            view_mode: ViewMode::default(),
+            saved_diff_scroll: 0,
+            saved_stream_scroll: 0,
+            stream_events: Vec::new(),
+            processed_event_paths: std::collections::HashSet::new(),
+            // Tests use small timestamps (1000, 2000, …) for events.
+            // Leave `session_start_ms` at 0 so the session-isolation
+            // filter in `handle_event_log` is a no-op by default;
+            // tests that exercise the filter set this field explicitly.
+            session_start_ms: 0,
+            bound_session_id: None,
+            diff_snapshots: DiffSnapshots::default(),
+            scar_undo_stack: Vec::new(),
+            scar_focus: None,
+            pinned_cursor_y: None,
         };
         app.files = files;
-        app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        app.files.sort_by_key(|a| a.mtime);
         app.build_layout();
         app.refresh_anchor();
         app
@@ -3262,17 +4563,10 @@ mod tests {
     }
 
     #[test]
-    fn follow_target_row_is_last_diff_row_of_newest_file() {
-        // ADR-0009 fix: follow must park on the **last content row**
-        // of the newest file, not on the newest hunk's header. With
-        // the old behaviour a tall last hunk would pin the viewport
-        // to the top of the hunk and hide the newest added/deleted
-        // lines — the opposite of what `tail -f`-style monitoring
-        // should do.
-        //
-        // newest.rs has the largest mtime → ends up at the bottom of
-        // the mtime-ascending layout. Its second hunk's DiffLine is
-        // the very last row; follow should land there.
+    fn follow_target_row_is_last_hunk_header_of_newest_file() {
+        // Follow mode should park on the **last hunk header** of
+        // the newest file so the user sees the most recent @@
+        // context and the diff body below it.
         let app = fake_app(vec![
             make_file(
                 "older.rs",
@@ -3289,35 +4583,30 @@ mod tests {
             ),
         ]);
         assert!(
-            matches!(app.layout.rows[app.scroll], RowKind::DiffLine { .. }),
-            "follow target must be an actual DiffLine row, got {:?}",
+            matches!(app.layout.rows[app.scroll], RowKind::HunkHeader { .. }),
+            "follow target must be a HunkHeader row, got {:?}",
             app.layout.rows[app.scroll]
         );
-        // The last DiffLine of the newest file is the target. Trailing
-        // Spacer rows are cosmetic padding and must be skipped by
-        // `follow_target_row`.
+        // Should be the LAST hunk header (hunk at line 20), not the first.
         let newest_idx = app.files.len() - 1;
-        let last_diff_in_newest = app
+        let last_hunk_header = app
             .layout
             .rows
             .iter()
             .enumerate()
             .rev()
             .find_map(|(i, r)| match r {
-                RowKind::DiffLine { file_idx, .. } if *file_idx == newest_idx => Some(i),
+                RowKind::HunkHeader { file_idx, .. } if *file_idx == newest_idx => Some(i),
                 _ => None,
             })
-            .expect("newest file must contain at least one DiffLine");
-        assert_eq!(app.scroll, last_diff_in_newest);
+            .expect("newest file must have a HunkHeader");
+        assert_eq!(app.scroll, last_hunk_header);
     }
 
     #[test]
-    fn follow_target_row_reveals_tail_of_tall_last_hunk() {
-        // Regression for Codex round-4 finding: under the old design
-        // a tall final hunk would pin follow to its header row, so
-        // the newest ~hunk_size - viewport lines of the edit were
-        // always off-screen. A 20-line hunk is the minimal reproducer:
-        // follow must park on the 20th DiffLine, not the hunk header.
+    fn follow_target_row_lands_on_hunk_header_even_for_tall_hunk() {
+        // Even with a 20-line hunk, follow parks on the hunk header
+        // so the user sees the @@ context and diff body from the top.
         let huge_hunk = hunk(
             1,
             (0..20)
@@ -3325,10 +4614,11 @@ mod tests {
                 .collect(),
         );
         let app = fake_app(vec![make_file("big.rs", vec![huge_hunk], 500)]);
-        assert!(matches!(
-            app.layout.rows[app.scroll],
-            RowKind::DiffLine { line_idx: 19, .. }
-        ));
+        assert!(
+            matches!(app.layout.rows[app.scroll], RowKind::HunkHeader { .. }),
+            "follow should land on HunkHeader, got {:?}",
+            app.layout.rows[app.scroll]
+        );
     }
 
     #[test]
@@ -3357,8 +4647,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_j_jumps_to_next_hunk_and_disables_follow() {
-        // After M4v.swap, lowercase `j` is hunk-forward.
+    fn handle_key_j_walks_changes_and_disables_follow() {
+        // Lowercase `j` is run-forward: from the file header it jumps
+        // to the first hunk's header (no hunk to look inside yet),
+        // then to the Added line within that hunk (the run), then to
+        // the next hunk. Repeatedly pressing `j` eventually crosses
+        // into the next hunk even without a "short hunk shortcut".
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![
@@ -3370,6 +4664,8 @@ mod tests {
         app.scroll_to(0);
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, app.layout.hunk_starts[0]);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, app.layout.hunk_starts[0] + 1, "walks to run");
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, app.layout.hunk_starts[1]);
         assert!(!app.follow_mode);
@@ -3428,24 +4724,25 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_j_in_long_hunk_scrolls_by_chunk() {
-        // Force a small body height so the chunk size is exactly 5 rows
-        // (15 / 3 = 5) — this way the test's expected scroll positions
-        // are fixed regardless of the DEFAULT_BODY_HEIGHT used outside
-        // of tests.
+    fn lowercase_j_in_long_run_chunk_scrolls_through_body() {
+        // Long run (20 Added lines, viewport = 15). `j` must not
+        // teleport past the run body — it chunk-scrolls through it so
+        // the user actually sees the change. Once the cursor reaches
+        // the run's last row, the next `j` hands off to the straight
+        // hunk-cross path (no trailing-context dwell).
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
         let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
-        assert_eq!(chunk, 5);
+        assert_eq!(chunk, 5, "viewport=15 → chunk=5");
         let (start, end) = app.layout.change_runs[0];
         let last = end - 1;
 
         app.scroll_to(start);
         app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.scroll, start + chunk);
+        assert_eq!(app.scroll, start + chunk, "first `j`: chunk forward");
 
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, start + 2 * chunk);
@@ -3453,7 +4750,11 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, start + 3 * chunk);
 
-        // Subsequent presses clamp at the last row of the run.
+        // Fourth press clamps to run_end - 1 (4 * 5 = 20 > 19 span).
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, last, "clamps to last row of run");
+
+        // Fifth press: at run end, no next run, no next hunk → stay put.
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, last);
     }
@@ -3488,28 +4789,229 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_k_in_long_hunk_walks_back_by_chunk() {
+    fn lowercase_k_in_long_run_chunk_scrolls_back_through_body() {
+        // Backward mirror of `lowercase_j_in_long_run_chunk_scrolls_through_body`.
+        // A 20-line run with viewport = 15 gives chunk = 5. `k` from
+        // the tail chunk-walks back until the cursor reaches the run
+        // start; subsequent `k` hands off to the prev-hunk pathway (no
+        // prev hunk here → stay put; no hunk-top dwell).
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
         let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
-        // Hunk spans header + 20 diff rows → [1, 22). viewport = 15 < 21,
-        // so `k` chunk-scrolls back clamped to the header row.
-        let hunk_top = app.layout.hunk_starts[0];
-        let last = 21;
+        let (run_start, run_end) = app.layout.change_runs[0];
+        let last = run_end - 1;
 
         app.scroll_to(last);
         app.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(app.scroll, last - chunk);
+        assert_eq!(app.scroll, last - chunk, "first `k`: chunk back");
 
-        // Continue back; scroll must stay within the hunk's row range,
-        // flooring at the hunk header.
         app.handle_key(key(KeyCode::Char('k')));
         app.handle_key(key(KeyCode::Char('k')));
         app.handle_key(key(KeyCode::Char('k')));
-        assert!(app.scroll >= hunk_top);
+        assert_eq!(
+            app.scroll, run_start,
+            "keeps chunking back; magnet snaps to run_start once it's in range"
+        );
+
+        // From run_start, `k` continues chunking back toward the hunk
+        // header (no magnet hit, no current-run re-snap).
+        // At run_start: no more runs in this hunk and no prev hunk →
+        // `prev_hunk_last_run_start` is a no-op, cursor stays put.
+        // (No chunk through the hunk header — that would be stopping
+        // on a non-reviewable row.)
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.scroll, run_start, "no prev hunk → stay put");
+    }
+
+    #[test]
+    fn lowercase_j_teleports_between_runs_never_landing_on_context() {
+        // Hunk with three separate change runs. `j` teleports straight
+        // from run to run — never parks the cursor on an intermediate
+        // Context row. ScrollAnim (not tested here) supplies the
+        // visual "gradual" feel via its 150ms tween.
+        let lines: Vec<DiffLine> = vec![
+            diff_line(LineKind::Added, "r1-a1"),   // run 1 start
+            diff_line(LineKind::Deleted, "r1-d1"), // still run 1
+            diff_line(LineKind::Context, "ctx1"),
+            diff_line(LineKind::Added, "r2-a1"), // run 2 start
+            diff_line(LineKind::Context, "ctx2"),
+            diff_line(LineKind::Context, "ctx3"),
+            diff_line(LineKind::Context, "ctx4"),
+            diff_line(LineKind::Context, "ctx5"),
+            diff_line(LineKind::Context, "ctx6"),
+            diff_line(LineKind::Context, "ctx7"),
+            diff_line(LineKind::Context, "ctx8"),
+            diff_line(LineKind::Context, "ctx9"),
+            diff_line(LineKind::Context, "ctx10"),
+            diff_line(LineKind::Added, "r3-a1"), // run 3 start
+            diff_line(LineKind::Context, "ctx11"),
+        ];
+        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        app.last_body_height.set(10);
+        let runs: Vec<_> = app.layout.change_runs.clone();
+        assert_eq!(runs.len(), 3);
+        let hunk_top = app.layout.hunk_starts[0];
+
+        app.scroll_to(hunk_top);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[0].0, "1st `j`: run 1 start");
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[1].0, "2nd `j`: run 2 start");
+
+        // Run 3 is 10 rows past run 2; `j` still teleports straight to
+        // it, skipping all intervening Context rows.
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.scroll, runs[2].0,
+            "3rd `j`: teleports across context directly to run 3"
+        );
+    }
+
+    #[test]
+    fn lowercase_j_walks_runs_even_in_short_hunk() {
+        // Even when the whole hunk fits on screen (viewport = 40, hunk
+        // is ~4 rows), `j` still walks change runs — short hunks have
+        // no special skip. This keeps the press count consistent with
+        // what the user sees needs reviewing: 2 runs = 2 landings, not
+        // "the hunk's small so let's just skip".
+        let mut app = fake_app(vec![
+            make_file(
+                "a.rs",
+                vec![hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Added, "a1"),
+                        diff_line(LineKind::Context, "c1"),
+                        diff_line(LineKind::Added, "a2"),
+                    ],
+                )],
+                100,
+            ),
+            make_file(
+                "b.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "b1")])],
+                200,
+            ),
+        ]);
+        app.last_body_height.set(40);
+        let runs = app.layout.change_runs.clone();
+        let second_hunk_top = app.layout.hunk_starts[1];
+
+        app.scroll_to(app.layout.hunk_starts[0]);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[0].0, "1st `j`: run 1 start");
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[1].0, "2nd `j`: run 2 start (same hunk)");
+
+        // 3rd press: no more runs in hunk a → crosses to hunk b's
+        // header. The run inside hunk b is reached on the 4th press.
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, second_hunk_top, "3rd `j`: next hunk header");
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[2].0, "4th `j`: run in hunk 2");
+    }
+
+    #[test]
+    fn lowercase_k_at_hunk_top_lands_on_prev_hunk_last_run_start() {
+        // `k` at the second hunk's header must jump into the previous
+        // hunk — landing on the **start of its last change run**, not
+        // its literal last row. In this fixture the first hunk's 3
+        // Added lines form a single run; the run's start is the first
+        // Added line ("a1"), so that's the landing.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Added, "a1"),
+                        diff_line(LineKind::Added, "a2"),
+                        diff_line(LineKind::Added, "a3"),
+                    ],
+                ),
+                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
+            ],
+            100,
+        )]);
+        let second_hunk_top = app.layout.hunk_starts[1];
+        // First hunk's sole run: its start row.
+        let (first_hunk_last_run_start, _) = app.layout.change_runs[0];
+
+        app.scroll_to(second_hunk_top);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.scroll, first_hunk_last_run_start,
+            "`k` crosses into prev hunk and lands on its last run's start"
+        );
+    }
+
+    #[test]
+    fn lowercase_k_skips_prev_hunk_trailing_context() {
+        // Prev hunk has a run followed by trailing context rows.
+        // Backward `k` must land on the RUN start, skipping the
+        // context that trails it — landing on the literal last row
+        // would park the cursor on unchanged code.
+        let mut lines_a: Vec<DiffLine> = vec![diff_line(LineKind::Added, "change")];
+        for _ in 0..5 {
+            lines_a.push(diff_line(LineKind::Context, "tail"));
+        }
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, lines_a),
+                hunk(20, vec![diff_line(LineKind::Added, "b1")]),
+            ],
+            100,
+        )]);
+        let second_hunk_top = app.layout.hunk_starts[1];
+        // First hunk's sole run's start (the Added "change" row).
+        let (first_run_start, _) = app.layout.change_runs[0];
+
+        app.scroll_to(second_hunk_top);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.scroll, first_run_start,
+            "`k` skips trailing context and lands on the run's start"
+        );
+    }
+
+    #[test]
+    fn lowercase_j_skips_trailing_context_and_crosses_to_next_hunk() {
+        // Hunk with a single change run followed by trailing context.
+        // `j` from the run's sole row crosses straight into the next
+        // hunk (ScrollAnim tweens the motion) — never stops on any of
+        // the Context rows between.
+        let mut lines: Vec<DiffLine> = vec![];
+        for _ in 0..4 {
+            lines.push(diff_line(LineKind::Context, "lead"));
+        }
+        lines.push(diff_line(LineKind::Added, "change"));
+        for _ in 0..4 {
+            lines.push(diff_line(LineKind::Context, "trail"));
+        }
+        let mut app = fake_app(vec![
+            make_file("a.rs", vec![hunk(1, lines)], 100),
+            make_file(
+                "b.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                200,
+            ),
+        ]);
+        app.last_body_height.set(10);
+        let (run_start, _) = app.layout.change_runs[0];
+
+        app.scroll_to(run_start);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.scroll, app.layout.hunk_starts[1],
+            "`j` skips trailing context and crosses directly to next hunk header"
+        );
     }
 
     #[test]
@@ -4025,26 +5527,11 @@ mod tests {
         assert!(!app.follow_mode);
         app.handle_key(key(KeyCode::Char('f')));
         assert!(app.follow_mode);
-        // ADR-0009 fix: follow target = last **DiffLine** of the
-        // newest file's last hunk, not the hunk header. This is the
-        // row that actually shows the newest edit.
+        // Follow target = last HunkHeader of the newest file.
         assert!(matches!(
             app.layout.rows[app.scroll],
-            RowKind::DiffLine { .. }
+            RowKind::HunkHeader { .. }
         ));
-        let newest = app.files.len() - 1;
-        let last_diff = app
-            .layout
-            .rows
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, r)| match r {
-                RowKind::DiffLine { file_idx, .. } if *file_idx == newest => Some(i),
-                _ => None,
-            })
-            .expect("newest file has a DiffLine");
-        assert_eq!(app.scroll, last_diff);
     }
 
     #[test]
@@ -4244,6 +5731,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "hi2")])]),
             mtime: SystemTime::UNIX_EPOCH,
+            header_prefix: None,
         };
         let gone = FileDiff {
             path: PathBuf::from("gone.rs"),
@@ -4252,6 +5740,7 @@ mod tests {
             deleted: 1,
             content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Deleted, "bye")])]),
             mtime: SystemTime::UNIX_EPOCH,
+            header_prefix: None,
         };
 
         let app = App::bootstrap_with_diff(
@@ -4434,6 +5923,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "fresh")])]),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(500),
+            header_prefix: None,
         };
         let new_sha = "feedfacefeedfacefeedfacefeedfacefeedface".to_string();
         // Same branch as the existing fake_app default — a successful
@@ -4525,6 +6015,48 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_with_diff_reads_expected_session_id_from_env() {
+        // First-writer-wins binding can silently attach the TUI to
+        // the wrong agent when a second agent in the same repo fires
+        // faster than the one the user is attached to. Pre-binding
+        // the expected `session_id` at bootstrap (here via the
+        // `KIZU_SESSION_ID` environment variable) closes that
+        // window. Once bound, `handle_event_log` drops events from
+        // any other session instead of auto-binding to the first
+        // arrival.
+        //
+        // Serialized via a static Mutex so cargo's parallel runner
+        // doesn't interleave `set_var` / `remove_var` with other
+        // env-touching tests in this file.
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe { std::env::set_var("KIZU_SESSION_ID", "agent-xyz") };
+        let diff = Ok(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
+            100,
+        )]);
+        let app = App::bootstrap_with_diff(
+            PathBuf::from("/tmp/fake"),
+            PathBuf::from("/tmp/fake/.git"),
+            PathBuf::from("/tmp/fake/.git"),
+            Some("refs/heads/main".into()),
+            "abcdef1234567890abcdef1234567890abcdef12".into(),
+            diff,
+        )
+        .expect("bootstrap must succeed");
+        unsafe { std::env::remove_var("KIZU_SESSION_ID") };
+
+        assert_eq!(
+            app.bound_session_id,
+            Some("agent-xyz".to_string()),
+            "bootstrap must pre-bind the TUI to the env-provided session_id"
+        );
+    }
+
+    #[test]
     fn picker_enter_disables_follow_mode_so_selection_survives_recompute() {
         // bootstrap lands in follow mode. A picker selection is an
         // explicit manual navigation — the next recompute must not yank
@@ -4565,7 +6097,7 @@ mod tests {
             ],
             400,
         );
-        app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        app.files.sort_by_key(|a| a.mtime);
         app.build_layout();
         app.refresh_anchor();
 
@@ -4662,7 +6194,7 @@ mod tests {
             vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
             50, // older than b.rs
         ));
-        app.files.sort_by(|x, y| x.mtime.cmp(&y.mtime));
+        app.files.sort_by_key(|x| x.mtime);
         app.build_layout();
         app.refresh_anchor();
 
@@ -4753,6 +6285,163 @@ mod tests {
         assert_eq!(
             hunk_idx, 1,
             "manual fallback should stay near the previously viewed hunk, not jump to the file's first hunk"
+        );
+    }
+
+    #[test]
+    fn apply_computed_files_pins_cursor_screen_row_across_reorder() {
+        // Scenario: user is parked on a hunk in b.rs. A watcher-driven
+        // recompute fires because b.rs was edited, bumping its mtime so
+        // it now sorts to the end of the ascending list. Without the
+        // pin, `refresh_anchor` follows the hunk to its new row index,
+        // which slides the viewport — jarring when the user was only
+        // reviewing that one change.
+        //
+        // Expected: cursor continues to point at the same hunk identity
+        // AND the viewport top shifts so the cursor lands at the same
+        // screen row as before the recompute.
+        let mut body_lines = Vec::new();
+        for i in 0..30 {
+            body_lines.push(diff_line(LineKind::Context, &format!("ctx {i}")));
+        }
+        body_lines.push(diff_line(LineKind::Added, "y"));
+        let mut app = fake_app(vec![
+            make_file(
+                "a.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                200,
+            ),
+            make_file("b.rs", vec![hunk(42, body_lines.clone())], 100),
+        ]);
+
+        // fake_app sorts ascending by mtime, so a.rs (200) is at the
+        // bottom and b.rs (100) is at the top. Park on b.rs's only
+        // hunk and pin the app into manual mode.
+        let b = file_idx(&app, "b.rs");
+        app.jump_to_file_first_hunk(b);
+        app.follow_mode = false;
+        app.update_anchor_from_scroll();
+
+        // Skip populate_mtimes / sort in apply_computed_files so the
+        // test controls the post-recompute order deterministically.
+        app.view_mode = ViewMode::Stream;
+
+        // Simulate one render cycle: pick a viewport height, let the
+        // renderer resolve viewport_top, and stash that top as
+        // visual_top (the Cell the renderer updates every frame).
+        let body_height = 24;
+        app.last_body_height.set(body_height);
+        let initial_top = app.viewport_top(body_height);
+        app.visual_top.set(initial_top as f32);
+        let initial_screen_row = app
+            .scroll
+            .checked_sub(initial_top)
+            .expect("cursor above viewport_top — test setup wrong");
+
+        // Fresh file set: same two files, but b.rs has been edited
+        // and its mtime bumped past a.rs's, so its position in the
+        // layout moves from first to last.
+        let fresh = vec![
+            make_file(
+                "a.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                200,
+            ),
+            make_file("b.rs", vec![hunk(42, body_lines.clone())], 400),
+        ];
+        app.apply_computed_files(fresh);
+
+        // Anchor still points at the same hunk in b.rs.
+        assert_eq!(app.current_file_path(), Some(Path::new("b.rs")));
+
+        // Viewport top is chosen so the cursor lands at the same
+        // screen row it was on before the recompute — the hallmark
+        // of the pin.
+        let new_top = app.viewport_top(body_height);
+        let new_screen_row = app
+            .scroll
+            .checked_sub(new_top)
+            .expect("cursor above viewport_top after recompute");
+        assert_eq!(
+            new_screen_row, initial_screen_row,
+            "cursor must stay at the same screen row across a \
+             reorder-driven apply_computed_files"
+        );
+    }
+
+    #[test]
+    fn scar_line_edited_away_does_not_snap_cursor_to_hunk_header() {
+        // Reproduces the user-reported bug: user inserts a scar, then
+        // edits the scar away (or shifts it). The watcher-driven
+        // recompute should leave the cursor on a DiffLine near the
+        // scar's position, not on the hunk's `@@` header row.
+        //
+        // Current chain:
+        //   - refresh_anchor maps anchor → HunkHeader row
+        //   - scar_focus's `find_new_file_line_row` returns None because
+        //     the scar line is gone → scar_focus cleared
+        //   - pin preserves screen row, but the LOGICAL cursor is still
+        //     on HunkHeader (placed by refresh_anchor)
+        // Expected: cursor lands on a DiffLine at (or near) the
+        // pre-edit new-file line.
+        let pre_edit_body = vec![
+            diff_line(LineKind::Added, "line one"),
+            diff_line(LineKind::Added, "scar target"),
+            diff_line(LineKind::Added, "line three"),
+        ];
+        let mut app = fake_app(vec![make_file("b.rs", vec![hunk(1, pre_edit_body)], 100)]);
+
+        // Park cursor on the "scar target" DiffLine (hunk_idx=0,
+        // line_idx=1) and pretend a scar was just inserted there —
+        // scar_focus points at new-file line 2.
+        let scar_target_row = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::DiffLine {
+                        file_idx: 0,
+                        hunk_idx: 0,
+                        line_idx: 1,
+                    },
+                )
+            })
+            .expect("scar target DiffLine row must exist");
+        app.scroll_to(scar_target_row);
+        app.follow_mode = false;
+        let abs = app.root.join("b.rs");
+        app.scar_focus = Some((abs, 2));
+
+        // Prime visual_top as a render would.
+        let body_height = 20;
+        app.last_body_height.set(body_height);
+        let initial_top = app.viewport_top(body_height);
+        app.visual_top.set(initial_top as f32);
+
+        // Edit: scar target is removed. The hunk now has only two
+        // lines. find_new_file_line_row(path, 2) will still find a
+        // line ("line three" at new-line 2) OR the hunk may have
+        // shrunk — depends on the edit. To reliably reproduce the
+        // "line gone" branch we cut the hunk down to one line so
+        // new-line 2 is past the end.
+        let edited_body = vec![diff_line(LineKind::Added, "line one")];
+        let fresh = vec![make_file("b.rs", vec![hunk(1, edited_body)], 100)];
+        app.view_mode = ViewMode::Stream;
+        app.apply_computed_files(fresh);
+
+        // The bug: cursor on HunkHeader row after the recompute.
+        let landed = app
+            .layout
+            .rows
+            .get(app.scroll)
+            .cloned()
+            .expect("cursor on some row");
+        assert!(
+            !matches!(landed, RowKind::HunkHeader { .. }),
+            "cursor must not land on a @@ HunkHeader after the scar line is edited away; \
+             landed on {landed:?}"
         );
     }
 
@@ -5467,7 +7156,7 @@ mod tests {
 
         let after = std::fs::read_to_string(tmp.path().join("auth.py")).expect("read back");
         assert_eq!(
-            after, "def main():\n# @kizu[reject]: revert this change\n    return 1\n",
+            after, "def main():\n    # @kizu[reject]: revert this change\n    return 1\n",
             "`r` key must insert the canned reject scar using python # syntax",
         );
     }
@@ -5847,6 +7536,32 @@ mod tests {
             "line 1 (fn two) should have added bg"
         );
         assert!(!fv.line_bg.contains_key(&0), "line 0 is context — no bg");
+    }
+
+    #[test]
+    fn enter_file_view_starts_at_cursor_not_hunk_header() {
+        // Context + two added lines. The diff surfaces all 3 as
+        // DiffLine rows: [Context "fn one", Added "fn two", Added
+        // "fn three"] with `hunk.new_start = 1`. Parking the cursor
+        // on the 3rd DiffLine (Added "fn three" → new-file line 3)
+        // must take file view to 0-indexed line 2, NOT to 0 (the old
+        // behavior which snapped to `hunk.new_start - 1`).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 2);
+
+        app.handle_key(key(KeyCode::Enter));
+
+        let fv = app.file_view.as_ref().expect("file view opened");
+        assert_eq!(
+            fv.cursor, 2,
+            "file view cursor must track the diff cursor's new-file line (was snapping to hunk.new_start - 1 = 0)",
+        );
     }
 
     #[test]
@@ -6691,6 +8406,1075 @@ mod tests {
         assert_eq!(
             after, "a\n// @kizu[ask]: explain this change\nd\n",
             "scar on all-deleted hunk must land at the deletion gap"
+        );
+    }
+
+    // ---- scar undo stack ----
+
+    #[test]
+    fn insert_canned_scar_pushes_entry_to_undo_stack() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn a() {}\nfn b() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn b() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+
+        assert_eq!(app.scar_undo_stack.len(), 1);
+        let entry = &app.scar_undo_stack[0];
+        assert_eq!(entry.line_1indexed, 2);
+        assert_eq!(entry.rendered, "// @kizu[ask]: explain this change");
+        assert_eq!(entry.path, tmp.path().join("src/main.rs"));
+    }
+
+    #[test]
+    fn idempotent_scar_reinsert_does_not_grow_undo_stack() {
+        // Pre-seed the file with the same scar one line above the
+        // intended target. `insert_scar` sees the duplicate and
+        // returns `None`, so the undo stack must stay empty (no
+        // phantom entry that would otherwise cause `u` to "undo" a
+        // write that never happened).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn a() {}\n// @kizu[ask]: explain this change\nfn b() {}\n",
+            1,
+            vec![diff_line(LineKind::Context, "fn a() {}")],
+        );
+        // Use file-view mode to target line 3 (where `fn b` lives)
+        // deterministically — the line above is the pre-existing scar.
+        app.file_view = Some(FileViewState {
+            path: PathBuf::from("src/main.rs"),
+            return_scroll: 0,
+            lines: vec![
+                "fn a() {}".into(),
+                "// @kizu[ask]: explain this change".into(),
+                "fn b() {}".into(),
+            ],
+            line_bg: std::collections::HashMap::new(),
+            cursor: 2, // 0-indexed → 1-indexed line 3
+            scroll_top: 0,
+            anim: None,
+            visual_top: 0.0,
+        });
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        assert!(
+            app.scar_undo_stack.is_empty(),
+            "no-op insert must not push an undo entry"
+        );
+    }
+
+    #[test]
+    fn undo_scar_on_empty_stack_is_noop() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn a() {}\n",
+            1,
+            vec![diff_line(LineKind::Context, "fn a() {}")],
+        );
+        app.undo_scar();
+        assert!(app.last_error.is_none(), "empty undo must not error");
+    }
+
+    #[test]
+    fn undo_scar_removes_the_last_inserted_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let abs = tmp.path().join("src/main.rs");
+        let before = "fn a() {}\nfn b() {}\n".to_string();
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            &before,
+            2,
+            vec![diff_line(LineKind::Added, "fn b() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        let inserted = std::fs::read_to_string(&abs).expect("read after insert");
+        assert_ne!(inserted, before);
+
+        app.undo_scar();
+
+        let after_undo = std::fs::read_to_string(&abs).expect("read after undo");
+        assert_eq!(after_undo, before, "undo must restore the original file");
+        assert!(app.scar_undo_stack.is_empty());
+    }
+
+    #[test]
+    fn undo_scar_mismatch_surfaces_on_last_error_and_pops_stack() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let abs = tmp.path().join("src/main.rs");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn a() {}\nfn b() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn b() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        // User edits the scar line between insert and undo.
+        std::fs::write(&abs, "fn a() {}\n// @kizu[ask]: USER EDIT\nfn b() {}\n").expect("rewrite");
+
+        app.undo_scar();
+
+        assert!(
+            app.last_error
+                .as_deref()
+                .map(|s| s.contains("edited"))
+                .unwrap_or(false),
+            "mismatched undo must set a last_error with 'edited', got {:?}",
+            app.last_error,
+        );
+        assert!(app.scar_undo_stack.is_empty(), "entry must still pop");
+    }
+
+    #[test]
+    fn undo_unwinds_multiple_inserts_in_reverse_order() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let abs = tmp.path().join("src/main.rs");
+        let before = "fn a() {}\nfn b() {}\nfn c() {}\n".to_string();
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            &before,
+            2,
+            vec![diff_line(LineKind::Added, "fn b() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        // First insertion above line 2.
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        // Reuse the diff view layout — second insertion at same logical
+        // position now lands above what shifted to line 3 (the scar
+        // occupies line 2).
+        app.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+        assert_eq!(app.scar_undo_stack.len(), 2);
+
+        // LIFO: the second scar must come off first.
+        app.undo_scar();
+        app.undo_scar();
+
+        let after = std::fs::read_to_string(&abs).expect("read back");
+        assert_eq!(after, before, "two undos must fully restore the file");
+        assert!(app.scar_undo_stack.is_empty());
+    }
+
+    #[test]
+    fn file_view_scar_target_line_is_cursor_plus_one() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "line1\nline2\nline3\n",
+            1,
+            vec![diff_line(LineKind::Added, "line1")],
+        );
+        // Fake a file-view state directly (bypassing open_file_view's
+        // hunk-centering logic). `cursor: 1` is 0-indexed → scar
+        // targets 1-indexed line 2.
+        app.file_view = Some(FileViewState {
+            path: PathBuf::from("src/main.rs"),
+            return_scroll: 0,
+            lines: vec!["line1".into(), "line2".into(), "line3".into()],
+            line_bg: std::collections::HashMap::new(),
+            cursor: 1,
+            scroll_top: 0,
+            anim: None,
+            visual_top: 0.0,
+        });
+        let (path, line) = app.scar_target_line().expect("target");
+        assert_eq!(line, 2);
+        assert_eq!(path, tmp.path().join("src/main.rs"));
+    }
+
+    #[test]
+    fn file_view_a_key_inserts_scar_at_cursor_line_and_u_undoes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let abs = tmp.path().join("src/main.rs");
+        let before = "line1\nline2\nline3\n".to_string();
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            &before,
+            1,
+            vec![diff_line(LineKind::Added, "line1")],
+        );
+        // Enter file view programmatically (don't rely on the Enter
+        // key, which requires the diff layout to have a hunk under
+        // the cursor).
+        app.file_view = Some(FileViewState {
+            path: PathBuf::from("src/main.rs"),
+            return_scroll: 0,
+            lines: vec!["line1".into(), "line2".into(), "line3".into()],
+            line_bg: std::collections::HashMap::new(),
+            cursor: 1,
+            scroll_top: 0,
+            anim: None,
+            visual_top: 0.0,
+        });
+
+        // `a` in file view must route to insert_canned_scar via
+        // handle_file_view_key.
+        app.handle_key(key(KeyCode::Char('a')));
+        let inserted = std::fs::read_to_string(&abs).expect("read after insert");
+        assert_eq!(
+            inserted, "line1\n// @kizu[ask]: explain this change\nline2\nline3\n",
+            "`a` in file view must scar above the cursor's 1-indexed line"
+        );
+        assert_eq!(app.scar_undo_stack.len(), 1);
+
+        // `u` in file view reverses that one write.
+        app.handle_key(key(KeyCode::Char('u')));
+        let undone = std::fs::read_to_string(&abs).expect("read after undo");
+        assert_eq!(undone, before, "`u` in file view must undo the scar");
+        assert!(app.scar_undo_stack.is_empty());
+    }
+
+    #[test]
+    fn scar_focus_sticks_across_subsequent_recomputes() {
+        // Regression: the watcher fires a second `recompute_diff` ~300ms
+        // after the scar write, which used to yank the cursor back to
+        // the hunk header via `refresh_anchor`. A sticky `scar_focus`
+        // pin should survive both that second recompute and any further
+        // ones until the user explicitly navigates.
+        let mut app = fake_app(vec![make_file(
+            "src/main.rs",
+            vec![hunk(
+                2,
+                vec![
+                    diff_line(LineKind::Added, "// @kizu[ask]: explain this change"),
+                    diff_line(LineKind::Added, "fn two() {}"),
+                ],
+            )],
+            100,
+        )]);
+        app.scar_focus = Some((PathBuf::from("/tmp/fake/src/main.rs"), 2));
+        // Directly drive `apply_computed_files` with the same file
+        // set — simulates a watcher tick that re-delivers the diff.
+        // The sticky focus must push the scroll to the scar row (line
+        // 2 = the Added "// @kizu[ask]..." line), not the hunk header.
+        let files_snapshot = app.files.clone();
+        app.apply_computed_files(files_snapshot.clone());
+        let scroll_after_first = app.scroll;
+        assert!(
+            matches!(
+                app.layout.rows[scroll_after_first],
+                RowKind::DiffLine { .. }
+            ),
+            "first recompute must land on a DiffLine, not a header"
+        );
+        // Second apply (another watcher tick): focus still sticks.
+        app.apply_computed_files(files_snapshot);
+        assert_eq!(
+            app.scroll, scroll_after_first,
+            "repeated recomputes must keep the cursor on the scar line"
+        );
+        assert!(app.scar_focus.is_some(), "focus persists until user nav");
+    }
+
+    #[test]
+    fn scar_focus_cleared_by_navigation_keys() {
+        // After any user navigation in normal mode, the sticky focus
+        // pin is released so subsequent recomputes follow normal
+        // anchoring rules (the user has explicitly moved elsewhere).
+        let mut app = fake_app(vec![make_file(
+            "src/main.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
+            100,
+        )]);
+        app.scar_focus = Some((PathBuf::from("/tmp/fake/src/main.rs"), 1));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert!(
+            app.scar_focus.is_none(),
+            "j must clear scar_focus so the next recompute doesn't pull the cursor back"
+        );
+    }
+
+    // ---- stream mode tests ----
+
+    fn make_stream_event(tool: &str, path: &str, diff: Option<&str>, ts: u64) -> StreamEvent {
+        let mut per_file = std::collections::BTreeMap::new();
+        if let Some(d) = diff {
+            per_file.insert(PathBuf::from(path), d.to_string());
+        }
+        StreamEvent {
+            metadata: crate::hook::SanitizedEvent {
+                session_id: None,
+                hook_event_name: "PostToolUse".into(),
+                tool_name: Some(tool.into()),
+                file_paths: vec![PathBuf::from(path)],
+                cwd: PathBuf::from("/tmp"),
+                timestamp_ms: ts,
+            },
+            per_file_diffs: per_file,
+        }
+    }
+
+    #[test]
+    fn handle_event_log_skips_files_outside_project_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = fake_app(vec![]);
+        app.root = tmp.path().to_path_buf();
+
+        // Write an event file whose file_path is outside the project root.
+        let events_dir = tmp.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![PathBuf::from("/home/user/.config/kizu/config.toml")],
+            cwd: tmp.path().to_path_buf(),
+            timestamp_ms: 1000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let event_path = events_dir.join("1000-Write.json");
+        std::fs::write(&event_path, &json).unwrap();
+
+        app.handle_event_log(event_path);
+        assert!(
+            app.stream_events.is_empty(),
+            "events for files outside project root should be ignored"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_accepts_files_inside_project_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = fake_app(vec![]);
+        app.root = tmp.path().to_path_buf();
+
+        let events_dir = tmp.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![tmp.path().join("src/main.rs")],
+            cwd: tmp.path().to_path_buf(),
+            timestamp_ms: 2000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let event_path = events_dir.join("2000-Write.json");
+        std::fs::write(&event_path, &json).unwrap();
+
+        app.handle_event_log(event_path);
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "events for files inside project root should be accepted"
+        );
+    }
+
+    #[test]
+    fn build_stream_files_converts_events_to_file_diffs() {
+        let events = vec![
+            make_stream_event(
+                "Write",
+                "src/auth.rs",
+                Some("+fn verify() {}\n+  ok\n"),
+                1700000000000,
+            ),
+            make_stream_event("Edit", "src/main.rs", Some("+use auth;\n"), 1700000001000),
+        ];
+        let files = build_stream_files(&events);
+        assert_eq!(files.len(), 2);
+        // First event
+        assert_eq!(files[0].path, PathBuf::from("src/auth.rs"));
+        assert_eq!(files[0].added, 2);
+        assert!(files[0].header_prefix.as_ref().unwrap().contains("Write"));
+        // Second event
+        assert_eq!(files[1].path, PathBuf::from("src/main.rs"));
+        assert_eq!(files[1].added, 1);
+        assert!(files[1].header_prefix.as_ref().unwrap().contains("Edit"));
+    }
+
+    #[test]
+    fn build_stream_files_empty_diff_produces_empty_hunk() {
+        let events = vec![make_stream_event("Write", "a.rs", None, 1000)];
+        let files = build_stream_files(&events);
+        assert_eq!(files.len(), 1);
+        match &files[0].content {
+            DiffContent::Text(hunks) => assert!(hunks.is_empty()),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn build_stream_files_produces_one_entry_per_path_for_multi_file_event() {
+        // A single MultiEdit / multi-file Write touches several paths.
+        // Every path must get its own FileDiff so the stream view does
+        // not collapse secondary files onto the first path's header.
+        let mut per_file = std::collections::BTreeMap::new();
+        per_file.insert(
+            PathBuf::from("src/a.rs"),
+            "diff --git a/src/a.rs b/src/a.rs\n@@ -0,0 +1,1 @@\n+a\n".to_string(),
+        );
+        per_file.insert(
+            PathBuf::from("src/b.rs"),
+            "diff --git a/src/b.rs b/src/b.rs\n@@ -0,0 +1,1 @@\n+b\n".to_string(),
+        );
+        let events = vec![StreamEvent {
+            metadata: crate::hook::SanitizedEvent {
+                session_id: None,
+                hook_event_name: "PostToolUse".into(),
+                tool_name: Some("MultiEdit".into()),
+                file_paths: vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")],
+                cwd: PathBuf::from("/tmp"),
+                timestamp_ms: 1_700_000_000_000,
+            },
+            per_file_diffs: per_file,
+        }];
+        let files = build_stream_files(&events);
+        assert_eq!(files.len(), 2, "one FileDiff per touched path");
+        let paths: Vec<&PathBuf> = files.iter().map(|f| &f.path).collect();
+        assert!(paths.contains(&&PathBuf::from("src/a.rs")));
+        assert!(paths.contains(&&PathBuf::from("src/b.rs")));
+        // Each must carry a non-empty hunk (their own `+` line).
+        for f in &files {
+            match &f.content {
+                DiffContent::Text(hunks) => {
+                    assert!(
+                        !hunks.is_empty(),
+                        "per-path FileDiff must have its own hunk, got empty for {:?}",
+                        f.path
+                    );
+                }
+                _ => panic!("expected Text content"),
+            }
+        }
+    }
+
+    #[test]
+    fn toggle_view_mode_switches_between_diff_and_stream() {
+        let mut app = fake_app(vec![]);
+        assert_eq!(app.view_mode, ViewMode::Diff);
+        app.toggle_view_mode();
+        assert_eq!(app.view_mode, ViewMode::Stream);
+        app.toggle_view_mode();
+        assert_eq!(app.view_mode, ViewMode::Diff);
+    }
+
+    #[test]
+    fn tab_key_toggles_view_mode() {
+        let mut app = fake_app(vec![]);
+        assert_eq!(app.view_mode, ViewMode::Diff);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.view_mode, ViewMode::Stream);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.view_mode, ViewMode::Diff);
+    }
+
+    #[test]
+    fn compute_operation_diff_returns_new_lines_only() {
+        let prev = "+added line 1\n context\n";
+        let curr = "+added line 1\n+added line 2\n context\n";
+        let op = super::compute_operation_diff(prev, curr);
+        assert_eq!(op, "+added line 2\n");
+    }
+
+    #[test]
+    fn compute_operation_diff_empty_when_identical() {
+        let prev = "+line 1\n+line 2\n";
+        let op = super::compute_operation_diff(prev, prev);
+        assert!(op.is_empty());
+    }
+
+    #[test]
+    fn compute_operation_diff_preserves_duplicate_added_lines() {
+        // Edit adds another identical `}` line on top of an already-added `}`.
+        // A set-based diff would drop this because `+}` is already in prev;
+        // a multiset/count-based diff must preserve the second copy.
+        let prev = "+fn a() {}\n+}\n";
+        let curr = "+fn a() {}\n+}\n+}\n";
+        let op = super::compute_operation_diff(prev, curr);
+        assert_eq!(op, "+}\n", "second duplicate added line must survive");
+    }
+
+    #[test]
+    fn compute_operation_diff_preserves_duplicate_blank_lines() {
+        // Many real edits add blank lines. prev already has one blank,
+        // curr has two. The NEW blank line must appear in op_diff.
+        let prev = "+foo\n+\n bar\n";
+        let curr = "+foo\n+\n+\n bar\n";
+        let op = super::compute_operation_diff(prev, curr);
+        assert_eq!(op, "+\n", "second blank-line addition must survive");
+    }
+
+    #[test]
+    fn apply_reset_clears_stale_diff_snapshots() {
+        // Previously, `R` would rewrite `baseline_sha` + `files` but
+        // leave `diff_snapshots` pinned to the OLD baseline. The next
+        // hook-log-event for a file in the map would then compute
+        // op_diff against an outdated snapshot — semantic garbage.
+        // The fix: clear the map on every successful reset so the
+        // next event rebuilds from the new baseline.
+        let mut app = fake_app(vec![]);
+        app.diff_snapshots
+            .insert(PathBuf::from("stale.rs"), "OLD\n".to_string());
+        assert!(!app.diff_snapshots.is_empty());
+
+        // Simulate a successful reset to a new baseline + branch.
+        let effect = app.apply_reset(
+            "new-sha-xxx".to_string(),
+            Some("refs/heads/main".to_string()),
+            Ok(Vec::new()),
+        );
+        assert_eq!(effect, super::KeyEffect::None);
+        assert!(
+            app.diff_snapshots.is_empty(),
+            "stale diff snapshots must be dropped after a baseline reset"
+        );
+    }
+
+    #[test]
+    fn apply_reset_failure_preserves_diff_snapshots() {
+        // If the reset transaction fails (new SHA unresolvable, etc.)
+        // the app keeps showing the old diff — and must therefore
+        // keep the snapshots that were valid against the OLD baseline,
+        // otherwise the very next event would misattribute lines.
+        let mut app = fake_app(vec![]);
+        app.diff_snapshots
+            .insert(PathBuf::from("keep.rs"), "content\n".to_string());
+
+        let effect = app.apply_reset("new-sha".to_string(), None, Err(anyhow::anyhow!("boom")));
+        assert_eq!(effect, super::KeyEffect::None);
+        assert_eq!(
+            app.diff_snapshots.get(&PathBuf::from("keep.rs")),
+            Some(&"content\n".to_string()),
+            "failed reset must not touch snapshot state",
+        );
+    }
+
+    #[test]
+    fn handle_event_log_accepts_path_with_symlink_variant() {
+        // On macOS `/tmp` is a symlink to `/private/tmp` (and similarly
+        // `/var/folders` → `/private/var/folders`). `git rev-parse
+        // --show-toplevel` canonicalizes, so `app.root` ends up on the
+        // `/private/...` side. But an agent hook that records the
+        // current working directory may still write file_paths on the
+        // symlinked side. A naive `starts_with` comparison silently
+        // drops those events — which is exactly what the e2e stream
+        // tests hit on macOS runners. `handle_event_log` must
+        // canonicalize before matching so symlink-variant paths are
+        // accepted.
+        let tmp = tempfile::tempdir().unwrap();
+        let Ok(canonical_root) = tmp.path().canonicalize() else {
+            return; // tempdir not canonicalizable; nothing to test.
+        };
+        if tmp.path() == canonical_root {
+            return; // No symlink divergence on this runner; skip.
+        }
+
+        let mut app = fake_app(vec![]);
+        app.root = canonical_root.clone();
+
+        let file_canonical = canonical_root.join("a.rs");
+        std::fs::write(&file_canonical, "").unwrap();
+        let symlinked_file = tmp.path().join("a.rs");
+
+        let events_dir = canonical_root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![symlinked_file],
+            cwd: canonical_root.clone(),
+            timestamp_ms: 3000,
+        };
+        let event_path = events_dir.join("3000-Write.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.handle_event_log(event_path);
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "event whose file_path resolves to a path inside the canonical root must be accepted"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_preserves_snapshot_on_git_error() {
+        // When `git diff` fails (e.g. baseline SHA is missing after a
+        // rebase that garbage-collected the old object), the previous
+        // file snapshot MUST NOT be clobbered — otherwise the next
+        // event for the same file will compute op_diff against an
+        // empty baseline and emit the entire cumulative diff as
+        // "what this operation changed", which is wrong.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut app = fake_app(vec![]);
+        app.root = root.to_path_buf();
+        // Bogus baseline — every `git diff <bogus> -- file` call will fail.
+        app.baseline_sha = "0000000000000000000000000000000000000000".to_string();
+
+        let file = root.join("foo.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        // Seed a realistic prior snapshot as if a previous event had
+        // captured the cumulative baseline → current diff.
+        let prev_diff = "@@ -1 +1 @@\n-fn main() {}\n+fn main() { 1 }\n".to_string();
+        app.diff_snapshots.insert(file.clone(), prev_diff.clone());
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![file.clone()],
+            cwd: root.to_path_buf(),
+            timestamp_ms: 1000,
+        };
+        let event_path = events_dir.join("1000-Edit.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.handle_event_log(event_path);
+
+        assert_eq!(
+            app.diff_snapshots.get(&file),
+            Some(&prev_diff),
+            "snapshot must survive a failing `git diff` so the next event is still accurate"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_filters_by_explicit_bound_session_id() {
+        // Under concurrent agent activity on the same repo, a foreign
+        // session's events must not pollute the stream or
+        // `diff_snapshots`. When the TUI was started with a
+        // preconfigured `bound_session_id` (via `KIZU_SESSION_ID`
+        // or a future CLI flag), `handle_event_log` drops events
+        // from any other session. Auto-binding was intentionally
+        // removed because it locked onto whichever session fired
+        // first — often the wrong one under real concurrency.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+        app.bound_session_id = Some("session-A".into());
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+
+        // Matching session: accepted.
+        let a = crate::hook::SanitizedEvent {
+            session_id: Some("session-A".into()),
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/a.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 10_000,
+        };
+        let a_path = events_dir.join("10000-Edit-aaa.json");
+        std::fs::write(&a_path, serde_json::to_string(&a).unwrap()).unwrap();
+        app.handle_event_log(a_path);
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "event matching the bound session must be ingested"
+        );
+
+        // Foreign session: dropped.
+        let b = crate::hook::SanitizedEvent {
+            session_id: Some("session-B".into()),
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/a.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 11_000,
+        };
+        let b_path = events_dir.join("11000-Edit-bbb.json");
+        std::fs::write(&b_path, serde_json::to_string(&b).unwrap()).unwrap();
+        app.handle_event_log(b_path);
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "foreign-session event must not advance stream or diff_snapshots"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_accepts_any_session_when_unbound() {
+        // When no explicit binding exists (no env / no CLI), we
+        // accept every session_id instead of auto-latching to the
+        // first we see. This keeps concurrent-session trap-free:
+        // users who want strict filtering opt in by setting
+        // `KIZU_SESSION_ID`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+        assert!(app.bound_session_id.is_none());
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        for (i, sid) in ["session-A", "session-B"].iter().enumerate() {
+            let ev = crate::hook::SanitizedEvent {
+                session_id: Some((*sid).into()),
+                hook_event_name: "PostToolUse".into(),
+                tool_name: Some("Edit".into()),
+                file_paths: vec![root.join(format!("src/{i}.rs"))],
+                cwd: root.clone(),
+                timestamp_ms: 20_000 + i as u64,
+            };
+            let path = events_dir.join(format!("2000{i}-Edit-{sid}.json"));
+            std::fs::write(&path, serde_json::to_string(&ev).unwrap()).unwrap();
+            app.handle_event_log(path);
+        }
+        assert_eq!(
+            app.stream_events.len(),
+            2,
+            "unbound TUI must accept events from any session"
+        );
+        assert!(
+            app.bound_session_id.is_none(),
+            "unbound state must stay unbound; no auto-latch"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_filters_out_events_predating_session_start() {
+        // Two kizu sessions on the same repo: session B must not
+        // ingest session A's historical events. The earlier
+        // implementation used `clean_stale_events` to delete the
+        // shared per-project events directory at startup, which
+        // destroyed session A's live history. The replacement is a
+        // timestamp filter: events whose `timestamp_ms` is older
+        // than this session's start are silently dropped without
+        // touching the shared files on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+        app.session_start_ms = 5_000;
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let old_event = crate::hook::SanitizedEvent {
+            session_id: Some("other-agent-session".into()),
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/a.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 1_000, // earlier than session_start_ms
+        };
+        let old_path = events_dir.join("1000-Edit-xyz.json");
+        std::fs::write(&old_path, serde_json::to_string(&old_event).unwrap()).unwrap();
+
+        app.handle_event_log(old_path.clone());
+
+        assert!(
+            app.stream_events.is_empty(),
+            "pre-session events must be filtered out of stream mode"
+        );
+        // The file itself must not be deleted — other sessions may
+        // still own it. Only the ingest is suppressed.
+        assert!(
+            old_path.exists(),
+            "filter must be non-destructive: leave the event file in place"
+        );
+    }
+
+    #[test]
+    fn replay_events_dir_ingests_files_written_during_startup_gap() {
+        // During startup there is a window between
+        // `clean_stale_events` and `watcher::start`. Any event
+        // file written in that gap is never delivered via the
+        // watcher, so the next event for that file would include
+        // the dropped operation's contents in its `op_diff`.
+        // A replay step must drain the directory once at startup
+        // so no event is silently skipped.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![root.join("src/a.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 6000,
+        };
+        let event_path = events_dir.join("6000-Write-abc.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        // `replay_events_dir` must scan the directory and feed each
+        // event through `handle_event_log`, just as the watcher
+        // would once it is armed.
+        app.replay_events_dir(&events_dir);
+
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "replay must ingest the pre-existing event, got: {:?}",
+            app.stream_events
+                .iter()
+                .map(|e| e.metadata.tool_name.as_deref().unwrap_or("?"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn replay_events_dir_orders_same_millisecond_events_chronologically() {
+        // Two events in the same millisecond must replay in the
+        // order they were written, not in alphabetical order by
+        // tool name. The previous implementation sorted the
+        // directory by filename, so `<ms>-<tool>-<uniq>.json`
+        // placed `Edit` before `Write` regardless of which event
+        // actually fired first. `handle_event_log` advances
+        // `diff_snapshots` as it goes, so an out-of-order replay
+        // fabricates the operation diff for whichever event lands
+        // on the wrong side of the split.
+        //
+        // Assertion: `handle_event_log` is called in write order so
+        // `stream_events` appears in the same order as the on-disk
+        // write sequence (which we control via the uniqueness
+        // suffix in the filename).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+
+        // Same millisecond, different tool names. The *intended*
+        // write order is `Write` first, then `Edit` — encoded by
+        // a monotonic uniqueness prefix `001` < `002`.
+        let first = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![root.join("src/x.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 20_000,
+        };
+        let second = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/x.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 20_000,
+        };
+        // Use the production filename layout `<ms>-<tool>-<uniq>.json`
+        // with tool names picked so filename lex sort disagrees with
+        // write order: `Edit` < `Write` alphabetically, but the
+        // intended chronological order is `Write` first. Replay
+        // must honour the write order (derived from on-disk mtime)
+        // rather than naïve filename sort.
+        let first_path = events_dir.join("20000-Write-aaa.json");
+        let second_path = events_dir.join("20000-Edit-zzz.json");
+        std::fs::write(&first_path, serde_json::to_string(&first).unwrap()).unwrap();
+        // Ensure distinct on-disk mtimes so the replay's tie-break
+        // reflects the actual sequence.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&second_path, serde_json::to_string(&second).unwrap()).unwrap();
+
+        app.replay_events_dir(&events_dir);
+
+        let tools: Vec<&str> = app
+            .stream_events
+            .iter()
+            .filter_map(|e| e.metadata.tool_name.as_deref())
+            .collect();
+        assert_eq!(
+            tools,
+            vec!["Write", "Edit"],
+            "replay must honour monotonic write order, got {tools:?}"
+        );
+    }
+
+    #[test]
+    fn replay_events_dir_does_not_double_process_already_seen_events() {
+        // If `replay_events_dir` runs and then the watcher also
+        // delivers the same event (because the watcher was armed
+        // after the file already existed on some notify backends),
+        // the event must be recorded exactly once — otherwise
+        // stream history shows phantom duplicates.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/b.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 7000,
+        };
+        let event_path = events_dir.join("7000-Edit-def.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.replay_events_dir(&events_dir);
+        // Simulate the watcher later delivering the same file.
+        app.handle_event_log(event_path.clone());
+
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "same event must not be recorded twice"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_rejects_parent_traversal_relative_paths() {
+        // `normalize_event_path` must not accept a relative path that
+        // escapes the repo via `..`. The earlier implementation only
+        // checked `root.join(p).starts_with(root)` lexically, so
+        // `../outside.rs` slipped through (the joined string starts
+        // with `root` before lexical resolution). Any such path
+        // would pollute stream mode with rows that sit outside the
+        // worktree and whose git-diff lookups always fail.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            // Traversal path — lexically begins with root but the
+            // `..` escapes the worktree.
+            file_paths: vec![PathBuf::from("../outside.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 5000,
+        };
+        let event_path = events_dir.join("5000-Write.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.handle_event_log(event_path);
+
+        assert!(
+            app.stream_events.is_empty(),
+            "traversal path must not pass the repo-root filter, got {:?}",
+            app.stream_events
+                .iter()
+                .map(|e| &e.metadata.file_paths)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn handle_event_log_matches_seeded_snapshot_via_repo_relative_key() {
+        // `seed_diff_snapshots` keys the map by repo-relative paths
+        // (from `git::compute_diff`). Agent hooks, however, usually
+        // emit **absolute** paths. Without normalization, the seeded
+        // `src/foo.rs` entry is never found for an event on
+        // `/<root>/src/foo.rs`, so the first event for a
+        // pre-existing dirty file shows the entire cumulative diff
+        // as one tool call instead of only the delta.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        // Seed map with the repo-relative key, mirroring the
+        // `git::compute_diff` output shape that `seed_diff_snapshots`
+        // uses in production.
+        let rel = PathBuf::from("src/foo.rs");
+        let seeded = "diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+seed\n".to_string();
+        app.diff_snapshots.insert(rel.clone(), seeded.clone());
+
+        // The agent supplies an absolute path on the repo root.
+        let abs = root.join(&rel);
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![abs.clone()],
+            cwd: root.clone(),
+            timestamp_ms: 4000,
+        };
+        let event_path = events_dir.join("4000-Edit.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.handle_event_log(event_path);
+
+        // After the event fires, both the lookup side and the
+        // insert side must use the repo-relative key so a subsequent
+        // seed/event for the same file lands on the same entry.
+        assert_eq!(
+            app.diff_snapshots.keys().collect::<Vec<_>>(),
+            vec![&rel],
+            "snapshot map must not split one file across raw and repo-relative keys, \
+             found keys: {:?}",
+            app.diff_snapshots.keys().collect::<Vec<_>>()
+        );
+        // The seeded op_diff was `-old / +seed`. Regardless of what
+        // the current `git diff` returns (likely Err because no real
+        // repo), the seeded snapshot must have been consulted — so
+        // there must be exactly one StreamEvent and it must be keyed
+        // on the repo-relative path.
+        assert_eq!(app.stream_events.len(), 1);
+        let recorded = &app.stream_events[0];
+        let paths: Vec<&PathBuf> = recorded.metadata.file_paths.iter().collect();
+        assert_eq!(
+            paths,
+            vec![&rel],
+            "StreamEvent.metadata.file_paths must be stored repo-relative, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn compute_operation_diff_preserves_repeated_context_lines() {
+        // Two different hunks may share an identical context line
+        // (e.g. a closing brace). If prev has one hunk containing ` }`
+        // and curr adds a second hunk that also contains ` }`, the
+        // second occurrence in curr must appear in op_diff.
+        let prev = " }\n";
+        let curr = " }\n+new\n }\n";
+        let op = super::compute_operation_diff(prev, curr);
+        // op contains +new and the second occurrence of context ` }`.
+        assert!(op.contains("+new\n"));
+        assert!(
+            op.matches(" }\n").count() == 1,
+            "one of the two context ` }}` lines is new to curr; exactly one copy should appear"
         );
     }
 }

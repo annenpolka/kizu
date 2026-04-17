@@ -37,10 +37,21 @@ impl Highlighter {
     /// tokens. Falls back to a single unstyled token if the file
     /// extension is unknown or highlighting fails.
     pub fn highlight_line(&self, line: &str, path: &Path) -> Vec<HlToken> {
-        let syntax = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(|ext| self.syntax_set.find_syntax_by_extension(ext))
+        let ext = path.extension().and_then(|e| e.to_str());
+        let syntax = ext
+            .and_then(|e| self.syntax_set.find_syntax_by_extension(e))
+            // Fallback: syntect's defaults lack TypeScript, TSX, Vue,
+            // Svelte, etc. Map them to the nearest available syntax.
+            .or_else(|| {
+                let fallback = match ext {
+                    Some("ts" | "mts" | "cts") => Some("js"),
+                    Some("tsx") => Some("jsx"),
+                    Some("vue" | "svelte") => Some("html"),
+                    Some("jsonc") => Some("json"),
+                    _ => None,
+                };
+                fallback.and_then(|f| self.syntax_set.find_syntax_by_extension(f))
+            })
             .or_else(|| {
                 path.file_name()
                     .and_then(|n| n.to_str())
@@ -92,6 +103,30 @@ mod tests {
         let hl = Highlighter::new();
         let tokens = hl.highlight_line("fn main() {}", Path::new("test.rs"));
         assert!(tokens.len() > 1, "Rust code should produce multiple tokens");
+    }
+
+    #[test]
+    fn highlight_typescript_code_produces_multiple_tokens() {
+        let hl = Highlighter::new();
+        let tokens = hl.highlight_line("const x: number = 42;", Path::new("app.ts"));
+        assert!(
+            tokens.len() > 1,
+            "TypeScript should produce multiple tokens, got {} — syntect may not recognise .ts",
+            tokens.len()
+        );
+    }
+
+    #[test]
+    fn ts_falls_back_to_js_highlighting() {
+        let hl = Highlighter::new();
+        // Even though syntect doesn't natively support .ts,
+        // our fallback maps it to JavaScript syntax.
+        let tokens = hl.highlight_line("const x: number = 42;", Path::new("app.ts"));
+        assert!(
+            tokens.len() > 1,
+            ".ts should produce highlighted tokens via JS fallback, got {}",
+            tokens.len()
+        );
     }
 
     #[test]

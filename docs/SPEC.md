@@ -288,7 +288,7 @@ kizu hook-stop
 | tmux | `split-window -h` | `$TMUX` |
 | Ghostty | AppleScript split | `$TERM_PROGRAM=ghostty` |
 | zellij | `zellij run --floating` | `$ZELLIJ` |
-| kitty | `kitty @ launch --type=overlay` | `$KITTY_LISTEN_ON` |
+| kitty | `kitty @ launch --type=window` | `$KITTY_LISTEN_ON` |
 
 優先順: tmux → zellij → kitty → ghostty
 

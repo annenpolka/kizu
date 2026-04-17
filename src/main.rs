@@ -1,12 +1,15 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod app;
+mod attach;
+mod config;
 mod git;
 mod highlight;
 mod hook;
 mod init;
 mod paths;
+mod prompt;
 mod scar;
 mod session;
 mod ui;
@@ -19,6 +22,10 @@ mod watcher;
     about = "Realtime diff monitor + inline scar review TUI for AI coding agents"
 )]
 struct Cli {
+    /// Auto-split the terminal and launch kizu in the new pane.
+    #[arg(long)]
+    attach: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -59,6 +66,13 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.attach {
+        let config = config::load_config();
+        let terminal = attach::resolve_terminal(&config.attach.terminal)?;
+        let kizu_bin = std::env::current_exe().context("resolving kizu binary path")?;
+        return attach::split_and_launch(terminal, &kizu_bin);
+    }
+
     match cli.command {
         None => app::run().await,
         Some(Command::Init {
@@ -77,7 +91,7 @@ async fn main() -> Result<()> {
         }
         Some(Command::HookPostTool { agent }) => run_hook_post_tool(&agent),
         Some(Command::HookPreCommit) => run_hook_pre_commit(),
-        Some(Command::HookLogEvent) => unimplemented!("v0.2: kizu hook-log-event"),
+        Some(Command::HookLogEvent) => run_hook_log_event(),
         Some(Command::HookStop { agent }) => run_hook_stop(&agent),
     }
 }
@@ -118,6 +132,28 @@ fn run_hook_stop(agent_str: &str) -> Result<()> {
         eprint!("{}", hook::format_stop_stderr(&hits));
         std::process::exit(2);
     }
+    Ok(())
+}
+
+fn run_hook_log_event() -> Result<()> {
+    let input = hook::parse_hook_input(hook::AgentKind::ClaudeCode, std::io::stdin().lock())?;
+    let cwd = input
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let root = git::find_root(&cwd).unwrap_or(cwd);
+    let mut event = hook::sanitize_event(&input);
+    // Ensure cwd is the git root so per-project events dir resolves correctly.
+    event.cwd = root.clone();
+    hook::write_event(&event)?;
+
+    // Prune old entries. TTL defaults to 24h, overridable via env var.
+    let ttl_secs: u64 = std::env::var("KIZU_EVENT_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(86400);
+    hook::prune_event_log(&root, std::time::Duration::from_secs(ttl_secs), 1000)?;
+
     Ok(())
 }
 

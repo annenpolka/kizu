@@ -1,0 +1,33 @@
+{
+  "name": "kizu",
+  "description": "Realtime diff monitor + inline scar review TUI for AI coding agents",
+  "version": "0.3.0",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kizu hook-post-tool --agent claude-code"
+          },
+          {
+            "type": "command",
+            "command": "kizu hook-log-event",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kizu hook-stop --agent claude-code"
+          }
+        ]
+      }
+    ]
+  }
+}

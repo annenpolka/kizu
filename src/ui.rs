@@ -18,14 +18,12 @@ use crate::git::{DiffContent, FileDiff, FileStatus, Hunk, LineKind};
 /// every modified file.
 const SCROLL_ROW_LIMIT: usize = 2000;
 
-/// Delta-style background color for added lines. Dim enough to stay
-/// legible against a standard terminal text color but saturated enough
-/// that the eye distinguishes add vs. delete without a `+`/`-` prefix.
-/// See ADR-0014.
+/// Delta-style background color defaults. Production code reads these
+/// from [`crate::config::ColorConfig`]; the constants remain for tests
+/// that assert on default-config rendering (ADR-0014).
+#[cfg(test)]
 const BG_ADDED: Color = Color::Rgb(10, 50, 10);
-
-/// Delta-style background color for deleted lines. Paired with
-/// [`BG_ADDED`] so the two form a clear contrast.
+#[cfg(test)]
 const BG_DELETED: Color = Color::Rgb(60, 10, 10);
 
 /// Render the entire kizu frame: scroll view (main) + footer (bottom),
@@ -71,7 +69,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         let hl = app
             .highlighter
             .get_or_init(crate::highlight::Highlighter::new);
-        render_file_view(frame, main, fv, Some(hl));
+        // Sample the file-view scroll animation if active.
+        let effective_top = if let Some(anim) = &fv.anim {
+            let (v, _done) = anim.sample(fv.scroll_top as f32, std::time::Instant::now());
+            v.round() as usize
+        } else {
+            fv.scroll_top
+        };
+        render_file_view(frame, main, fv, Some(hl), effective_top);
     } else if app.files.is_empty() {
         render_empty(frame, main, app);
     } else {
@@ -286,6 +291,11 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport_height);
     let mut row_idx = viewport_top;
     let mut skip_remaining = skip_visual;
+    // Viewport-relative line index where the cursor's own visual line
+    // lands. Recorded during the render loop so the flash overlay
+    // afterwards knows which row to paint without rebuilding the
+    // visual index.
+    let mut cursor_viewport_line: Option<usize> = None;
     while row_idx < total_rows && lines.len() < viewport_height {
         // The cursor row gets `Some(sub)` so wrap-mode rendering
         // can position the arrow on the correct visual sub-row;
@@ -306,23 +316,37 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             nowrap_body_width,
             seen_hunks: &app.seen_hunks,
             hl: Some(hl),
+            bg_added: app.config.colors.bg_added_color(),
+            bg_deleted: app.config.colors.bg_deleted_color(),
         };
         let row_lines = render_row(&app.layout.rows[row_idx], &ctx);
         let mut take = row_lines.into_iter();
         // Discard any leading visual lines requested by the
         // placement layer (only the first logical row ever carries
         // a non-zero `skip_remaining` budget).
+        let initial_skip = skip_remaining;
         for _ in 0..skip_remaining {
             if take.next().is_none() {
                 break;
             }
         }
         skip_remaining = 0;
+        let row_start_line = lines.len();
         for line in take {
             if lines.len() >= viewport_height {
                 break;
             }
             lines.push(line);
+        }
+        if row_idx == cursor_row && cursor_viewport_line.is_none() {
+            // The cursor's visual sub-row within this logical row,
+            // minus any leading lines the placement layer asked us to
+            // discard for the *first* row in the viewport.
+            let sub_in_view = app.cursor_sub_row.saturating_sub(initial_skip);
+            let candidate = row_start_line + sub_in_view;
+            if candidate < lines.len() {
+                cursor_viewport_line = Some(candidate);
+            }
         }
         row_idx += 1;
     }
@@ -338,6 +362,11 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     frame.render_widget(Paragraph::new(lines), content_area);
+
+    // Paint a subtle background tint on the cursor row's left gutter
+    // so the user can pick out the current row at a glance without
+    // the diff body's `bg_added` / `bg_deleted` colors being obscured.
+    apply_cursor_gutter_tint(frame, content_area, cursor_viewport_line);
 
     // Pin the header on top after the body, so the overlay always wins.
     if let (Some(header_rect), Some((file_idx, hunk_idx))) = (header_area, sticky)
@@ -356,6 +385,57 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Walk `rows` to find the row index of the `HunkHeader` matching
 /// `(file_idx, hunk_idx)`. Returns `None` if the layout is empty or the
 /// cursor's hunk has no header row (binary, etc).
+/// Darken every cell of the cursor row's bg, hue preserved. No
+/// separate gutter tint — the gutter gets the same semi-transparent
+/// darken treatment as the diff body, so the row is visually recessed
+/// uniformly and the `+` / `-` add/delete signal carried by the
+/// surrounding full-intensity rows stays legible.
+fn apply_cursor_gutter_tint(
+    frame: &mut Frame<'_>,
+    content_area: Rect,
+    cursor_viewport_line: Option<usize>,
+) {
+    let Some(line_in_viewport) = cursor_viewport_line else {
+        return;
+    };
+    if line_in_viewport >= content_area.height as usize {
+        return;
+    }
+    let y = content_area.y + line_in_viewport as u16;
+    let end_x = content_area.x.saturating_add(content_area.width);
+    let buf = frame.buffer_mut();
+    for x in content_area.x..end_x {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            let darkened = darken_cursor_body_bg(cell.style().bg);
+            let new_style = cell.style().bg(darkened);
+            cell.set_style(new_style);
+        }
+    }
+}
+
+/// Return a background color that sits behind the cursor row's body
+/// cells. `Color::Rgb` values are scaled down (hue preserved, value
+/// reduced) so `bg_added` green stays green-but-dimmer; cells without
+/// a set bg (`Color::Reset` / unset) pick up a subtle dark gray.
+/// Other color kinds (ANSI names) fall through to the same dim gray
+/// since scaling them precisely would require resolving terminal
+/// palette which we don't control.
+fn darken_cursor_body_bg(existing: Option<Color>) -> Color {
+    // `bg_added = Rgb(10, 50, 10)` (default) maps to Rgb(7, 37, 7) —
+    // still clearly green, just slightly muted against the surrounding
+    // full-intensity rows. Earlier 0.5 made it too stark a contrast.
+    const FACTOR: f32 = 0.75;
+    const DEFAULT_DIM: Color = Color::Rgb(30, 30, 36);
+    match existing {
+        Some(Color::Rgb(r, g, b)) => Color::Rgb(
+            (r as f32 * FACTOR) as u8,
+            (g as f32 * FACTOR) as u8,
+            (b as f32 * FACTOR) as u8,
+        ),
+        _ => DEFAULT_DIM,
+    }
+}
+
 fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> Option<usize> {
     rows.iter().position(|r| {
         matches!(
@@ -379,6 +459,8 @@ struct RowRenderCtx<'a> {
     nowrap_body_width: usize,
     seen_hunks: &'a std::collections::BTreeSet<(std::path::PathBuf, usize)>,
     hl: Option<&'a crate::highlight::Highlighter>,
+    bg_added: Color,
+    bg_deleted: Color,
 }
 
 /// Build the styled visual `Line`s for a single logical layout row.
@@ -409,11 +491,7 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
     let hl = ctx.hl;
     match row {
         RowKind::FileHeader { file_idx } => {
-            vec![render_file_header(
-                *file_idx,
-                &files[*file_idx],
-                cursor_sub.is_some(),
-            )]
+            vec![render_file_header(&files[*file_idx], cursor_sub.is_some())]
         }
         RowKind::HunkHeader { file_idx, hunk_idx } => {
             let DiffContent::Text(hunks) = &files[*file_idx].content else {
@@ -424,7 +502,11 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                 &hunks[*hunk_idx],
                 is_selected,
                 cursor_sub.is_some(),
-                seen_hunks.contains(&(files[*file_idx].path.clone(), hunks[*hunk_idx].old_start)),
+                crate::app::is_hunk_seen(
+                    seen_hunks,
+                    &files[*file_idx].path,
+                    hunks[*hunk_idx].old_start,
+                ),
             )]
         }
         RowKind::DiffLine {
@@ -446,6 +528,8 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                     width,
                     hl,
                     Some(&files[*file_idx].path),
+                    ctx.bg_added,
+                    ctx.bg_deleted,
                 ),
                 None => vec![render_diff_line(
                     line,
@@ -454,6 +538,8 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                     nowrap_body_width,
                     hl,
                     Some(&files[*file_idx].path),
+                    ctx.bg_added,
+                    ctx.bg_deleted,
                 )],
             }
         }
@@ -469,25 +555,37 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
     }
 }
 
-/// Split `content` into chunks of at most `width` chars. Always
-/// returns at least one chunk; an empty input produces `[""]`. Char-
-/// based, not display-width-based — CJK wide characters count as
-/// 1 char, so wrap is approximate for those. Fine for the ASCII-
-/// heavy diffs kizu cares about.
+/// Split `content` into chunks whose **display width** is at most
+/// `width` cells. Always returns at least one chunk; an empty input
+/// produces `[""]`. CJK / emoji / other wide characters consume 2
+/// cells apiece, so a body width of 40 cells holds roughly 20 kanji —
+/// feeding char counts straight into ratatui overflowed the viewport
+/// and broke the wrap marker on CJK-heavy diffs.
+///
+/// Zero-width combining marks (`char.width()` returns `Some(0)`) and
+/// control chars (`None`) are folded into the current chunk without
+/// advancing the cell counter so they stick with their preceding
+/// base glyph instead of getting orphaned onto a new visual row.
 fn wrap_at_chars(content: &str, width: usize) -> Vec<&str> {
+    use unicode_width::UnicodeWidthChar;
     if content.is_empty() || width == 0 {
         return vec![content];
     }
     let mut chunks = Vec::new();
     let mut chunk_start = 0usize;
-    let mut chunk_chars = 0usize;
-    for (idx, _) in content.char_indices() {
-        if chunk_chars == width {
+    let mut chunk_cells = 0usize;
+    for (idx, ch) in content.char_indices() {
+        let ch_cells = ch.width().unwrap_or(0);
+        // Flush the current chunk before placing a char that would
+        // overshoot the cell budget. Requires `chunk_cells > 0` so
+        // that a single char wider than the whole width still lands
+        // in one chunk rather than looping forever on an empty one.
+        if chunk_cells > 0 && chunk_cells + ch_cells > width {
             chunks.push(&content[chunk_start..idx]);
             chunk_start = idx;
-            chunk_chars = 0;
+            chunk_cells = 0;
         }
-        chunk_chars += 1;
+        chunk_cells += ch_cells;
     }
     if chunk_start < content.len() {
         chunks.push(&content[chunk_start..]);
@@ -506,6 +604,7 @@ fn wrap_at_chars(content: &str, width: usize) -> Vec<&str> {
 /// Each visual row is padded out to `body_width` with trailing spaces
 /// so the background color extends uniformly to the right margin
 /// instead of stopping at the last content character.
+#[allow(clippy::too_many_arguments)]
 fn render_diff_line_wrapped(
     line: &crate::git::DiffLine,
     is_selected: bool,
@@ -513,14 +612,17 @@ fn render_diff_line_wrapped(
     body_width: usize,
     hl: Option<&crate::highlight::Highlighter>,
     file_path: Option<&std::path::Path>,
+    bg_added: Color,
+    bg_deleted: Color,
 ) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
     // ADR-0014: background-color diff rendering. Focused hunks keep
     // full brightness; unfocused hunks wear `Modifier::DIM` so the
     // eye still flows to the cursor band. Context rows use the
     // terminal default inside the focus and dark-gray + DIM outside.
     let bg = match line.kind {
-        LineKind::Added => Some(BG_ADDED),
-        LineKind::Deleted => Some(BG_DELETED),
+        LineKind::Added => Some(bg_added),
+        LineKind::Deleted => Some(bg_deleted),
         LineKind::Context => None,
     };
     let base_style = match (bg, is_selected) {
@@ -599,7 +701,12 @@ fn render_diff_line_wrapped(
                 0
             };
             let chunk_char_count = chunk.chars().count();
-            let pad = body_width.saturating_sub(chunk_char_count + marker_reserve);
+            // Display width drives the trailing-space pad that extends
+            // the delta-style background to the viewport edge. Using
+            // char count would leave CJK rows short by one cell per
+            // wide char and the bg color would end mid-line.
+            let chunk_cell_count = UnicodeWidthStr::width(chunk);
+            let pad = body_width.saturating_sub(chunk_cell_count + marker_reserve);
 
             let mut spans = vec![bar];
 
@@ -639,7 +746,7 @@ fn render_diff_line_wrapped(
 /// Bottom-up file header: `  path                                14:03   +12 -3`.
 /// Path color encodes the status (cyan / green / red / yellow), no `M`/`A`/`D`
 /// label needed.
-fn render_file_header(_file_idx: usize, file: &FileDiff, is_cursor: bool) -> Line<'static> {
+fn render_file_header(file: &FileDiff, is_cursor: bool) -> Line<'static> {
     let path_color = match file.status {
         FileStatus::Modified => Color::Cyan,
         FileStatus::Added => Color::Green,
@@ -653,17 +760,24 @@ fn render_file_header(_file_idx: usize, file: &FileDiff, is_cursor: bool) -> Lin
     };
     let mtime = format_mtime(file.mtime);
 
-    let mut spans = vec![
-        if is_cursor {
-            Span::styled(
-                "▶ ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw("  ")
-        },
+    let mut spans = vec![if is_cursor {
+        Span::styled(
+            "▶ ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    }];
+    // Stream mode prefix (e.g. "14:03:22 Write") before the file path.
+    if let Some(prefix) = &file.header_prefix {
+        spans.push(Span::styled(
+            format!("{prefix}  "),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans.extend([
         Span::styled(
             file.path.display().to_string(),
             Style::default().fg(path_color).add_modifier(Modifier::BOLD),
@@ -672,7 +786,7 @@ fn render_file_header(_file_idx: usize, file: &FileDiff, is_cursor: bool) -> Lin
         Span::styled(mtime, Style::default().fg(Color::DarkGray)),
         Span::raw("   "),
         Span::raw(counts),
-    ];
+    ]);
     // Spacing for a future scar indicator placeholder; M4v leaves it
     // dormant so the column stays stable when scar lands.
     spans.push(Span::raw(""));
@@ -685,24 +799,39 @@ fn render_hunk_header(
     is_cursor: bool,
     is_seen: bool,
 ) -> Line<'static> {
-    // Seen-mark indicator sits in front of the `@@` body. It only
-    // takes one cell and keeps the existing 5-cell left bar so
-    // diff-line alignment below the header is unchanged.
     let seen_mark = if is_seen { "• " } else { "  " };
-    let body = match &hunk.context {
-        Some(ctx) => format!(
-            "{}{seen_mark}@@ {ctx}",
-            if is_cursor { "  ▶  " } else { "     " }
-        ),
-        None => format!(
-            "{}{seen_mark}@@ -{},{} +{},{} @@",
-            if is_cursor { "  ▶  " } else { "     " },
-            hunk.old_start,
-            hunk.old_count,
+    let cursor_mark = if is_cursor { "  ▶  " } else { "     " };
+
+    // Count added/deleted lines from the actual hunk content.
+    let added: usize = hunk
+        .lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Added)
+        .count();
+    let deleted: usize = hunk
+        .lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Deleted)
+        .count();
+    let counts = format!("+{added}/-{deleted}");
+
+    // Line range: show new_start (where the change lands in the
+    // current file). For multi-line hunks, show the range end.
+    let line_range = if hunk.new_count > 1 {
+        format!(
+            "L{}-{}",
             hunk.new_start,
-            hunk.new_count
-        ),
+            hunk.new_start + hunk.new_count - 1
+        )
+    } else {
+        format!("L{}", hunk.new_start)
     };
+
+    let body = match &hunk.context {
+        Some(ctx) => format!("{cursor_mark}{seen_mark}@@ {ctx}  {line_range} {counts}"),
+        None => format!("{cursor_mark}{seen_mark}@@ {line_range} {counts}"),
+    };
+
     let mut style = Style::default().fg(Color::Cyan);
     if !is_selected {
         style = style.add_modifier(Modifier::DIM);
@@ -710,6 +839,7 @@ fn render_hunk_header(
     Line::from(Span::styled(body, style))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_diff_line(
     line: &crate::git::DiffLine,
     is_selected: bool,
@@ -717,10 +847,12 @@ fn render_diff_line(
     body_width: usize,
     hl: Option<&crate::highlight::Highlighter>,
     file_path: Option<&std::path::Path>,
+    bg_added: Color,
+    bg_deleted: Color,
 ) -> Line<'static> {
     let bg = match line.kind {
-        LineKind::Added => Some(BG_ADDED),
-        LineKind::Deleted => Some(BG_DELETED),
+        LineKind::Added => Some(bg_added),
+        LineKind::Deleted => Some(bg_deleted),
         LineKind::Context => None,
     };
     let bar = if is_cursor {
@@ -746,26 +878,32 @@ fn render_diff_line(
 
     // Try syntax highlighting. If available, produce per-token spans
     // with the token fg color + the diff bg style overlay.
+    //
+    // Widths are counted in display cells (via `unicode-width`), not
+    // chars — each kanji is 2 cells, and char-based truncation would
+    // push CJK rows past the viewport edge and smear the delta-style
+    // background color past the right margin.
     if let (Some(hl), Some(path)) = (hl, file_path) {
         let tokens = hl.highlight_line(&line.content, path);
         if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
             let mut spans = vec![bar];
-            let mut chars_emitted = 0;
+            let mut cells_emitted = 0usize;
             for token in &tokens {
-                let token_chars = token.text.chars().count();
-                let remaining = body_width.saturating_sub(chars_emitted);
+                let remaining = body_width.saturating_sub(cells_emitted);
                 if remaining == 0 {
                     break;
                 }
-                let take = token_chars.min(remaining);
-                let text: String = token.text.chars().take(take).collect();
+                let (text, token_cells) = take_cells(&token.text, remaining);
+                if text.is_empty() {
+                    break;
+                }
                 spans.push(Span::styled(text, base_style.fg(token.fg)));
-                chars_emitted += take;
+                cells_emitted += token_cells;
             }
             // Pad to body_width.
-            if chars_emitted < body_width {
+            if cells_emitted < body_width {
                 spans.push(Span::styled(
-                    " ".repeat(body_width - chars_emitted),
+                    " ".repeat(body_width - cells_emitted),
                     base_style,
                 ));
             }
@@ -774,11 +912,13 @@ fn render_diff_line(
     }
 
     // Fallback: single-span body (no highlighting or unknown extension).
-    let chunk_len = line.content.chars().count();
-    let padded_body: String = if chunk_len >= body_width {
-        line.content.chars().take(body_width).collect()
+    use unicode_width::UnicodeWidthStr;
+    let content_cells = UnicodeWidthStr::width(line.content.as_str());
+    let padded_body: String = if content_cells >= body_width {
+        let (truncated, _) = take_cells(&line.content, body_width);
+        truncated
     } else {
-        let pad = body_width - chunk_len;
+        let pad = body_width - content_cells;
         line.content
             .chars()
             .chain(std::iter::repeat_n(' ', pad))
@@ -787,25 +927,52 @@ fn render_diff_line(
     Line::from(vec![bar, Span::styled(padded_body, base_style)])
 }
 
-/// `HH:MM` formatted local time. Returns `--:--` when the metadata read
-/// failed and the parser left the field at `UNIX_EPOCH`.
+/// Take as many leading chars from `s` as fit into `max_cells` display
+/// cells, without splitting a wide char. Returns the prefix and the
+/// number of cells actually consumed.
+fn take_cells(s: &str, max_cells: usize) -> (String, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut cells = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if cells + w > max_cells {
+            break;
+        }
+        out.push(ch);
+        cells += w;
+    }
+    (out, cells)
+}
+
+/// `HH:MM` formatted **local** time. Returns `--:--` when the metadata
+/// read failed and the parser left the field at `UNIX_EPOCH`. Uses
+/// `libc::localtime_r` on Unix so the picker mtime column matches the
+/// user's wall clock; falls back to UTC on non-Unix platforms.
 fn format_mtime(t: SystemTime) -> String {
     if t == UNIX_EPOCH {
         return "--:--".to_string();
     }
-    // We avoid pulling in `chrono` for a single timestamp render: the
-    // duration since midnight UTC is enough to derive HH:MM, and any
-    // off-by-timezone is acceptable for an at-a-glance hint. Real local
-    // time will arrive with the v0.2 dependency on `time` if it pays for
-    // itself elsewhere.
     let secs = t
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let day_secs = secs % 86_400;
-    let hour = (day_secs / 3600) as u32;
-    let minute = ((day_secs % 3600) / 60) as u32;
-    format!("{hour:02}:{minute:02}")
+        .unwrap_or(0) as i64;
+
+    #[cfg(unix)]
+    {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let time_t = secs as libc::time_t;
+        unsafe { libc::localtime_r(&time_t, &mut tm) };
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let day_secs = (secs as u64) % 86_400;
+        let hour = (day_secs / 3600) as u32;
+        let minute = ((day_secs % 3600) / 60) as u32;
+        format!("{hour:02}:{minute:02}")
+    }
 }
 
 fn render_empty(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -825,13 +992,14 @@ fn render_file_view(
     area: Rect,
     fv: &crate::app::FileViewState,
     hl: Option<&crate::highlight::Highlighter>,
+    effective_top: usize,
 ) {
     let height = area.height as usize;
     let width = area.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
 
     for i in 0..height {
-        let line_idx = fv.scroll_top + i;
+        let line_idx = effective_top + i;
         if line_idx >= fv.lines.len() {
             lines.push(Line::from(Span::styled(
                 "~",
@@ -901,6 +1069,30 @@ fn render_file_view(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Convert a Unix epoch millisecond timestamp to a local-time
+/// `HH:MM:SS` string. Uses `libc::localtime_r` on Unix for
+/// timezone-aware conversion; falls back to UTC on other platforms.
+pub fn format_local_time(timestamp_ms: u64) -> String {
+    let epoch_secs = (timestamp_ms / 1000) as i64;
+
+    #[cfg(unix)]
+    {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let time_t = epoch_secs as libc::time_t;
+        unsafe { libc::localtime_r(&time_t, &mut tm) };
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let secs = epoch_secs as u64;
+        let hours = (secs / 3600) % 24;
+        let mins = (secs / 60) % 60;
+        let s = secs % 60;
+        format!("{hours:02}:{mins:02}:{s:02}")
+    }
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Pre-styled spans for the four "static" pieces of the status bar.
     let dim = Style::default().fg(Color::DarkGray);
@@ -917,6 +1109,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("[search]", Color::Yellow)
     } else if app.file_view.is_some() {
         ("[file view]", Color::Cyan)
+    } else if app.view_mode == crate::app::ViewMode::Stream {
+        ("[stream]", Color::Blue)
     } else if app.follow_mode {
         ("[follow]", Color::Green)
     } else {
@@ -1114,6 +1308,45 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// Pad or truncate `s` so its display width (cells) equals exactly
+/// `target`. Truncation is rune-aware via `unicode-width` so CJK
+/// filenames do not land mid-codepoint or overflow by one cell.
+fn pad_or_truncate_display(s: &str, target: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let w = UnicodeWidthStr::width(s);
+    if w <= target {
+        let pad = target - w;
+        let mut out = String::with_capacity(s.len() + pad);
+        out.push_str(s);
+        for _ in 0..pad {
+            out.push(' ');
+        }
+        return out;
+    }
+    // Truncate, reserving 1 cell for an ellipsis when it fits.
+    let keep = target.saturating_sub(1);
+    let mut acc = 0usize;
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if acc + cw > keep {
+            break;
+        }
+        acc += cw;
+        out.push(ch);
+    }
+    // Add the ellipsis marker + a trailing space when target - acc >= 1.
+    if target > acc {
+        out.push('…');
+        acc += 1;
+    }
+    while acc < target {
+        out.push(' ');
+        acc += 1;
+    }
+    out
+}
+
 fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup_area = centered_rect(60, 60, area);
     let Some(picker) = &app.picker else { return };
@@ -1142,6 +1375,18 @@ fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ]);
     frame.render_widget(Paragraph::new(query_line), query_area);
 
+    // Reserve a fixed right-hand slot for `HH:MM` + `+N -M` so the
+    // minute column is never clipped by a long path. The selection
+    // gutter (2 cells) sits left of the path, so the usable width
+    // inside `list_area` is `width - 2`. The path takes the rest.
+    let list_width = list_area.width as usize;
+    const MTIME_WIDTH: usize = 5; // "HH:MM"
+    const COUNTS_WIDTH: usize = 10; // "+NNN -MMM" fits comfortably
+    const GAP: usize = 1;
+    const GUTTER: usize = 2; // space for "▸ "
+    let reserved = MTIME_WIDTH + GAP + COUNTS_WIDTH + GAP;
+    let path_width = list_width.saturating_sub(reserved + GUTTER).max(10);
+
     let items: Vec<ListItem<'_>> = results
         .iter()
         .map(|&file_idx| {
@@ -1157,15 +1402,21 @@ fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 DiffContent::Text(_) => format!("+{} -{}", file.added, file.deleted),
             };
             let mtime = format_mtime(file.mtime);
+            // Pad path to `path_width` using unicode-width so CJK
+            // filenames stay aligned. Truncate from the right if the
+            // name overflows the column so the right-hand mtime/counts
+            // columns are never pushed off-screen.
+            let path_str = file.path.display().to_string();
+            let padded_path = pad_or_truncate_display(&path_str, path_width);
+            // Right-pad counts to a fixed width so the mtime column
+            // lands at a stable offset even when +/- counts vary.
+            let padded_counts = format!("{counts:>width$}", width = COUNTS_WIDTH);
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:<40}", file.path.display()),
-                    Style::default().fg(path_color),
-                ),
+                Span::styled(padded_path, Style::default().fg(path_color)),
                 Span::raw(" "),
                 Span::styled(mtime, Style::default().fg(Color::DarkGray)),
                 Span::raw(" "),
-                Span::raw(counts),
+                Span::raw(padded_counts),
             ]))
         })
         .collect();
@@ -1250,6 +1501,7 @@ mod tests {
             deleted,
             content: DiffContent::Text(hunks),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 
@@ -1261,6 +1513,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Binary,
             mtime: SystemTime::UNIX_EPOCH,
+            header_prefix: None,
         }
     }
 
@@ -1296,6 +1549,18 @@ mod tests {
             wrap_lines: false,
             watcher_health: crate::app::WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
+            config: crate::config::KizuConfig::default(),
+            view_mode: crate::app::ViewMode::default(),
+            saved_diff_scroll: 0,
+            saved_stream_scroll: 0,
+            stream_events: Vec::new(),
+            processed_event_paths: std::collections::HashSet::new(),
+            session_start_ms: 0,
+            bound_session_id: None,
+            diff_snapshots: crate::app::DiffSnapshots::default(),
+            scar_undo_stack: Vec::new(),
+            scar_focus: None,
+            pinned_cursor_y: None,
         }
     }
 
@@ -1303,7 +1568,7 @@ mod tests {
         let mut app = fake_app();
         app.files = files;
         // Match recompute_diff: mtime ascending (oldest first, newest last).
-        app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+        app.files.sort_by_key(|a| a.mtime);
         // Replicate the bootstrap path without touching the real filesystem.
         app.build_layout();
         app.refresh_anchor();
@@ -1352,9 +1617,14 @@ mod tests {
         )]);
         let view = render_to_string(&app, 80, 12);
         assert!(view.contains("src/foo.rs"), "missing file header:\n{view}");
+        // New hunk header format: @@ L<range> +N/-M
         assert!(
-            view.contains("@@ -10,1 +10,1 @@"),
-            "missing hunk header:\n{view}"
+            view.contains("@@ L10"),
+            "missing hunk header line range:\n{view}"
+        );
+        assert!(
+            view.contains("+1/-1"),
+            "missing hunk header counts:\n{view}"
         );
         // ADR-0014: no `+`/`-` prefix; the body text appears bare on
         // the row and the add/delete signal lives in the background.
@@ -1505,6 +1775,86 @@ mod tests {
         assert!(
             view.contains(&long_content[90..110]),
             "expected wrapped continuation to be visible:\n{view}"
+        );
+    }
+
+    #[test]
+    fn render_diff_line_nowrap_cjk_pads_to_cell_width_not_char_count() {
+        // Fallback (no highlighter) path: 5 kanji = 5 chars = 10 cells.
+        // At body_width=20 cells the padded body must be exactly 20
+        // cells wide — not 20-5=15 pad chars tacked on (which would
+        // produce a 25-cell body and bleed past the viewport).
+        use unicode_width::UnicodeWidthStr;
+        let line = diff_line(LineKind::Added, "あいうえお");
+        let rendered = super::render_diff_line(
+            &line,
+            false,
+            false,
+            20,
+            None,
+            None,
+            Color::Rgb(10, 50, 10),
+            Color::Rgb(60, 10, 10),
+        );
+        // Skip the 5-cell left bar; the remaining spans make up the body.
+        let body_cells: usize = rendered
+            .spans
+            .iter()
+            .skip(1)
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        assert_eq!(
+            body_cells, 20,
+            "nowrap CJK body must pad to body_width in cells, got {body_cells} cells",
+        );
+    }
+
+    #[test]
+    fn wrap_at_chars_respects_cjk_display_width() {
+        // Each kanji in `日本語テスト` has display width 2. At a body
+        // width of 4 cells we must emit 2 kanji per chunk — NOT 4
+        // kanji (which would overflow to 8 cells and let the chunk
+        // spill beyond the viewport in wrap mode).
+        let chunks = super::wrap_at_chars("日本語テスト", 4);
+        assert_eq!(chunks, vec!["日本", "語テ", "スト"]);
+    }
+
+    #[test]
+    fn wrap_at_chars_handles_mixed_ascii_and_cjk() {
+        // `ab漢字` = 1+1+2+2 = 6 cells. At width 4, the first chunk
+        // fits `ab漢` (1+1+2=4 cells exactly); `字` starts a new chunk.
+        let chunks = super::wrap_at_chars("ab漢字cd", 4);
+        assert_eq!(chunks, vec!["ab漢", "字cd"]);
+    }
+
+    #[test]
+    fn wrap_mode_cjk_line_wraps_within_viewport() {
+        // 40 kanji at width 40 (viewport cell width): the line must
+        // wrap to 2 rows since each kanji is 2 cells wide. Previously
+        // this rendered as a single over-wide row that ratatui
+        // silently truncated or that bled past the viewport.
+        let forty_kanji: String = "あいうえおかきくけこ".repeat(4);
+        assert_eq!(forty_kanji.chars().count(), 40);
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, &forty_kanji)])],
+            100,
+        )]);
+        app.wrap_lines = true;
+
+        // Viewport: 45 cols (5 for left bar + 40 for body).
+        let view = render_to_string(&app, 45, 10);
+        // Both the first kanji and a kanji past the 20th position
+        // must be visible: if wrap worked correctly, both halves of
+        // the content appear on separate visual rows.
+        assert!(view.contains("あ"), "first kanji must be visible:\n{view}");
+        // The 35th kanji (well past the 20-kanji midpoint) must also
+        // land in the viewport — only possible if the line actually
+        // wrapped rather than being truncated at column 40.
+        let late_kanji: char = forty_kanji.chars().nth(35).unwrap();
+        assert!(
+            view.contains(late_kanji),
+            "late CJK char {late_kanji:?} must survive wrap:\n{view}"
         );
     }
 
@@ -1729,6 +2079,7 @@ mod tests {
             deleted: 0,
             content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "x")])]),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 
@@ -1782,6 +2133,32 @@ mod tests {
     }
 
     #[test]
+    fn file_header_shows_prefix_when_set() {
+        let mut file = make_file(
+            "src/auth.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        );
+        file.header_prefix = Some("14:03:22 Write".to_string());
+        let mut app = populated_app(vec![file]);
+        app.scroll = 0;
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10))
+            .expect("test terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        // The prefix "14:03:22 Write" should appear in the header line.
+        let first_line: String = (0..buffer.area().width)
+            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            first_line.contains("14:03:22 Write"),
+            "header should contain prefix, got: {first_line:?}"
+        );
+    }
+
+    #[test]
     fn hunk_header_uses_function_context_when_available() {
         let app = populated_app(vec![make_file(
             "src/auth.rs",
@@ -1802,6 +2179,69 @@ mod tests {
         assert!(
             !view.contains("@@ -10,0 +10,1 @@"),
             "old hunk-range header leaked through:\n{view}"
+        );
+    }
+
+    #[test]
+    fn hunk_header_shows_line_range_and_counts() {
+        // Hunk header should display line number range and +/-
+        // counts alongside the function context.
+        let app = populated_app(vec![make_file(
+            "a.rs",
+            vec![Hunk {
+                old_start: 10,
+                old_count: 2,
+                new_start: 10,
+                new_count: 5,
+                lines: vec![
+                    diff_line(LineKind::Context, "ok"),
+                    diff_line(LineKind::Added, "new1"),
+                    diff_line(LineKind::Added, "new2"),
+                    diff_line(LineKind::Added, "new3"),
+                    diff_line(LineKind::Deleted, "old1"),
+                ],
+                context: Some("fn example()".to_string()),
+            }],
+            100,
+        )]);
+        let view = render_to_string(&app, 100, 14);
+        // Should contain the line range.
+        assert!(
+            view.contains("L10"),
+            "expected line range L10, got:\n{view}"
+        );
+        // Should contain the change counts.
+        assert!(
+            view.contains("+3/-1"),
+            "expected +3/-1 counts, got:\n{view}"
+        );
+    }
+
+    #[test]
+    fn hunk_header_shows_range_in_fallback_format() {
+        // When no function context is available, the header should
+        // still show line range and counts.
+        let app = populated_app(vec![make_file(
+            "a.rs",
+            vec![Hunk {
+                old_start: 5,
+                old_count: 1,
+                new_start: 5,
+                new_count: 3,
+                lines: vec![
+                    diff_line(LineKind::Added, "x"),
+                    diff_line(LineKind::Added, "y"),
+                    diff_line(LineKind::Deleted, "z"),
+                ],
+                context: None,
+            }],
+            100,
+        )]);
+        let view = render_to_string(&app, 100, 14);
+        assert!(view.contains("L5"), "expected line range L5, got:\n{view}");
+        assert!(
+            view.contains("+2/-1"),
+            "expected +2/-1 counts, got:\n{view}"
         );
     }
 
@@ -2197,6 +2637,7 @@ mod tests {
                 context: Some(ctx.to_string()),
             }]),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            header_prefix: None,
         }
     }
 }

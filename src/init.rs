@@ -217,6 +217,33 @@ fn kizu_bin_for_scope(scope: Scope) -> String {
     }
 }
 
+/// Build a hook `command` string that is safe to hand to the agent's
+/// shell-based hook runner. Project-local and user scopes embed an
+/// absolute `current_exe()` path, so paths containing spaces (e.g.
+/// `/Users/John Doe/.cargo/bin/kizu`) or shell metacharacters would
+/// break `sh -c` parsing and either exec the wrong argv[0] or trigger
+/// unintended expansion. Project-shared keeps the bare `kizu` token
+/// because the committed config must work on any machine where kizu
+/// is resolvable through PATH.
+fn kizu_hook_command(scope: Scope, rest: &str) -> String {
+    let bin = kizu_bin_for_scope(scope);
+    kizu_hook_command_with_bin(scope, &bin, rest)
+}
+
+/// Testable variant of [`kizu_hook_command`] that accepts an
+/// explicit `bin` path. The production call resolves the bin via
+/// `current_exe()`; tests pass fabricated paths to cover quoting
+/// edge cases (spaces, embedded quotes) without touching the
+/// filesystem or the process's own installation.
+fn kizu_hook_command_with_bin(scope: Scope, bin: &str, rest: &str) -> String {
+    match scope {
+        Scope::ProjectShared => format!("{bin} {rest}"),
+        Scope::ProjectLocal | Scope::User => {
+            format!("{} {}", shell_single_quote(bin), rest)
+        }
+    }
+}
+
 /// Run `kizu init` interactively or non-interactively.
 pub fn run_init(
     project_root: &Path,
@@ -332,61 +359,123 @@ fn print_banner() {
     println!();
 }
 
-fn select_agents_interactive(detected: &[DetectedAgent]) -> Result<Vec<AgentKind>> {
-    use dialoguer::{MultiSelect, theme::ColorfulTheme};
+/// Short prompt-friendly label for a support level. The `SupportLevel`
+/// Display impl is intentionally verbose for error messages; here we
+/// pick terse labels that fit inside the fixed column of the picker.
+fn support_level_short(sl: SupportLevel) -> &'static str {
+    match sl {
+        SupportLevel::Full => "Full",
+        SupportLevel::StopOnly => "Stop only",
+        SupportLevel::PostToolOnlyBestEffort => "PostTool only",
+        SupportLevel::WriteSideOnly => "Write-side only",
+    }
+}
 
-    // dialoguer 0.11 uses byte length (not visible width) for line-
-    // clearing math, so ANSI escape sequences in items cause it to
-    // over-count and drift the display upward on every keystroke.
-    // Use plain text items to avoid this.
-    let items: Vec<String> = detected
+/// Render the support-level pill with an ANSI color + icon. Matches the
+/// pre-8b0f9dd design, now safely renderable because `src/prompt.rs`
+/// measures item width via `unicode-width` (see ADR-0019).
+fn support_level_colored(sl: SupportLevel) -> String {
+    let label = support_level_short(sl);
+    match sl {
+        SupportLevel::Full => c_green(&format!("● {label}")),
+        SupportLevel::StopOnly => c_yellow(&format!("◐ {label}")),
+        SupportLevel::PostToolOnlyBestEffort => c_yellow(&format!("◐ {label}")),
+        SupportLevel::WriteSideOnly => c_dim(&format!("○ {label}")),
+    }
+}
+
+/// Render the detection state (binary + config dir presence) with a
+/// single-glyph icon + color.
+fn detection_status_colored(d: &DetectedAgent) -> String {
+    if d.binary_found && d.config_dir_found {
+        c_green("✓ detected")
+    } else if d.binary_found {
+        c_yellow("~ bin only")
+    } else {
+        c_dim("✗ not found")
+    }
+}
+
+fn select_agents_interactive(detected: &[DetectedAgent]) -> Result<Vec<AgentKind>> {
+    // Item layout (visible cells, not bytes — every padding uses
+    // `pad_visible` so ANSI escapes inside colored spans don't inflate
+    // the count):
+    //
+    //   <agent name, 12>  <support-level pill, 18>  <detection status>
+    //
+    // 18 fits the widest short pill `○ Write-side only` (17 cells) with
+    // one trailing pad cell. The dialoguer era's `{:<N}` formatter
+    // counted bytes (including ANSI) and misaligned these columns —
+    // see ADR-0019.
+    let labels: Vec<String> = detected
         .iter()
         .map(|d| {
             let sl = support_level(d.kind);
-            let status = if d.binary_found && d.config_dir_found {
-                "detected"
-            } else if d.binary_found {
-                "bin only"
-            } else {
-                "not found"
-            };
-            format!("{:<12}  {:<36}  {}", d.kind, sl, status)
+            format!(
+                "{}  {}  {}",
+                pad_visible(&c_bold(&d.kind.to_string()), 12),
+                pad_visible(&support_level_colored(sl), 18),
+                detection_status_colored(d),
+            )
         })
         .collect();
-
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let defaults: Vec<bool> = detected.iter().map(|d| d.recommended).collect();
 
-    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select agents to install hooks for")
-        .items(&items)
-        .defaults(&defaults)
-        .interact()
-        .context("agent selection cancelled")?;
+    let selections = crate::prompt::run_multi_select(
+        "Select agents to install hooks for",
+        &label_refs,
+        &defaults,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("agent selection cancelled"))?;
 
     Ok(selections.into_iter().map(|i| detected[i].kind).collect())
 }
 
-fn select_scope_interactive() -> Result<Scope> {
-    use dialoguer::{Select, theme::ColorfulTheme};
-
-    let items = [
-        "project-local   (gitignored, personal) <- recommended",
-        "project-shared   (committed, team-shared)",
-        "user             (global, ~/.claude/settings.json)",
-    ];
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Install scope")
-        .items(items)
-        .default(0)
-        .interact()
-        .context("scope selection cancelled")?;
-
-    Ok(if selection == 0 {
-        Scope::ProjectLocal
-    } else if selection == 1 {
-        Scope::ProjectShared
+/// Pad `s` on the right with spaces so its **visible** width equals
+/// `target_cells`. Never truncates (returns `s` unchanged if it already
+/// exceeds the target). Uses the prompt module's visible-width helper
+/// so ANSI escapes don't inflate the pad count.
+fn pad_visible(s: &str, target_cells: usize) -> String {
+    let w = crate::prompt::visible_width(s);
+    if w >= target_cells {
+        s.to_string()
     } else {
-        Scope::User
+        let mut out = String::with_capacity(s.len() + (target_cells - w));
+        out.push_str(s);
+        for _ in 0..(target_cells - w) {
+            out.push(' ');
+        }
+        out
+    }
+}
+
+fn select_scope_interactive() -> Result<Scope> {
+    let items: [String; 3] = [
+        format!(
+            "{}  {}",
+            c_bold("project-local"),
+            c_dim("(gitignored, personal) ← recommended"),
+        ),
+        format!(
+            "{}  {}",
+            c_bold("project-shared"),
+            c_dim("(committed, team-shared)"),
+        ),
+        format!(
+            "{}  {}",
+            c_bold("user"),
+            c_dim("(global, ~/.claude/settings.json)"),
+        ),
+    ];
+    let item_refs: Vec<&str> = items.iter().map(String::as_str).collect();
+    let selection = crate::prompt::run_select_one("Install scope", &item_refs, 0)?
+        .ok_or_else(|| anyhow::anyhow!("scope selection cancelled"))?;
+
+    Ok(match selection {
+        0 => Scope::ProjectLocal,
+        1 => Scope::ProjectShared,
+        _ => Scope::User,
     })
 }
 
@@ -421,6 +510,43 @@ fn print_report(report: &InstallReport) {
 /// Kizu-managed shim marker embedded in generated pre-commit hooks.
 const KIZU_SHIM_MARKER: &str = "# kizu-managed-shim";
 
+/// Wrap `s` in POSIX single quotes, escaping any interior single
+/// quotes with the standard `'\''` sequence. Produces a token that
+/// `sh` always parses as exactly one literal argument, regardless of
+/// spaces, `$`, `"`, `\`, `*`, etc. Kizu binaries installed under
+/// paths like `/Users/John Doe/.cargo/bin/kizu` would otherwise
+/// wordsplit in the generated pre-commit shim.
+///
+/// Shared with [`crate::attach`] so the Ghostty `osascript` builder
+/// reuses the same quoting contract.
+pub(crate) fn shell_single_quote(s: &str) -> String {
+    let escaped = s.replace('\'', r"'\''");
+    format!("'{escaped}'")
+}
+
+/// Render the `/bin/sh` shim body that `.git/hooks/pre-commit`
+/// writes. Extracted from `install_git_pre_commit_hook` so the
+/// quoting contract can be unit-tested without touching the
+/// filesystem.
+fn pre_commit_shim_body(bin: &str, has_user_hook: bool) -> String {
+    let bin_q = shell_single_quote(bin);
+    if has_user_hook {
+        format!(
+            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
+             # Run the original user hook first.\n\
+             \"$(dirname \"$0\")/pre-commit.user\" \"$@\"\n\
+             # Then run kizu scar guard.\n\
+             {bin_q} hook-pre-commit\n"
+        )
+    } else {
+        format!(
+            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
+             # kizu scar guard\n\
+             {bin_q} hook-pre-commit\n"
+        )
+    }
+}
+
 /// Install a kizu-managed pre-commit shim that guarantees
 /// `kizu hook-pre-commit` always runs, even when the repo has a
 /// pre-existing hook script that may contain `exit`/`exec`.
@@ -454,13 +580,7 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
         }
         std::fs::rename(&hook_path, &user_hook)?;
         let bin = kizu_bin_for_scope(Scope::ProjectLocal);
-        let shim = format!(
-            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
-             # Run the original user hook first.\n\
-             \"$(dirname \"$0\")/pre-commit.user\" \"$@\"\n\
-             # Then run kizu scar guard.\n\
-             {bin} hook-pre-commit\n"
-        );
+        let shim = pre_commit_shim_body(&bin, true);
         std::fs::write(&hook_path, shim)?;
         println!(
             "  git pre-commit hook: wrapped existing hook → {}",
@@ -468,11 +588,7 @@ fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
         );
     } else {
         let bin = kizu_bin_for_scope(Scope::ProjectLocal);
-        let shim = format!(
-            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
-             # kizu scar guard\n\
-             {bin} hook-pre-commit\n"
-        );
+        let shim = pre_commit_shim_body(&bin, false);
         std::fs::write(&hook_path, shim)?;
     }
 
@@ -513,8 +629,6 @@ fn fallback_scope(kind: AgentKind) -> Scope {
 /// Interactively ask the user what to do when the chosen scope is
 /// unavailable for a specific agent. Returns `None` to skip.
 fn ask_scope_fallback(kind: AgentKind, requested: Scope) -> Result<Option<Scope>> {
-    use dialoguer::{Select, theme::ColorfulTheme};
-
     println!(
         "\n  {}  {} does not support {} scope",
         c_yellow("⚠"),
@@ -541,12 +655,9 @@ fn ask_scope_fallback(kind: AgentKind, requested: Scope) -> Result<Option<Scope>
     };
 
     let labels: Vec<&str> = choices.iter().map(|(l, _)| *l).collect();
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!("How to install {} hooks?", kind))
-        .items(&labels)
-        .default(0)
-        .interact()
-        .context("scope fallback selection cancelled")?;
+    let prompt_text = format!("How to install {} hooks?", kind);
+    let selection = crate::prompt::run_select_one(&prompt_text, &labels, 0)?
+        .ok_or_else(|| anyhow::anyhow!("scope fallback selection cancelled"))?;
 
     Ok(choices[selection].1)
 }
@@ -606,12 +717,86 @@ fn config_path(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<Pat
 ///   }
 /// }
 /// ```
+/// A single hook command entry within a matcher group.
+struct HookCmd<'a> {
+    command: &'a str,
+    timeout: Option<u32>,
+    is_async: bool,
+}
+
 /// Each event holds an array of **matcher groups**, each with a
 /// `matcher` string (tool name filter, `""` = match all) and a
 /// `hooks` sub-array of command objects.
+/// Walk a matcher-group array for one hook event and split any
+/// **mixed** group (contains both kizu and user commands) into two
+/// sibling groups with the same `matcher`: a user-only group and a
+/// kizu-only group. This keeps `remove_kizu_hooks_from_json`'s
+/// group-level removal safe — after the split, the kizu group can
+/// be dropped wholesale without touching user commands.
+///
+/// Ordering: the resulting array keeps the original group at its
+/// position (now user-only) and inserts the kizu-only group
+/// immediately after it, so stable ordering is preserved and the
+/// usual "append to kizu-exclusive group" lookup still finds it.
+fn split_mixed_kizu_groups(arr: &mut Vec<serde_json::Value>) {
+    let mut i = 0;
+    while i < arr.len() {
+        let Some(group_obj) = arr[i].as_object() else {
+            i += 1;
+            continue;
+        };
+        let Some(hooks_arr) = group_obj.get("hooks").and_then(|h| h.as_array()) else {
+            i += 1;
+            continue;
+        };
+        let (kizu_cmds, user_cmds): (Vec<_>, Vec<_>) = hooks_arr.iter().cloned().partition(|cmd| {
+            cmd.get("command")
+                .and_then(|v| v.as_str())
+                .and_then(kizu_command_token)
+                .is_some()
+        });
+        if kizu_cmds.is_empty() || user_cmds.is_empty() {
+            // All-kizu or all-user — nothing to split.
+            i += 1;
+            continue;
+        }
+        // Mixed group. Rebuild into two siblings preserving the
+        // matcher string and any other group-level fields.
+        let matcher_val = group_obj.get("matcher").cloned();
+        let mut user_group = serde_json::Map::new();
+        let mut kizu_group = serde_json::Map::new();
+        if let Some(m) = matcher_val {
+            user_group.insert("matcher".to_string(), m.clone());
+            kizu_group.insert("matcher".to_string(), m);
+        }
+        user_group.insert("hooks".to_string(), serde_json::Value::Array(user_cmds));
+        kizu_group.insert("hooks".to_string(), serde_json::Value::Array(kizu_cmds));
+        arr[i] = serde_json::Value::Object(user_group);
+        arr.insert(i + 1, serde_json::Value::Object(kizu_group));
+        // Skip both the user group and its new kizu sibling.
+        i += 2;
+    }
+}
+
+/// Extract the `hook-<name>` token from a kizu hook invocation so we
+/// can reconcile by subcommand instead of by full command string.
+/// Returns `None` when the command does not look like a kizu hook
+/// (e.g. a user's linter), so non-kizu entries are never matched.
+fn kizu_command_token(command: &str) -> Option<String> {
+    for token in command.split_whitespace() {
+        if let Some(rest) = token.strip_prefix("hook-") {
+            if rest.is_empty() {
+                continue;
+            }
+            return Some(format!("hook-{rest}"));
+        }
+    }
+    None
+}
+
 fn merge_hooks_into_settings(
     path: &Path,
-    hooks: &[(&str, &str, &str)], // (event_name, matcher, command)
+    hooks: &[(&str, &str, &[HookCmd<'_>])], // (event_name, matcher, commands)
 ) -> Result<(usize, usize)> {
     let mut doc: serde_json::Value = if path.exists() {
         let content =
@@ -634,44 +819,128 @@ fn merge_hooks_into_settings(
     let mut added = 0;
     let mut skipped = 0;
 
-    for &(event_name, matcher, command) in hooks {
+    for (event_name, matcher, commands) in hooks {
         let matcher_groups = hooks_map
-            .entry(event_name)
+            .entry(*event_name)
             .or_insert_with(|| serde_json::json!([]));
         let arr = matcher_groups
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("hooks.{event_name} is not an array"))?;
 
-        // Check if any existing matcher group already has a kizu hook.
-        let already = arr.iter().any(|group| {
-            group
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .is_some_and(|cmds| {
-                    cmds.iter().any(|cmd| {
-                        cmd.get("command")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|c| {
-                                c.contains("kizu hook-")
-                                    || c.contains(" hook-post-tool")
-                                    || c.contains(" hook-stop")
-                            })
-                    })
-                })
+        // Pre-pass: split any pre-existing **mixed** matcher group
+        // (contains both kizu and user commands) into a user-only
+        // group plus a kizu-only sibling. `remove_kizu_hooks_from_json`
+        // removes any group containing a kizu command wholesale, so
+        // as long as a mixed group exists kizu's teardown path will
+        // still delete the user's hook. Migrating it here during
+        // `kizu init` makes subsequent teardowns safe without
+        // requiring the user to touch settings.json manually.
+        split_mixed_kizu_groups(arr);
+
+        // Gather all existing commands on this event so we can
+        // reconcile per-command instead of per-matcher-group. This is
+        // the upgrade path: a config that already contains
+        // `hook-post-tool` from an older kizu install must still
+        // receive new commands like `hook-log-event`.
+        let existing_cmds: Vec<String> = arr
+            .iter()
+            .flat_map(|group| {
+                group
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|cmd| cmd.get("command").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .collect();
+
+        // Partition the requested commands into "already present" and
+        // "missing". `kizu_command_token` extracts the subcommand
+        // (`hook-post-tool`, `hook-log-event`, …) so `--agent`
+        // differences or binary-path differences do not spawn a
+        // duplicate entry.
+        let mut missing: Vec<&HookCmd<'_>> = Vec::new();
+        for cmd in commands.iter() {
+            let want_token = kizu_command_token(cmd.command);
+            let is_present = existing_cmds
+                .iter()
+                .any(|existing| want_token.is_some() && kizu_command_token(existing) == want_token);
+            if is_present {
+                skipped += 1;
+            } else {
+                missing.push(cmd);
+            }
+        }
+
+        if missing.is_empty() {
+            continue;
+        }
+
+        // Prefer appending to an existing matcher group that is
+        // **kizu-exclusive** and shares the same `matcher`, so the
+        // upgraded config stays cohesive across reruns. Groups that
+        // also contain user-owned commands are intentionally skipped
+        // here: `remove_kizu_hooks_from_json` drops any group that
+        // holds a kizu command wholesale, so appending into a mixed
+        // group would bind the user's hook to kizu's teardown path
+        // and erase it on `kizu teardown`. Creating a fresh
+        // kizu-exclusive group for the missing commands keeps the
+        // user's hook uninvolved in kizu's install/uninstall lifecycle.
+        let target_idx = arr.iter().position(|group| {
+            let matches_matcher = group
+                .get("matcher")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| m == *matcher);
+            let cmds_opt = group.get("hooks").and_then(|h| h.as_array());
+            let Some(cmds) = cmds_opt else {
+                return false;
+            };
+            let has_any_kizu = cmds.iter().any(|cmd| {
+                cmd.get("command")
+                    .and_then(|v| v.as_str())
+                    .and_then(kizu_command_token)
+                    .is_some()
+            });
+            let all_kizu = cmds.iter().all(|cmd| {
+                cmd.get("command")
+                    .and_then(|v| v.as_str())
+                    .and_then(kizu_command_token)
+                    .is_some()
+            });
+            matches_matcher && has_any_kizu && all_kizu
         });
 
-        if already {
-            skipped += 1;
+        let cmd_values: Vec<serde_json::Value> = missing
+            .iter()
+            .map(|cmd| {
+                let mut obj = serde_json::json!({
+                    "type": "command",
+                    "command": cmd.command,
+                });
+                if let Some(t) = cmd.timeout {
+                    obj["timeout"] = serde_json::json!(t);
+                }
+                if cmd.is_async {
+                    obj["async"] = serde_json::json!(true);
+                }
+                obj
+            })
+            .collect();
+
+        if let Some(idx) = target_idx {
+            let group_hooks = arr[idx]
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+                .ok_or_else(|| anyhow::anyhow!("hooks.{event_name}[{idx}].hooks is not array"))?;
+            for v in cmd_values {
+                group_hooks.push(v);
+                added += 1;
+            }
         } else {
             arr.push(serde_json::json!({
                 "matcher": matcher,
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": command,
-                        "timeout": 10
-                    }
-                ]
+                "hooks": cmd_values
             }));
             added += 1;
         }
@@ -691,12 +960,35 @@ fn merge_hooks_into_settings(
 
 fn install_claude_code(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::ClaudeCode, scope, project_root)?;
-    let bin = kizu_bin_for_scope(scope);
-    let post_cmd = format!("{bin} hook-post-tool --agent claude-code");
-    let stop_cmd = format!("{bin} hook-stop --agent claude-code");
-    let hooks = &[
-        ("PostToolUse", "Edit|Write|MultiEdit", post_cmd.as_str()),
-        ("Stop", "", stop_cmd.as_str()),
+    let post_cmd = kizu_hook_command(scope, "hook-post-tool --agent claude-code");
+    let log_cmd = kizu_hook_command(scope, "hook-log-event");
+    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent claude-code");
+    let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[
+        (
+            "PostToolUse",
+            "Edit|Write|MultiEdit",
+            &[
+                HookCmd {
+                    command: &post_cmd,
+                    timeout: Some(10),
+                    is_async: false,
+                },
+                HookCmd {
+                    command: &log_cmd,
+                    timeout: None,
+                    is_async: true,
+                },
+            ],
+        ),
+        (
+            "Stop",
+            "",
+            &[HookCmd {
+                command: &stop_cmd,
+                timeout: Some(10),
+                is_async: false,
+            }],
+        ),
     ];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
@@ -730,35 +1022,48 @@ fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
         .and_then(|v| v.as_object_mut())
         .ok_or_else(|| anyhow::anyhow!("hooks is not an object in hooks.json"))?;
 
-    let bin = kizu_bin_for_scope(scope);
-    let post_cmd = format!("{bin} hook-post-tool --agent cursor");
-    let stop_cmd = format!("{bin} hook-stop --agent cursor");
-    let entries = &[
-        ("afterFileEdit", post_cmd.as_str()),
-        ("stop", stop_cmd.as_str()),
+    let post_cmd = kizu_hook_command(scope, "hook-post-tool --agent cursor");
+    let log_cmd = kizu_hook_command(scope, "hook-log-event");
+    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent cursor");
+    // `hook-log-event` rides alongside the scar scan on every edit
+    // so Cursor edits produce the event files that power stream
+    // mode. Without it, `SupportLevel::Full` was a lie for Cursor:
+    // scar scanning worked, but the Stream view stayed empty.
+    let entries: &[(&str, &[&str])] = &[
+        ("afterFileEdit", &[post_cmd.as_str(), log_cmd.as_str()]),
+        ("stop", &[stop_cmd.as_str()]),
     ];
 
     let mut added = 0;
     let mut skipped = 0;
-    for &(event, command) in entries {
+    for &(event, commands) in entries {
         let arr = hooks_map
             .entry(event)
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("hooks.{event} is not an array"))?;
 
-        let already = arr.iter().any(|e| {
-            e.get("command").and_then(|v| v.as_str()).is_some_and(|c| {
-                c.contains("kizu hook-")
-                    || c.contains(" hook-post-tool")
-                    || c.contains(" hook-stop")
-            })
-        });
-        if already {
-            skipped += 1;
-        } else {
-            arr.push(serde_json::json!({"command": command, "timeout": 10}));
-            added += 1;
+        // Reconcile per-command (matching on the `hook-*`
+        // subcommand token) so a rerun of `kizu init` upgrades an
+        // older install that lacks `hook-log-event`. The previous
+        // logic short-circuited on any kizu entry and skipped
+        // every command, which is how stream mode stayed inert on
+        // upgrade.
+        for command in commands {
+            let want_token = kizu_command_token(command);
+            let already = arr.iter().any(|e| {
+                e.get("command")
+                    .and_then(|v| v.as_str())
+                    .and_then(kizu_command_token)
+                    == want_token
+                    && want_token.is_some()
+            });
+            if already {
+                skipped += 1;
+            } else {
+                arr.push(serde_json::json!({"command": command, "timeout": 10}));
+                added += 1;
+            }
         }
     }
 
@@ -784,9 +1089,16 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
             .join("hooks.json"),
     };
     // Codex: Stop only (PreTool/PostTool is Bash-only).
-    let bin = kizu_bin_for_scope(scope);
-    let stop_cmd = format!("{bin} hook-stop --agent codex");
-    let hooks = &[("Stop", "", stop_cmd.as_str())];
+    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent codex");
+    let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[(
+        "Stop",
+        "",
+        &[HookCmd {
+            command: &stop_cmd,
+            timeout: Some(10),
+            is_async: false,
+        }],
+    )];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
         agent: AgentKind::Codex,
@@ -801,12 +1113,35 @@ fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
 
 fn install_qwen(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     let path = config_path(AgentKind::QwenCode, scope, project_root)?;
-    let bin = kizu_bin_for_scope(scope);
-    let post_cmd = format!("{bin} hook-post-tool --agent qwen");
-    let stop_cmd = format!("{bin} hook-stop --agent qwen");
-    let hooks = &[
-        ("PostToolUse", "Edit|Write|MultiEdit", post_cmd.as_str()),
-        ("Stop", "", stop_cmd.as_str()),
+    let post_cmd = kizu_hook_command(scope, "hook-post-tool --agent qwen");
+    let log_cmd = kizu_hook_command(scope, "hook-log-event");
+    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent qwen");
+    let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[
+        (
+            "PostToolUse",
+            "Edit|Write|MultiEdit",
+            &[
+                HookCmd {
+                    command: &post_cmd,
+                    timeout: Some(10),
+                    is_async: false,
+                },
+                HookCmd {
+                    command: &log_cmd,
+                    timeout: None,
+                    is_async: true,
+                },
+            ],
+        ),
+        (
+            "Stop",
+            "",
+            &[HookCmd {
+                command: &stop_cmd,
+                timeout: Some(10),
+                is_async: false,
+            }],
+        ),
     ];
     let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
     Ok(InstallReport {
@@ -939,6 +1274,24 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
                 agent_removed = true;
                 any_removed = true;
             }
+            // User-scope Cursor install lives at ~/.cursor/hooks.json,
+            // which `AgentKind::user_config_dir()` intentionally
+            // returns `None` for (Cursor uses hooks.json, not the
+            // settings.json shape the generic path handles). Install
+            // writes there; teardown must match.
+            if let Some(home) = dirs::home_dir()
+                && teardown_cursor_user_hooks(&home)?
+            {
+                let path = home.join(".cursor").join("hooks.json");
+                println!(
+                    "  {}  {}  {}",
+                    c_bold(&format!("{:<12}", "Cursor")),
+                    c_green("✓ removed"),
+                    c_dim(&format!("→ {}", path.display())),
+                );
+                agent_removed = true;
+                any_removed = true;
+            }
         }
         if agent.kind == AgentKind::Codex {
             // Codex project-scoped install writes to <repo>/.codex/hooks.json
@@ -1051,8 +1404,26 @@ fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Remove all hook entries whose `command` starts with `kizu hook-`
-/// from a JSON settings file. Returns `true` if anything was removed.
+/// Scrub kizu hook entries from `<home>/.cursor/hooks.json`,
+/// covering the user-scope install path that `install_cursor` uses
+/// when `Scope::User`. Split out of `run_teardown` so tests can
+/// inject a fake home directory without monkey-patching
+/// `dirs::home_dir()`. Returns `true` if anything was removed.
+fn teardown_cursor_user_hooks(home: &Path) -> Result<bool> {
+    let path = home.join(".cursor").join("hooks.json");
+    remove_kizu_hooks_from_json(&path)
+}
+
+/// Remove kizu hook entries from a JSON settings file. Returns
+/// `true` if anything was removed.
+///
+/// Removal is **command-level**, not group-level: a matcher group
+/// that mixes kizu and user commands keeps its non-kizu entries
+/// intact. This is the rollback-safety boundary — a user who ran
+/// `kizu teardown` without ever migrating via `kizu init` would
+/// otherwise lose their hand-added linter from any matcher group
+/// that happened to also contain a kizu hook. Groups left empty
+/// after scrubbing are pruned so the schema stays tidy.
 fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -1064,39 +1435,47 @@ fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
         return Ok(false);
     };
 
+    let is_kizu_cmd = |cmd: &serde_json::Value| -> bool {
+        cmd.get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| {
+                c.contains("kizu hook-")
+                    || c.contains(" hook-post-tool")
+                    || c.contains(" hook-stop")
+                    || c.contains(" hook-log-event")
+            })
+    };
+
     let mut removed = false;
     for (_event, entries) in hooks.iter_mut() {
         if let Some(arr) = entries.as_array_mut() {
+            // Pass 1: scrub kizu entries inside every nested matcher
+            // group, preserving user commands that shared the group.
+            for group in arr.iter_mut() {
+                if let Some(nested) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    let before = nested.len();
+                    nested.retain(|cmd| !is_kizu_cmd(cmd));
+                    if nested.len() < before {
+                        removed = true;
+                    }
+                }
+            }
+            // Pass 2: flat old-schema entries and now-empty matcher
+            // groups both drop out here. Flat entries have no nested
+            // `hooks` array, so they're filtered by the direct
+            // `command` check; groups whose `hooks` just emptied out
+            // in pass 1 are discarded now.
             let before = arr.len();
-            // New schema: each element is a matcher group with a
-            // `hooks` sub-array. Remove groups that contain kizu commands.
             arr.retain(|group| {
-                // Old flat schema: { "command": "kizu hook-..." }
-                let flat_kizu = group
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|c| {
-                        c.contains("kizu hook-")
-                            || c.contains(" hook-post-tool")
-                            || c.contains(" hook-stop")
-                    });
-                // New nested schema: { "matcher": "...", "hooks": [{ "command": "kizu hook-..." }] }
-                let nested_kizu =
-                    group
-                        .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .is_some_and(|cmds| {
-                            cmds.iter().any(|cmd| {
-                                cmd.get("command")
-                                    .and_then(|v| v.as_str())
-                                    .is_some_and(|c| {
-                                        c.contains("kizu hook-")
-                                            || c.contains(" hook-post-tool")
-                                            || c.contains(" hook-stop")
-                                    })
-                            })
-                        });
-                !flat_kizu && !nested_kizu
+                // Flat legacy shape: { "command": "kizu hook-..." }.
+                if is_kizu_cmd(group) {
+                    return false;
+                }
+                // Empty matcher group (no hooks or hooks:[]).
+                !matches!(
+                    group.get("hooks").and_then(|h| h.as_array()),
+                    Some(h) if h.is_empty()
+                )
             });
             if arr.len() < before {
                 removed = true;
@@ -1129,9 +1508,28 @@ mod tests {
                 (
                     "PostToolUse",
                     "Edit|Write",
-                    "kizu hook-post-tool --agent claude-code",
+                    &[
+                        HookCmd {
+                            command: "kizu hook-post-tool --agent claude-code",
+                            timeout: Some(10),
+                            is_async: false,
+                        },
+                        HookCmd {
+                            command: "kizu hook-log-event",
+                            timeout: None,
+                            is_async: true,
+                        },
+                    ],
                 ),
-                ("Stop", "", "kizu hook-stop --agent claude-code"),
+                (
+                    "Stop",
+                    "",
+                    &[HookCmd {
+                        command: "kizu hook-stop --agent claude-code",
+                        timeout: Some(10),
+                        is_async: false,
+                    }],
+                ),
             ],
         )
         .unwrap();
@@ -1143,13 +1541,21 @@ mod tests {
         let post = &doc["hooks"]["PostToolUse"].as_array().unwrap()[0];
         assert_eq!(post["matcher"].as_str().unwrap(), "Edit|Write");
         let cmds = post["hooks"].as_array().unwrap();
-        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0]["type"].as_str().unwrap(), "command");
         assert!(
             cmds[0]["command"]
                 .as_str()
                 .unwrap()
                 .contains("kizu hook-post-tool")
+        );
+        assert!(cmds[0].get("async").is_none());
+        assert_eq!(cmds[1]["async"].as_bool(), Some(true));
+        assert!(
+            cmds[1]["command"]
+                .as_str()
+                .unwrap()
+                .contains("hook-log-event")
         );
     }
 
@@ -1169,13 +1575,267 @@ mod tests {
             &[(
                 "PostToolUse",
                 "Edit|Write",
-                "kizu hook-post-tool --agent claude-code",
+                &[HookCmd {
+                    command: "kizu hook-post-tool --agent claude-code",
+                    timeout: Some(10),
+                    is_async: false,
+                }],
             )],
         )
         .unwrap();
 
         assert_eq!(added, 0);
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn merge_hooks_adds_missing_commands_to_existing_kizu_group() {
+        // Upgrade path: a user installed kizu from main (which only had
+        // `hook-post-tool`), then re-runs `kizu init` on v0.3. The new
+        // async `hook-log-event` must be appended even though a kizu
+        // command is already present — otherwise stream mode stays
+        // inert after the upgrade.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write|MultiEdit","hooks":[{"type":"command","command":"kizu hook-post-tool --agent claude-code","timeout":10}]}]}}"#,
+        )
+        .unwrap();
+
+        merge_hooks_into_settings(
+            &path,
+            &[(
+                "PostToolUse",
+                "Edit|Write|MultiEdit",
+                &[
+                    HookCmd {
+                        command: "kizu hook-post-tool --agent claude-code",
+                        timeout: Some(10),
+                        is_async: false,
+                    },
+                    HookCmd {
+                        command: "kizu hook-log-event",
+                        timeout: None,
+                        is_async: true,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let post = doc["hooks"]["PostToolUse"].as_array().unwrap();
+        let cmds: Vec<&str> = post
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+            .filter_map(|c| c["command"].as_str())
+            .collect();
+        assert!(
+            cmds.iter().any(|c| c.contains("hook-post-tool")),
+            "pre-existing hook-post-tool must remain: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("hook-log-event")),
+            "missing hook-log-event must be appended on rerun: {cmds:?}"
+        );
+        // The duplicate `hook-post-tool` must not be added twice.
+        let post_tool_count = cmds.iter().filter(|c| c.contains("hook-post-tool")).count();
+        assert_eq!(post_tool_count, 1, "duplicate must be suppressed");
+    }
+
+    #[test]
+    fn teardown_only_preserves_user_hooks_in_legacy_mixed_group() {
+        // Rollback path: a user upgraded from an older kizu that
+        // did not split mixed groups. They then run `kizu teardown`
+        // *without* first running `kizu init`, so the migration
+        // pre-pass never touches the file. `remove_kizu_hooks_from_json`
+        // must still scrub only kizu commands and leave the user's
+        // linter intact — dropping the whole group would silently
+        // delete user config.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write","hooks":[
+                {"type":"command","command":"kizu hook-post-tool --agent claude-code","timeout":10},
+                {"type":"command","command":"my-user-linter","timeout":5}
+            ]}]}}"#,
+        )
+        .unwrap();
+
+        let removed = remove_kizu_hooks_from_json(&path).unwrap();
+        assert!(removed, "teardown must report that something was removed");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = doc
+            .get("hooks")
+            .and_then(|h| h.get("PostToolUse"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let all_cmds: Vec<String> = arr
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|c| c["command"].as_str().map(String::from))
+            .collect();
+        assert!(
+            all_cmds.iter().any(|c| c.contains("my-user-linter")),
+            "user linter must survive direct teardown of a legacy mixed group, remaining: {all_cmds:?}"
+        );
+        assert!(
+            !all_cmds.iter().any(|c| c.contains("kizu hook-")),
+            "no kizu command must remain after teardown, remaining: {all_cmds:?}"
+        );
+    }
+
+    #[test]
+    fn init_then_teardown_preserves_user_hook_in_pre_existing_mixed_group() {
+        // The realistic upgrade path: a user's settings.json already
+        // has a mixed matcher group `[kizu hook-post-tool,
+        // my-user-linter]` from an older install plus a manual
+        // addition. `kizu init` must migrate that mixed group into
+        // a kizu-only group (carrying the pre-existing kizu command
+        // with it) and a user-only group, so that later
+        // `remove_kizu_hooks_from_json` removes only the kizu-only
+        // group and leaves `my-user-linter` alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write|MultiEdit","hooks":[
+                {"type":"command","command":"kizu hook-post-tool --agent claude-code","timeout":10},
+                {"type":"command","command":"my-user-linter","timeout":5}
+            ]}]}}"#,
+        )
+        .unwrap();
+
+        // Simulate a `kizu init` rerun with the v0.3 hook set.
+        merge_hooks_into_settings(
+            &path,
+            &[(
+                "PostToolUse",
+                "Edit|Write|MultiEdit",
+                &[
+                    HookCmd {
+                        command: "kizu hook-post-tool --agent claude-code",
+                        timeout: Some(10),
+                        is_async: false,
+                    },
+                    HookCmd {
+                        command: "kizu hook-log-event",
+                        timeout: None,
+                        is_async: true,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+
+        // Now run teardown.
+        remove_kizu_hooks_from_json(&path).unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = doc
+            .get("hooks")
+            .and_then(|h| h.get("PostToolUse"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let remaining_cmds: Vec<String> = arr
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|c| c["command"].as_str().map(String::from))
+            .collect();
+
+        assert!(
+            remaining_cmds.iter().any(|c| c.contains("my-user-linter")),
+            "user linter must survive `init` → `teardown`, remaining: {remaining_cmds:?}"
+        );
+        assert!(
+            !remaining_cmds.iter().any(|c| c.contains("kizu hook-")),
+            "no kizu command must remain after teardown, remaining: {remaining_cmds:?}"
+        );
+    }
+
+    #[test]
+    fn merge_hooks_does_not_append_into_mixed_user_and_kizu_group() {
+        // If a user has added their own hook to a matcher group that
+        // also contains a kizu command, a rerun of `kizu init` must
+        // NOT append new kizu commands into that mixed group — doing
+        // so lets `teardown` later erase the user's hook because
+        // `remove_kizu_hooks_from_json` drops any group containing a
+        // kizu command. Instead, create a new kizu-exclusive group.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write|MultiEdit","hooks":[
+                {"type":"command","command":"kizu hook-post-tool --agent claude-code","timeout":10},
+                {"type":"command","command":"my-user-linter","timeout":5}
+            ]}]}}"#,
+        )
+        .unwrap();
+
+        merge_hooks_into_settings(
+            &path,
+            &[(
+                "PostToolUse",
+                "Edit|Write|MultiEdit",
+                &[
+                    HookCmd {
+                        command: "kizu hook-post-tool --agent claude-code",
+                        timeout: Some(10),
+                        is_async: false,
+                    },
+                    HookCmd {
+                        command: "kizu hook-log-event",
+                        timeout: None,
+                        is_async: true,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = doc["hooks"]["PostToolUse"].as_array().unwrap();
+
+        // The original mixed group must remain untouched: it still
+        // contains exactly the original kizu hook-post-tool AND the
+        // user's linter, and it did NOT grow a new kizu command.
+        let mixed = &arr[0];
+        let mixed_cmds: Vec<&str> = mixed["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["command"].as_str())
+            .collect();
+        assert!(
+            mixed_cmds.iter().any(|c| c.contains("my-user-linter")),
+            "mixed group must keep the user linter, got {mixed_cmds:?}"
+        );
+        assert!(
+            !mixed_cmds.iter().any(|c| c.contains("hook-log-event")),
+            "new kizu command must NOT be appended into a mixed group: {mixed_cmds:?}"
+        );
+
+        // The missing kizu command must still be installed — it
+        // lives in a fresh kizu-exclusive group, so teardown can
+        // remove it without touching the user's linter.
+        let all_cmds: Vec<&str> = arr
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+            .filter_map(|c| c["command"].as_str())
+            .collect();
+        assert!(
+            all_cmds.iter().any(|c| c.contains("hook-log-event")),
+            "hook-log-event must still be installed somewhere, got {all_cmds:?}"
+        );
     }
 
     #[test]
@@ -1193,7 +1853,11 @@ mod tests {
             &[(
                 "PostToolUse",
                 "Edit|Write",
-                "kizu hook-post-tool --agent claude-code",
+                &[HookCmd {
+                    command: "kizu hook-post-tool --agent claude-code",
+                    timeout: Some(10),
+                    is_async: false,
+                }],
             )],
         )
         .unwrap();
@@ -1258,6 +1922,170 @@ mod tests {
     }
 
     #[test]
+    fn kizu_hook_command_quotes_path_for_local_and_user_scopes() {
+        // Agent hook backends run `command` through a shell. If the
+        // kizu binary lives at `/Users/John Doe/.cargo/bin/kizu`,
+        // emitting the raw path into `format!("{bin} hook-...")`
+        // yields a command where `sh` word-splits on the space and
+        // tries to exec the wrong argv[0]. Generated commands must
+        // therefore shell-quote the path for project-local / user
+        // scopes; project-shared keeps the bare `kizu` token since
+        // the binary is expected on PATH.
+        let with_space = "/Users/John Doe/.cargo/bin/kizu";
+        let local = super::kizu_hook_command_with_bin(
+            super::Scope::ProjectLocal,
+            with_space,
+            "hook-post-tool --agent claude-code",
+        );
+        assert!(
+            local.starts_with(r"'/Users/John Doe/.cargo/bin/kizu'"),
+            "project-local path with space must be single-quoted, got {local}"
+        );
+        assert!(
+            local.ends_with(" hook-post-tool --agent claude-code"),
+            "subcommand must follow the quoted path unchanged, got {local}"
+        );
+
+        // A single quote inside the path must get the `'\''` escape.
+        let with_quote = "/home/ev'an/kizu";
+        let user =
+            super::kizu_hook_command_with_bin(super::Scope::User, with_quote, "hook-log-event");
+        assert!(
+            user.starts_with(r"'/home/ev'\''an/kizu'"),
+            "embedded single quote must use `'\\''` escape, got {user}"
+        );
+
+        // Project-shared stays bare — this path is committed and is
+        // expected to resolve via PATH on every contributor's box.
+        let shared = super::kizu_hook_command_with_bin(
+            super::Scope::ProjectShared,
+            "kizu",
+            "hook-stop --agent claude-code",
+        );
+        assert_eq!(shared, "kizu hook-stop --agent claude-code");
+    }
+
+    #[test]
+    fn shell_single_quote_wraps_and_escapes_embedded_quotes() {
+        // Plain path: wrapped only.
+        assert_eq!(
+            super::shell_single_quote("/usr/bin/kizu"),
+            "'/usr/bin/kizu'"
+        );
+        // Path with a space: still one literal token after the shim parses it.
+        assert_eq!(
+            super::shell_single_quote("/Users/John Doe/kizu"),
+            "'/Users/John Doe/kizu'"
+        );
+        // Path containing a single quote gets the standard '\'' escape.
+        assert_eq!(
+            super::shell_single_quote("/home/ev'an/kizu"),
+            r"'/home/ev'\''an/kizu'"
+        );
+    }
+
+    #[test]
+    fn pre_commit_shim_body_quotes_bin_with_spaces() {
+        let shim = super::pre_commit_shim_body("/Users/John Doe/kizu", false);
+        // The shim must contain the quoted form so `/bin/sh` does
+        // not wordsplit at the space.
+        assert!(
+            shim.contains("'/Users/John Doe/kizu' hook-pre-commit"),
+            "shim body should quote the binary path; got:\n{shim}"
+        );
+        // And must NOT contain the unquoted form that would break.
+        assert!(
+            !shim.contains("/Users/John Doe/kizu hook-pre-commit"),
+            "shim body must not embed the unquoted path; got:\n{shim}"
+        );
+    }
+
+    #[test]
+    fn pre_commit_shim_body_with_user_hook_still_quotes_bin() {
+        let shim = super::pre_commit_shim_body("/p with space/kizu", true);
+        assert!(shim.contains("'/p with space/kizu' hook-pre-commit"));
+        assert!(shim.contains("pre-commit.user"));
+    }
+
+    #[test]
+    fn install_cursor_writes_hook_log_event_for_stream_mode() {
+        // Cursor is advertised as `SupportLevel::Full`, which implies
+        // stream mode works — stream mode only works when the
+        // `hook-log-event` hook fires on every edit. Without it,
+        // `afterFileEdit` only runs `hook-post-tool` (scar scan)
+        // and no event file is ever written, leaving the Stream
+        // view permanently empty for Cursor sessions. Install must
+        // wire `hook-log-event` alongside the existing scar hook.
+        let tmp = tempfile::tempdir().unwrap();
+        let report = super::install_cursor(super::Scope::ProjectLocal, tmp.path()).unwrap();
+        assert!(
+            report.entries_added > 0,
+            "fresh install must add at least one entry"
+        );
+        let path = tmp.path().join(".cursor").join("hooks.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let after_edit = doc["hooks"]["afterFileEdit"]
+            .as_array()
+            .expect("afterFileEdit must be an array");
+        let commands: Vec<&str> = after_edit
+            .iter()
+            .filter_map(|e| e["command"].as_str())
+            .collect();
+        assert!(
+            commands.iter().any(|c| c.contains("hook-log-event")),
+            "afterFileEdit must install hook-log-event for stream mode, got {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("hook-post-tool")),
+            "afterFileEdit must also keep the scar scan hook, got {commands:?}"
+        );
+    }
+
+    #[test]
+    fn teardown_removes_cursor_user_scope_hooks_json() {
+        // `install_cursor` writes to `~/.cursor/hooks.json` for
+        // `Scope::User`, but the earlier teardown path only scrubbed
+        // `<project>/.cursor/hooks.json`. A user who installed Cursor
+        // hooks globally was told teardown found nothing while the
+        // global afterFileEdit/stop hooks kept firing in every later
+        // Cursor session. Teardown must remove the user-scope file
+        // too, using the same path install wrote to.
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+        let cursor_dir = fake_home.join(".cursor");
+        fs::create_dir_all(&cursor_dir).unwrap();
+        let hooks_path = cursor_dir.join("hooks.json");
+        fs::write(
+            &hooks_path,
+            r#"{"version":1,"hooks":{"afterFileEdit":[{"command":"kizu hook-post-tool --agent cursor","timeout":10}],"stop":[{"command":"kizu hook-stop --agent cursor","timeout":10}]}}"#,
+        )
+        .unwrap();
+
+        let removed =
+            super::teardown_cursor_user_hooks(fake_home).expect("user-scope teardown must succeed");
+        assert!(
+            removed,
+            "teardown must report removal of the user-scope cursor hooks file"
+        );
+
+        // After removal, the file no longer carries kizu entries.
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let all_cmds: Vec<String> = doc["hooks"]
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.values())
+            .flat_map(|v| v.as_array().cloned().unwrap_or_default())
+            .filter_map(|c| c["command"].as_str().map(String::from))
+            .collect();
+        assert!(
+            !all_cmds.iter().any(|c| c.contains("kizu hook-")),
+            "no kizu command must remain in user-scope Cursor hooks, got {all_cmds:?}"
+        );
+    }
+
+    #[test]
     fn teardown_removes_codex_project_scoped_hooks_json() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -1281,5 +2109,56 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
         let hooks = doc["hooks"].as_object().unwrap();
         assert!(hooks.is_empty(), "all kizu entries should be gone");
+    }
+
+    /// The interactive agent picker pads two columns: agent name to 12
+    /// cells, support-level pill to 18 cells. Both paddings must be
+    /// done via `pad_visible` (not `{:<N}`) so ANSI escapes don't
+    /// inflate the count. Cf. ADR-0019.
+    #[test]
+    fn agent_label_columns_are_visually_aligned() {
+        use crate::prompt::visible_width;
+
+        let detected = AgentKind::all()
+            .iter()
+            .map(|&kind| DetectedAgent {
+                kind,
+                binary_found: matches!(kind, AgentKind::ClaudeCode),
+                config_dir_found: matches!(kind, AgentKind::ClaudeCode),
+                recommended: matches!(kind, AgentKind::ClaudeCode),
+            })
+            .collect::<Vec<_>>();
+
+        // Build the labels exactly as `select_agents_interactive` would.
+        let labels: Vec<String> = detected
+            .iter()
+            .map(|d| {
+                let sl = support_level(d.kind);
+                format!(
+                    "{}  {}  {}",
+                    pad_visible(&c_bold(&d.kind.to_string()), 12),
+                    pad_visible(&support_level_colored(sl), 18),
+                    detection_status_colored(d),
+                )
+            })
+            .collect();
+
+        // For each label, the prefix up to where the **third** column
+        // begins must land at exactly 12 + 2 + 18 + 2 = 34 cells.
+        let third_col_start_cells = 12 + 2 + 18 + 2;
+        for (d, label) in detected.iter().zip(labels.iter()) {
+            let status = detection_status_colored(d);
+            let total = visible_width(label);
+            let status_w = visible_width(&status);
+            assert_eq!(
+                total.checked_sub(status_w),
+                Some(third_col_start_cells),
+                "misaligned row for {:?}: total={} status_w={} label={:?}",
+                d.kind,
+                total,
+                status_w,
+                label,
+            );
+        }
     }
 }

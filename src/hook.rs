@@ -1,7 +1,16 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Compiled once per process. Hook subcommands fire on every
+/// PostToolUse / Stop invocation, so recompiling this regex per call
+/// would bill the cost to Claude Code's tool-use latency.
+static SCAR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--)\s*@kizu\[(\w+)\]:\s*(.*)").expect("scar regex")
+});
 
 /// Supported AI coding agent kinds. Determines how stdin JSON is
 /// parsed and how stdout feedback is formatted.
@@ -32,11 +41,8 @@ impl AgentKind {
 /// JSON dialects.
 #[derive(Debug, Clone)]
 pub struct NormalizedHookInput {
-    #[allow(dead_code)]
     pub session_id: Option<String>,
-    #[allow(dead_code)]
     pub hook_event_name: String,
-    #[allow(dead_code)]
     pub tool_name: Option<String>,
     pub file_paths: Vec<PathBuf>,
     pub cwd: Option<PathBuf>,
@@ -127,8 +133,6 @@ pub struct ScarHit {
 /// after optional whitespace). This avoids false positives from
 /// string literals in test code that happen to contain `@kizu[`.
 pub fn scan_scars(paths: &[PathBuf]) -> Vec<ScarHit> {
-    let re = regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--)\s*@kizu\[(\w+)\]:\s*(.*)")
-        .expect("scar regex");
     let mut hits = Vec::new();
     for path in paths {
         let content = match std::fs::read_to_string(path) {
@@ -136,7 +140,12 @@ pub fn scan_scars(paths: &[PathBuf]) -> Vec<ScarHit> {
             Err(_) => continue,
         };
         let fence_aware = is_fenced_code_aware(path);
-        hits.extend(scan_content_for_scars(&re, &content, path, fence_aware));
+        hits.extend(scan_content_for_scars(
+            &SCAR_RE,
+            &content,
+            path,
+            fence_aware,
+        ));
     }
     hits
 }
@@ -243,8 +252,6 @@ fn scan_content_for_scars(
 /// staged blob via `git show :<path>` so that worktree edits after
 /// staging don't mask scars that are actually about to be committed.
 pub fn scan_scars_from_index(root: &Path, paths: &[PathBuf]) -> Vec<ScarHit> {
-    let re = regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--)\s*@kizu\[(\w+)\]:\s*(.*)")
-        .expect("scar regex");
     let mut hits = Vec::new();
     for path in paths {
         let rel = match path.strip_prefix(root) {
@@ -261,9 +268,185 @@ pub fn scan_scars_from_index(root: &Path, paths: &[PathBuf]) -> Vec<ScarHit> {
         };
         let content = String::from_utf8_lossy(&output.stdout);
         let fence_aware = is_fenced_code_aware(path);
-        hits.extend(scan_content_for_scars(&re, &content, path, fence_aware));
+        hits.extend(scan_content_for_scars(
+            &SCAR_RE,
+            &content,
+            path,
+            fence_aware,
+        ));
     }
     hits
+}
+
+/// Sanitized event metadata for the stream mode event log.
+/// Contains only non-sensitive metadata — code content, prompts,
+/// and agent responses are stripped during sanitization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SanitizedEvent {
+    pub session_id: Option<String>,
+    pub hook_event_name: String,
+    pub tool_name: Option<String>,
+    pub file_paths: Vec<PathBuf>,
+    pub cwd: PathBuf,
+    pub timestamp_ms: u64,
+}
+
+/// Convert a [`NormalizedHookInput`] into a [`SanitizedEvent`],
+/// stripping all code content and adding a timestamp.
+pub fn sanitize_event(input: &NormalizedHookInput) -> SanitizedEvent {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    SanitizedEvent {
+        session_id: input.session_id.clone(),
+        hook_event_name: input.hook_event_name.clone(),
+        tool_name: input.tool_name.clone(),
+        file_paths: input.file_paths.clone(),
+        cwd: input.cwd.clone().unwrap_or_default(),
+        timestamp_ms,
+    }
+}
+
+/// Write a [`SanitizedEvent`] to the events directory as an atomic
+/// JSON file. Returns the path of the written file. The events
+/// directory is created with `0700` permissions if it doesn't exist.
+/// Individual event files are written with `0600` permissions.
+///
+/// Filenames include a uniqueness suffix (`pid` + nanosecond remainder)
+/// so two hook processes firing in the same millisecond cannot
+/// overwrite each other — the earlier format `<ms>-<tool>.json` was
+/// collision-prone because `SanitizedEvent.timestamp_ms` is only
+/// millisecond-precise. Temp files use the same suffix and are
+/// created with `create_new` so a cross-process collision fails the
+/// rename cleanly instead of silently replacing an in-flight event.
+pub fn write_event(event: &SanitizedEvent) -> Result<PathBuf> {
+    let dir = crate::paths::events_dir(&event.cwd)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve kizu events directory"))?;
+    crate::paths::ensure_private_dir(&dir)?;
+
+    let tool = event.tool_name.as_deref().unwrap_or("unknown");
+    let uniq = unique_filename_suffix();
+    let filename = format!("{}-{}-{}.json", event.timestamp_ms, tool, uniq);
+    let dest = dir.join(&filename);
+
+    let json = serde_json::to_string(event).context("serializing event")?;
+
+    // Atomic write: write to a **unique** temp path (same uniqueness
+    // suffix as the final filename) then rename. `create_new`
+    // equivalent via OpenOptions::create_new prevents two concurrent
+    // writers from racing on the same temp file.
+    let tmp_path = dir.join(format!(".{filename}.tmp"));
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp_path)
+            .with_context(|| format!("creating temp event file {}", tmp_path.display()))?;
+        f.write_all(json.as_bytes())
+            .with_context(|| format!("writing temp event file {}", tmp_path.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        // Belt-and-braces: enforce 0600 even when OpenOptions::mode
+        // is a no-op (non-Unix fallback builds).
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    std::fs::rename(&tmp_path, &dest)
+        .with_context(|| format!("renaming event file to {}", dest.display()))?;
+
+    Ok(dest)
+}
+
+/// Build a per-invocation uniqueness suffix from the process id and
+/// the sub-millisecond nanosecond remainder. Collisions require two
+/// processes sharing the same pid **and** the same ns timestamp in
+/// the same millisecond window — not possible on a single machine.
+fn unique_filename_suffix() -> String {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{pid:x}{nanos:09}")
+}
+
+/// Prune the events directory: remove entries older than `ttl` and
+/// enforce a maximum entry count. Returns the number of files removed.
+/// Uses the default events directory from [`crate::paths::events_dir`].
+pub fn prune_event_log(root: &Path, ttl: Duration, max_entries: usize) -> Result<usize> {
+    let dir = match crate::paths::events_dir(root) {
+        Some(d) if d.is_dir() => d,
+        _ => return Ok(0),
+    };
+    prune_event_log_in(&dir, ttl, max_entries)
+}
+
+/// Prune events in the given directory. Testable variant of
+/// [`prune_event_log`] that accepts an explicit path.
+pub fn prune_event_log_in(dir: &Path, ttl: Duration, max_entries: usize) -> Result<usize> {
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+
+    let mut entries: Vec<(PathBuf, u64)> = Vec::new();
+    for entry in std::fs::read_dir(dir).context("reading events dir")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip temp files.
+        if name_str.starts_with('.') {
+            continue;
+        }
+        // Parse timestamp from filename: <timestamp_ms>-<tool>.json
+        if let Some(ts_str) = name_str.split('-').next()
+            && let Ok(ts) = ts_str.parse::<u64>()
+        {
+            entries.push((entry.path(), ts));
+        }
+    }
+
+    // Sort oldest first.
+    entries.sort_by_key(|(_, ts)| *ts);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let ttl_ms = ttl.as_millis() as u64;
+
+    let mut removed = 0;
+
+    // Pass 1: remove entries older than TTL.
+    entries.retain(|(path, ts)| {
+        if now_ms.saturating_sub(*ts) > ttl_ms {
+            let _ = std::fs::remove_file(path);
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+
+    // Pass 2: enforce max entries (remove oldest first).
+    if entries.len() > max_entries {
+        let excess = entries.len() - max_entries;
+        for (path, _) in entries.iter().take(excess) {
+            let _ = std::fs::remove_file(path);
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
 }
 
 /// List files that might contain scars, scoped by the kizu session
@@ -295,12 +478,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .context("git diff baseline..HEAD")?;
         if diff_base.status.success() {
-            for record in diff_base.stdout.split(|&b| b == 0) {
-                if !record.is_empty() {
-                    let rel = String::from_utf8_lossy(record);
-                    paths.push(root.join(rel.as_ref()));
-                }
-            }
+            extend_from_nul_list(&mut paths, root, &diff_base.stdout);
         } else {
             any_failed = true;
         }
@@ -312,12 +490,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .context("git diff HEAD")?;
         if diff_head.status.success() {
-            for record in diff_head.stdout.split(|&b| b == 0) {
-                if !record.is_empty() {
-                    let rel = String::from_utf8_lossy(record);
-                    paths.push(root.join(rel.as_ref()));
-                }
-            }
+            extend_from_nul_list(&mut paths, root, &diff_head.stdout);
         } else {
             any_failed = true;
         }
@@ -329,12 +502,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .context("git diff --cached")?;
         if diff_cached.status.success() {
-            for record in diff_cached.stdout.split(|&b| b == 0) {
-                if !record.is_empty() {
-                    let rel = String::from_utf8_lossy(record);
-                    paths.push(root.join(rel.as_ref()));
-                }
-            }
+            extend_from_nul_list(&mut paths, root, &diff_cached.stdout);
         } else {
             any_failed = true;
         }
@@ -349,12 +517,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
                 .output()
                 .context("git ls-files (fallback)")?;
             if ls_output.status.success() {
-                for record in ls_output.stdout.split(|&b| b == 0) {
-                    if !record.is_empty() {
-                        let rel = String::from_utf8_lossy(record);
-                        paths.push(root.join(rel.as_ref()));
-                    }
-                }
+                extend_from_nul_list(&mut paths, root, &ls_output.stdout);
             }
         }
     } else {
@@ -365,12 +528,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .context("git ls-files")?;
         if ls_output.status.success() {
-            for record in ls_output.stdout.split(|&b| b == 0) {
-                if !record.is_empty() {
-                    let rel = String::from_utf8_lossy(record);
-                    paths.push(root.join(rel.as_ref()));
-                }
-            }
+            extend_from_nul_list(&mut paths, root, &ls_output.stdout);
         }
     }
 
@@ -395,10 +553,27 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Extend `paths` with each NUL-separated relative path in `stdout`,
+/// joined onto `root`. Shared by the four `git diff --name-only -z` /
+/// `git ls-files -z` branches in [`enumerate_session_files`].
+fn extend_from_nul_list(paths: &mut Vec<PathBuf>, root: &Path, stdout: &[u8]) {
+    for record in stdout.split(|&b| b == 0) {
+        if !record.is_empty() {
+            let rel = String::from_utf8_lossy(record);
+            paths.push(root.join(rel.as_ref()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate `KIZU_STATE_DIR` so cargo's
+    /// parallel test runner does not interleave env-var writes.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_hook_input_extracts_claude_code_post_tool_use() {
@@ -713,6 +888,217 @@ mod tests {
         assert_eq!(AgentKind::from_str("qwen"), Some(AgentKind::QwenCode));
         assert_eq!(AgentKind::from_str("cline"), Some(AgentKind::Cline));
         assert_eq!(AgentKind::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn sanitize_event_strips_content_and_adds_timestamp() {
+        let input = NormalizedHookInput {
+            session_id: Some("sess-1".to_string()),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Edit".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/foo.rs")],
+            cwd: Some(PathBuf::from("/tmp/project")),
+            stop_hook_active: false,
+        };
+        let event = sanitize_event(&input);
+        assert_eq!(event.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(event.hook_event_name, "PostToolUse");
+        assert_eq!(event.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(event.file_paths, vec![PathBuf::from("/tmp/foo.rs")]);
+        assert_eq!(event.cwd, PathBuf::from("/tmp/project"));
+        assert!(event.timestamp_ms > 0);
+    }
+
+    #[test]
+    fn sanitize_event_serialized_json_has_no_content_fields() {
+        let input = NormalizedHookInput {
+            session_id: Some("sess-2".to_string()),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Write".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/bar.rs")],
+            cwd: Some(PathBuf::from("/tmp")),
+            stop_hook_active: false,
+        };
+        let event = sanitize_event(&input);
+        let json = serde_json::to_string(&event).unwrap();
+        // Verify no content/response/prompt fields leak through.
+        assert!(!json.contains("\"content\""));
+        assert!(!json.contains("\"new_string\""));
+        assert!(!json.contains("\"old_string\""));
+        assert!(!json.contains("\"output\""));
+        assert!(!json.contains("\"prompt\""));
+        // Verify expected fields are present.
+        assert!(json.contains("\"session_id\""));
+        assert!(json.contains("\"tool_name\""));
+        assert!(json.contains("\"file_paths\""));
+        assert!(json.contains("\"timestamp_ms\""));
+    }
+
+    #[test]
+    fn write_event_creates_file_with_correct_content() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("KIZU_STATE_DIR", tmp.path().to_str().unwrap()) };
+
+        let event = SanitizedEvent {
+            session_id: Some("test-sess".to_string()),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Edit".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/foo.rs")],
+            cwd: PathBuf::from("/tmp"),
+            timestamp_ms: 1700000000000,
+        };
+        let path = write_event(&event).unwrap();
+
+        unsafe { std::env::remove_var("KIZU_STATE_DIR") };
+
+        assert!(path.exists());
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            name.starts_with("1700000000000-Edit-"),
+            "filename must begin with `<ms>-<tool>-` and carry a uniqueness suffix, got {name}"
+        );
+        assert!(
+            name.ends_with(".json"),
+            "filename must end with `.json`, got {name}"
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: SanitizedEvent = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn write_event_same_millisecond_produces_distinct_files() {
+        // Two hook invocations in the same millisecond with the same
+        // tool name must NOT overwrite each other. The earlier
+        // implementation used `<ms>-<tool>.json` with a predictable
+        // `.{filename}.tmp` scratch path, so two concurrent writes
+        // raced on both the temp and destination names — one event
+        // silently vanished, poisoning later per-operation diffs
+        // because the next event for the same file diffed against
+        // the wrong prior snapshot.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("KIZU_STATE_DIR", tmp.path().to_str().unwrap()) };
+
+        let event_a = SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Edit".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/a.rs")],
+            cwd: PathBuf::from("/tmp"),
+            timestamp_ms: 1_800_000_000_000,
+        };
+        let event_b = SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Edit".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/b.rs")],
+            cwd: PathBuf::from("/tmp"),
+            timestamp_ms: 1_800_000_000_000, // same ms
+        };
+        let path_a = write_event(&event_a).unwrap();
+        let path_b = write_event(&event_b).unwrap();
+
+        unsafe { std::env::remove_var("KIZU_STATE_DIR") };
+
+        assert_ne!(
+            path_a, path_b,
+            "same-millisecond writes must land in distinct files, got {path_a:?} vs {path_b:?}"
+        );
+        assert!(path_a.exists(), "first event file missing: {path_a:?}");
+        assert!(path_b.exists(), "second event file missing: {path_b:?}");
+    }
+
+    #[test]
+    fn write_event_sets_0600_permissions() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("KIZU_STATE_DIR", tmp.path().to_str().unwrap()) };
+
+        let event = SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Write".to_string()),
+            file_paths: vec![],
+            cwd: PathBuf::from("/tmp"),
+            timestamp_ms: 1700000000001,
+        };
+        let path = write_event(&event).unwrap();
+
+        unsafe { std::env::remove_var("KIZU_STATE_DIR") };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn prune_removes_old_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_dir = tmp.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+
+        // Write an "old" event (timestamp 1000, effectively ancient).
+        let old_file = events_dir.join("1000-Edit.json");
+        std::fs::write(&old_file, "{}").unwrap();
+
+        // Write a "recent" event.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let new_file = events_dir.join(format!("{now_ms}-Write.json"));
+        std::fs::write(&new_file, "{}").unwrap();
+
+        let removed = prune_event_log_in(&events_dir, Duration::from_secs(3600), 1000).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!old_file.exists());
+        assert!(new_file.exists());
+    }
+
+    #[test]
+    fn prune_enforces_max_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_dir = tmp.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Create 5 recent events.
+        for i in 0..5 {
+            let file = events_dir.join(format!("{}-Edit.json", now_ms + i));
+            std::fs::write(&file, "{}").unwrap();
+        }
+
+        // Prune with max_entries = 3.
+        let removed = prune_event_log_in(&events_dir, Duration::from_secs(86400), 3).unwrap();
+
+        assert_eq!(removed, 2);
+        let remaining: Vec<_> = std::fs::read_dir(&events_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(remaining.len(), 3);
+    }
+
+    #[test]
+    fn prune_returns_zero_when_events_dir_missing() {
+        let removed = prune_event_log_in(
+            Path::new("/nonexistent/path"),
+            Duration::from_secs(3600),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(removed, 0);
     }
 
     #[test]

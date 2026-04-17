@@ -24,5 +24,15 @@
         "matcher": ""
       }
     ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cargo clippy *)",
+      "Bash(cargo check *)",
+      "Bash(draftsnap prompt)",
+      "Bash(obsidian search:context *)",
+      "Bash(gh search *)",
+      "Bash(cargo search *)"
+    ]
   }
 }

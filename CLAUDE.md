@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **kizu** は AI コーディングエージェント (Claude Code, Cursor, Codex, Qwen Code, Cline, Gemini 等) と並走させるリアルタイム diff 監視 + inline scar review TUI。Rust 製の単一バイナリ。
 
-現状は **v0.2 実装中** (feat/v0.2 ブランチ)。v0.1 MVP (diff 監視 TUI) に加え、scar (`@kizu[ask|reject|free]:`) によるインラインレビュー、マルチエージェント hook 統合、`kizu init/teardown` CLI を実装済み。
+現状は **v0.3** (feat/v0.3 ブランチで PR レビュー中 → main へのマージ待ち)。v0.2 までの scar + hook 層に加えて、ストリームモード (Tab 切替の操作履歴ビュー、`hook-log-event` が書き出す JSON を `git diff` snapshot の差分で per-operation diff 化)、`--attach` ターミナル自動分割 (tmux / zellij / kitty / Ghostty)、`~/.config/kizu/config.toml` (キーバインド・色・デバウンス・エディタ・分割先)、scar undo stack (`u`)、適応的 `j`/`k` ナビゲーション、Claude Code プラグイン (`plugin/`) を実装済み。
 
 ## 実装前に必ず読むもの
 
@@ -119,6 +119,14 @@ cd tests/e2e && bun install --frozen-lockfile && KIZU_BIN=../../target/release/k
 - **file view** (Enter): worktree ファイル全体を表示、hunk 内の Added 行に BG_ADDED を適用。j/k = chunk scroll, J/K = 1 行移動
 - **検索** (`/`): smart case (全小文字 → case-insensitive)、`n`/`N` で match 間ジャンプ (wrap-around)
 - **入力フィールド** (scar comment `c`, search `/`): フッター上の独立行に描画、折り返し対応、unicode-width でカーソル位置計算 (CJK 対応)、bracketed paste で IME 入力対応
+
+## v0.3 実装上のメモ
+
+- **hook-log-event** (`src/hook.rs`): `SanitizedEvent` に stdin JSON を sanitize (tool_input.content / tool_response.output を削除) して `<state_dir>/events/<timestamp>-<tool>.json` に atomic write。dir 0700 / file 0600。`prune_event_log` で TTL 24h + 上限 1000 エントリを自動削除。`KIZU_EVENT_TTL_SECS` で TTL 上書き可能
+- **設定ファイル** (`src/config.rs`): `~/.config/kizu/config.toml` (TOML 形式) でキーバインドリマップ、diff 背景色、デバウンスタイミング、エディタコマンド、ターミナル分割設定を変更可能。`#[serde(default)]` で部分 TOML を既定値にマージ。`$KIZU_CONFIG` で設定ファイルパスを上書き可能
+- **ストリームモード** (`src/app.rs` ViewMode::Stream): PostToolUse hook が書き出すイベントログを時系列で一覧表示する TUI ビュー。Tab キーでメイン diff ビューと切り替え。各イベントの per-operation diff は TUI がリアルタイムに `git diff` snapshot の差分計算で生成。TUI 起動前のイベントは metadata のみ表示。`WatchEvent::EventLog` で events dir を監視
+- **`--attach`** (`src/attach.rs`): ターミナル自動検出 ($TMUX → $ZELLIJ → $KITTY_LISTEN_ON → $TERM_PROGRAM=ghostty) + 分割コマンド実行。config の `[attach].terminal` で強制指定可能。Ghostty は macOS のみ (AppleScript)
+- **Claude Code プラグイン** (`plugin/`): `plugin.json` で PostToolUse (hook-post-tool + hook-log-event async) / Stop (hook-stop) hook を宣言、`/kizu` スラッシュコマンドでセッション状態確認
 
 ## ADR の運用
 

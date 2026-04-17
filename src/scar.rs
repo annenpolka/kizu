@@ -72,12 +72,6 @@ impl CommentSyntax {
 pub enum ScarKind {
     Ask,
     Reject,
-    // Wired up in the later M4 slice that adds the `c` free-text
-    // input mode. Until then `Free` is exercised only by the
-    // render / insert unit tests, so dead_code would otherwise
-    // fire — explicit allow keeps the variant visible in the
-    // API surface without hiding it behind a conditional compile.
-    #[allow(dead_code)]
     Free,
 }
 
@@ -178,11 +172,33 @@ pub fn detect_comment_syntax(path: &Path) -> CommentSyntax {
 ///
 /// # Errors
 ///
-/// Returns an error when the file cannot be read (missing,
-/// permission-denied, non-UTF-8 in v0.2 scope) or the write-back
-/// fails (read-only mount, disk full). The caller is expected to
-/// surface this error through `App.last_error` rather than panic.
-pub fn insert_scar(path: &Path, line_number: usize, kind: ScarKind, body: &str) -> Result<()> {
+/// Receipt of a successful scar insertion, for undo / audit.
+///
+/// `rendered` is the exact comment line written (without trailing
+/// newline) — `remove_scar` uses it to verify the line still matches
+/// before deleting, so a user edit between insert and undo is detected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScarInsert {
+    pub line_1indexed: usize,
+    pub rendered: String,
+}
+
+/// Insert a kizu scar above `line_number` (1-indexed) in `path`.
+///
+/// Returns:
+/// - `Ok(Some(ScarInsert))` — scar was written; receipt captures the
+///   exact rendered line + its 1-indexed position post-insert, so
+///   callers can store it for undo.
+/// - `Ok(None)` — idempotent no-op (an identical scar already sits
+///   immediately above the target line).
+/// - `Err(...)` — file read / write failed. Callers surface this via
+///   `App.last_error` rather than panicking.
+pub fn insert_scar(
+    path: &Path,
+    line_number: usize,
+    kind: ScarKind,
+    body: &str,
+) -> Result<Option<ScarInsert>> {
     let syntax = detect_comment_syntax(path);
     let scar_body = syntax.render_scar(kind, body);
     let original = std::fs::read_to_string(path)
@@ -201,18 +217,31 @@ pub fn insert_scar(path: &Path, line_number: usize, kind: ScarKind, body: &str) 
     let target = line_number.max(1);
     let insert_at = target.saturating_sub(1).min(line_count);
 
+    // Inherit indentation so the scar reads as an inline comment on
+    // the code it annotates. Prefer the target line's own indent;
+    // fall back to the nearest non-blank line (forward first, then
+    // back) when the target itself is blank. A fully blank surround
+    // yields an empty prefix, which matches "no indent".
+    let indent = inherited_indent(&lines, insert_at);
+    let scar_line = if indent.is_empty() {
+        scar_body.clone()
+    } else {
+        format!("{indent}{scar_body}")
+    };
+
     // Idempotent guard: if the line immediately above the insertion
-    // point is already the same scar, leave the file untouched so
-    // repeated keypresses don't stack duplicates.
+    // point is already the same scar (modulo leading whitespace), leave
+    // the file untouched. The trim pass on both sides handles the case
+    // where the existing scar was written with a different indent.
     if insert_at > 0 {
         let prev_raw = lines[insert_at - 1];
         let prev_trimmed = prev_raw.trim_end_matches('\n').trim_end_matches('\r');
         if prev_trimmed.trim() == scar_body.trim() {
-            return Ok(());
+            return Ok(None);
         }
     }
 
-    let mut out = String::with_capacity(original.len() + scar_body.len() + newline.len() * 2);
+    let mut out = String::with_capacity(original.len() + scar_line.len() + newline.len() * 2);
     for line in &lines[..insert_at] {
         out.push_str(line);
     }
@@ -222,7 +251,7 @@ pub fn insert_scar(path: &Path, line_number: usize, kind: ScarKind, body: &str) 
     if insert_at > 0 && !lines[insert_at - 1].ends_with('\n') {
         out.push_str(newline);
     }
-    out.push_str(&scar_body);
+    out.push_str(&scar_line);
     out.push_str(newline);
     for line in &lines[insert_at..] {
         out.push_str(line);
@@ -230,7 +259,98 @@ pub fn insert_scar(path: &Path, line_number: usize, kind: ScarKind, body: &str) 
 
     std::fs::write(path, out)
         .with_context(|| format!("writing {} with scar inserted", path.display()))?;
-    Ok(())
+    // Post-insert: the scar occupies 1-indexed line `insert_at + 1`,
+    // which equals the clamped `target`.
+    Ok(Some(ScarInsert {
+        line_1indexed: insert_at + 1,
+        rendered: scar_line,
+    }))
+}
+
+/// Return the leading whitespace string to reuse for a scar inserted
+/// at `insert_at` (0-indexed slot). Strategy:
+/// 1. Look at the line *at* `insert_at` (the target, which the scar
+///    will sit directly above). If it's non-blank, use its indent.
+/// 2. Otherwise scan forward, then backward, for the nearest non-blank
+///    line and use its indent.
+/// 3. Fall back to empty string if the file is entirely blank.
+fn inherited_indent(lines: &[&str], insert_at: usize) -> String {
+    fn line_indent(line: &str) -> Option<String> {
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+        if trimmed.trim().is_empty() {
+            return None;
+        }
+        let indent: String = trimmed
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        Some(indent)
+    }
+    if let Some(target) = lines.get(insert_at)
+        && let Some(ind) = line_indent(target)
+    {
+        return ind;
+    }
+    // Forward scan.
+    for line in lines.iter().skip(insert_at + 1) {
+        if let Some(ind) = line_indent(line) {
+            return ind;
+        }
+    }
+    // Backward scan.
+    for line in lines[..insert_at].iter().rev() {
+        if let Some(ind) = line_indent(line) {
+            return ind;
+        }
+    }
+    String::new()
+}
+
+/// Outcome of a `remove_scar` attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScarRemove {
+    /// The line matched `expected` and was deleted.
+    Removed,
+    /// The line at `line_1indexed` no longer matches `expected` —
+    /// the user edited the file between insert and undo. The file is
+    /// left untouched.
+    Mismatch,
+    /// `line_1indexed` is past the end of the file (e.g. the file
+    /// was truncated after the insert). Left untouched.
+    OutOfRange,
+}
+
+/// Remove a previously-inserted scar line if, and only if, the line
+/// at `line_1indexed` still matches `expected` (the trimmed scar
+/// body).
+///
+/// This is the undo primitive used by the app layer. It refuses to
+/// delete content the user has since changed, so an undo pressed
+/// after an unrelated edit is a safe no-op that surfaces through
+/// the returned `ScarRemove` variant.
+pub fn remove_scar(path: &Path, line_1indexed: usize, expected: &str) -> Result<ScarRemove> {
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {} for scar removal", path.display()))?;
+    let lines: Vec<&str> = original.split_inclusive('\n').collect();
+    if line_1indexed == 0 || line_1indexed > lines.len() {
+        return Ok(ScarRemove::OutOfRange);
+    }
+    let target_idx = line_1indexed - 1;
+    let line_raw = lines[target_idx];
+    let line_trimmed = line_raw.trim_end_matches('\n').trim_end_matches('\r');
+    if line_trimmed.trim() != expected.trim() {
+        return Ok(ScarRemove::Mismatch);
+    }
+    let mut out = String::with_capacity(original.len().saturating_sub(line_raw.len()));
+    for (idx, line) in lines.iter().enumerate() {
+        if idx == target_idx {
+            continue;
+        }
+        out.push_str(line);
+    }
+    std::fs::write(path, out)
+        .with_context(|| format!("writing {} with scar removed", path.display()))?;
+    Ok(ScarRemove::Removed)
 }
 
 #[cfg(test)]
@@ -438,9 +558,10 @@ mod tests {
         );
         insert_scar(&path, 3, ScarKind::Ask, "explain this change").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
+        // Indent inherited from the target line (`    let y = 2;`).
         assert_eq!(
             after,
-            "fn main() {\n    let x = 1;\n// @kizu[ask]: explain this change\n    let y = 2;\n}\n"
+            "fn main() {\n    let x = 1;\n    // @kizu[ask]: explain this change\n    let y = 2;\n}\n"
         );
     }
 
@@ -450,7 +571,10 @@ mod tests {
         let path = write_tmp(&dir, "app.py", "def main():\n    return 1\n");
         insert_scar(&path, 2, ScarKind::Free, "why?").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, "def main():\n# @kizu[free]: why?\n    return 1\n");
+        assert_eq!(
+            after,
+            "def main():\n    # @kizu[free]: why?\n    return 1\n"
+        );
     }
 
     #[test]
@@ -461,7 +585,7 @@ mod tests {
         let after = fs::read_to_string(&path).expect("read back");
         assert_eq!(
             after,
-            "<div>\n<!-- @kizu[free]: check layout -->\n  <p>hi</p>\n</div>\n"
+            "<div>\n  <!-- @kizu[free]: check layout -->\n  <p>hi</p>\n</div>\n"
         );
     }
 
@@ -541,11 +665,175 @@ mod tests {
     }
 
     #[test]
+    fn insert_scar_inherits_leading_whitespace_of_target_line() {
+        // The scar should match the indentation of the line it
+        // comments on, so it reads like a real inline comment rather
+        // than a loose left-edge annotation.
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(
+            &dir,
+            "main.rs",
+            "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
+        );
+        insert_scar(&path, 2, ScarKind::Ask, "why one?")
+            .expect("insert")
+            .expect("receipt");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            after,
+            "fn main() {\n    // @kizu[ask]: why one?\n    let x = 1;\n    let y = 2;\n}\n"
+        );
+    }
+
+    #[test]
+    fn insert_scar_inherits_tab_indent() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(&dir, "main.go", "func main() {\n\tfmt.Println()\n}\n");
+        insert_scar(&path, 2, ScarKind::Free, "n")
+            .expect("insert")
+            .expect("receipt");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            after,
+            "func main() {\n\t// @kizu[free]: n\n\tfmt.Println()\n}\n"
+        );
+    }
+
+    #[test]
+    fn insert_scar_skips_blank_target_and_uses_nearest_non_blank_indent() {
+        // A blank target line gives no indentation to inherit. Use the
+        // *following* non-blank line's indent (or the previous one if
+        // there isn't any).
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(&dir, "main.rs", "fn main() {\n\n    let x = 1;\n}\n");
+        // Target line 2 (the blank). We expect the scar to be inserted
+        // above the blank, using the next non-blank's indent ("    ").
+        insert_scar(&path, 2, ScarKind::Ask, "up")
+            .expect("insert")
+            .expect("receipt");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            after,
+            "fn main() {\n    // @kizu[ask]: up\n\n    let x = 1;\n}\n"
+        );
+    }
+
+    #[test]
+    fn remove_scar_tolerates_indented_scar_line() {
+        // After the indent change `remove_scar`'s `expected` string
+        // and the on-disk line both carry the same leading whitespace.
+        // The receipt stores the exact indented line, so undo still
+        // matches byte-for-byte (trimmed comparison).
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(&dir, "main.rs", "fn a() {\n    let x = 1;\n}\n");
+        let receipt = insert_scar(&path, 2, ScarKind::Ask, "why?")
+            .expect("insert")
+            .expect("receipt");
+        let outcome = remove_scar(&path, receipt.line_1indexed, &receipt.rendered).expect("remove");
+        assert_eq!(outcome, ScarRemove::Removed);
+        let after = fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, "fn a() {\n    let x = 1;\n}\n");
+    }
+
+    #[test]
     fn insert_scar_respects_unknown_extension_by_falling_back_to_hash() {
         let dir = TempDir::new().expect("tmp");
         let path = write_tmp(&dir, "notes.zzz", "first line\nsecond line\n");
         insert_scar(&path, 2, ScarKind::Free, "n").expect("insert");
         let after = fs::read_to_string(&path).expect("read back");
         assert_eq!(after, "first line\n# @kizu[free]: n\nsecond line\n");
+    }
+
+    #[test]
+    fn insert_scar_returns_receipt_with_post_insert_line_number() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(&dir, "main.rs", "fn a() {}\nfn b() {}\n");
+        // Target line 2 → scar goes above `fn b`. Post-insert the scar
+        // line is at 1-indexed position 2; `fn b()` shifts to 3.
+        let receipt = insert_scar(&path, 2, ScarKind::Ask, "look")
+            .expect("insert")
+            .expect("receipt on actual write");
+        assert_eq!(receipt.line_1indexed, 2);
+        assert_eq!(receipt.rendered, "// @kizu[ask]: look");
+    }
+
+    #[test]
+    fn insert_scar_returns_none_when_idempotent_noop() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(
+            &dir,
+            "main.rs",
+            "fn a() {}\n// @kizu[free]: look\nfn b() {}\n",
+        );
+        let outcome = insert_scar(&path, 3, ScarKind::Free, "look").expect("second insert");
+        assert!(outcome.is_none(), "idempotent path should report no-op");
+    }
+
+    #[test]
+    fn remove_scar_deletes_line_when_expected_matches() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(
+            &dir,
+            "main.rs",
+            "fn a() {}\n// @kizu[ask]: look\nfn b() {}\n",
+        );
+        let outcome = remove_scar(&path, 2, "// @kizu[ask]: look").expect("remove");
+        assert_eq!(outcome, ScarRemove::Removed);
+        let after = fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, "fn a() {}\nfn b() {}\n");
+    }
+
+    #[test]
+    fn remove_scar_refuses_when_user_edited_the_line() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(
+            &dir,
+            "main.rs",
+            "fn a() {}\n// @kizu[ask]: edited by user\nfn b() {}\n",
+        );
+        let outcome = remove_scar(&path, 2, "// @kizu[ask]: look").expect("remove");
+        assert_eq!(outcome, ScarRemove::Mismatch);
+        // File untouched.
+        let after = fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            after,
+            "fn a() {}\n// @kizu[ask]: edited by user\nfn b() {}\n"
+        );
+    }
+
+    #[test]
+    fn remove_scar_reports_out_of_range_when_file_was_truncated() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(&dir, "main.rs", "fn a() {}\n");
+        let outcome = remove_scar(&path, 5, "anything").expect("remove");
+        assert_eq!(outcome, ScarRemove::OutOfRange);
+    }
+
+    #[test]
+    fn remove_scar_preserves_crlf_endings_of_surrounding_lines() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(
+            &dir,
+            "main.rs",
+            "fn a() {}\r\n// @kizu[free]: look\r\nfn b() {}\r\n",
+        );
+        let outcome = remove_scar(&path, 2, "// @kizu[free]: look").expect("remove");
+        assert_eq!(outcome, ScarRemove::Removed);
+        let after = fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, "fn a() {}\r\nfn b() {}\r\n");
+    }
+
+    #[test]
+    fn insert_then_remove_using_receipt_round_trips() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(&dir, "main.rs", "fn a() {}\nfn b() {}\n");
+        let before = fs::read_to_string(&path).expect("read before");
+        let receipt = insert_scar(&path, 2, ScarKind::Ask, "look")
+            .expect("insert")
+            .expect("receipt");
+        let outcome = remove_scar(&path, receipt.line_1indexed, &receipt.rendered).expect("remove");
+        assert_eq!(outcome, ScarRemove::Removed);
+        let after = fs::read_to_string(&path).expect("read after");
+        assert_eq!(after, before);
     }
 }
