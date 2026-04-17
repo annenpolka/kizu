@@ -980,6 +980,18 @@ impl App {
             scar_focus: None,
             pinned_cursor_y: None,
         };
+        // If the agent handing off to kizu published its session id
+        // via the `KIZU_SESSION_ID` environment variable, pre-bind
+        // the TUI to it. That shuts the first-writer-wins window
+        // where a foreign concurrent agent could capture the
+        // binding before our own agent's first event landed,
+        // silently hiding every edit we were supposed to review.
+        if let Ok(sid) = std::env::var("KIZU_SESSION_ID") {
+            let trimmed = sid.trim();
+            if !trimmed.is_empty() {
+                app.bound_session_id = Some(trimmed.to_string());
+            }
+        }
         app.apply_computed_files(initial);
         Ok(app)
     }
@@ -1122,18 +1134,22 @@ impl App {
             return;
         }
 
-        // Session isolation — layer 2: bind to the first session_id
-        // we observe and reject events from other agent sessions.
-        // Wall-clock alone cannot distinguish concurrent sessions;
-        // ingesting both would cross-pollute `diff_snapshots`. A
-        // `None` session_id event (agent didn't provide one) is
-        // always accepted and does not change the binding.
-        if let Some(sid) = event.session_id.as_ref() {
-            match &self.bound_session_id {
-                Some(expected) if expected != sid => return,
-                Some(_) => {}
-                None => self.bound_session_id = Some(sid.clone()),
-            }
+        // Session isolation — layer 2: if an **explicit** expected
+        // session_id was set at bootstrap (from `KIZU_SESSION_ID`
+        // or a future CLI flag), drop events that carry a
+        // different session_id. Auto-binding to the first observed
+        // session was intentionally removed: under concurrent
+        // agent activity it locked the TUI onto whichever session
+        // happened to fire first, which could easily be a foreign
+        // agent and would silently hide the edits the user was
+        // attached to review. Unbound sessions accept all events
+        // (round-5 behavior) so the default path is non-trapping
+        // when no explicit binding is provided.
+        if let (Some(expected), Some(sid)) =
+            (self.bound_session_id.as_ref(), event.session_id.as_ref())
+            && expected != sid
+        {
+            return;
         }
 
         // Normalize every file path to repo-relative form **once**,
@@ -5833,6 +5849,48 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_with_diff_reads_expected_session_id_from_env() {
+        // First-writer-wins binding can silently attach the TUI to
+        // the wrong agent when a second agent in the same repo fires
+        // faster than the one the user is attached to. Pre-binding
+        // the expected `session_id` at bootstrap (here via the
+        // `KIZU_SESSION_ID` environment variable) closes that
+        // window. Once bound, `handle_event_log` drops events from
+        // any other session instead of auto-binding to the first
+        // arrival.
+        //
+        // Serialized via a static Mutex so cargo's parallel runner
+        // doesn't interleave `set_var` / `remove_var` with other
+        // env-touching tests in this file.
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe { std::env::set_var("KIZU_SESSION_ID", "agent-xyz") };
+        let diff = Ok(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
+            100,
+        )]);
+        let app = App::bootstrap_with_diff(
+            PathBuf::from("/tmp/fake"),
+            PathBuf::from("/tmp/fake/.git"),
+            PathBuf::from("/tmp/fake/.git"),
+            Some("refs/heads/main".into()),
+            "abcdef1234567890abcdef1234567890abcdef12".into(),
+            diff,
+        )
+        .expect("bootstrap must succeed");
+        unsafe { std::env::remove_var("KIZU_SESSION_ID") };
+
+        assert_eq!(
+            app.bound_session_id,
+            Some("agent-xyz".to_string()),
+            "bootstrap must pre-bind the TUI to the env-provided session_id"
+        );
+    }
+
+    #[test]
     fn picker_enter_disables_follow_mode_so_selection_survives_recompute() {
         // bootstrap lands in follow mode. A picker selection is an
         // explicit manual navigation — the next recompute must not yank
@@ -8826,13 +8884,15 @@ mod tests {
     }
 
     #[test]
-    fn handle_event_log_binds_to_first_seen_session_id() {
-        // Under concurrent agent activity on the same repo a second
-        // session's events must not pollute the first session's
-        // `diff_snapshots` / stream history. The TUI binds itself
-        // to the first session_id it observes; all later events
-        // with a different session_id are dropped without advancing
-        // the snapshot map.
+    fn handle_event_log_filters_by_explicit_bound_session_id() {
+        // Under concurrent agent activity on the same repo, a foreign
+        // session's events must not pollute the stream or
+        // `diff_snapshots`. When the TUI was started with a
+        // preconfigured `bound_session_id` (via `KIZU_SESSION_ID`
+        // or a future CLI flag), `handle_event_log` drops events
+        // from any other session. Auto-binding was intentionally
+        // removed because it locked onto whichever session fired
+        // first — often the wrong one under real concurrency.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp
             .path()
@@ -8840,10 +8900,11 @@ mod tests {
             .unwrap_or_else(|_| tmp.path().to_path_buf());
         let mut app = fake_app(vec![]);
         app.root = root.clone();
+        app.bound_session_id = Some("session-A".into());
         let events_dir = root.join("events");
         std::fs::create_dir_all(&events_dir).unwrap();
 
-        // First event binds the TUI to session A.
+        // Matching session: accepted.
         let a = crate::hook::SanitizedEvent {
             session_id: Some("session-A".into()),
             hook_event_name: "PostToolUse".into(),
@@ -8855,9 +8916,13 @@ mod tests {
         let a_path = events_dir.join("10000-Edit-aaa.json");
         std::fs::write(&a_path, serde_json::to_string(&a).unwrap()).unwrap();
         app.handle_event_log(a_path);
-        assert_eq!(app.stream_events.len(), 1, "first event must be ingested");
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "event matching the bound session must be ingested"
+        );
 
-        // Second event from a different session must be dropped.
+        // Foreign session: dropped.
         let b = crate::hook::SanitizedEvent {
             session_id: Some("session-B".into()),
             hook_event_name: "PostToolUse".into(),
@@ -8874,23 +8939,47 @@ mod tests {
             1,
             "foreign-session event must not advance stream or diff_snapshots"
         );
+    }
 
-        // A later event from the bound session must still be ingested.
-        let a2 = crate::hook::SanitizedEvent {
-            session_id: Some("session-A".into()),
-            hook_event_name: "PostToolUse".into(),
-            tool_name: Some("Write".into()),
-            file_paths: vec![root.join("src/a.rs")],
-            cwd: root.clone(),
-            timestamp_ms: 12_000,
-        };
-        let a2_path = events_dir.join("12000-Write-aaa2.json");
-        std::fs::write(&a2_path, serde_json::to_string(&a2).unwrap()).unwrap();
-        app.handle_event_log(a2_path);
+    #[test]
+    fn handle_event_log_accepts_any_session_when_unbound() {
+        // When no explicit binding exists (no env / no CLI), we
+        // accept every session_id instead of auto-latching to the
+        // first we see. This keeps concurrent-session trap-free:
+        // users who want strict filtering opt in by setting
+        // `KIZU_SESSION_ID`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+        assert!(app.bound_session_id.is_none());
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        for (i, sid) in ["session-A", "session-B"].iter().enumerate() {
+            let ev = crate::hook::SanitizedEvent {
+                session_id: Some((*sid).into()),
+                hook_event_name: "PostToolUse".into(),
+                tool_name: Some("Edit".into()),
+                file_paths: vec![root.join(format!("src/{i}.rs"))],
+                cwd: root.clone(),
+                timestamp_ms: 20_000 + i as u64,
+            };
+            let path = events_dir.join(format!("2000{i}-Edit-{sid}.json"));
+            std::fs::write(&path, serde_json::to_string(&ev).unwrap()).unwrap();
+            app.handle_event_log(path);
+        }
         assert_eq!(
             app.stream_events.len(),
             2,
-            "bound-session event must still be accepted after the foreign reject"
+            "unbound TUI must accept events from any session"
+        );
+        assert!(
+            app.bound_session_id.is_none(),
+            "unbound state must stay unbound; no auto-latch"
         );
     }
 

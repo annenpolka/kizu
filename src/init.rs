@@ -1020,33 +1020,47 @@ fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
         .ok_or_else(|| anyhow::anyhow!("hooks is not an object in hooks.json"))?;
 
     let post_cmd = kizu_hook_command(scope, "hook-post-tool --agent cursor");
+    let log_cmd = kizu_hook_command(scope, "hook-log-event");
     let stop_cmd = kizu_hook_command(scope, "hook-stop --agent cursor");
-    let entries = &[
-        ("afterFileEdit", post_cmd.as_str()),
-        ("stop", stop_cmd.as_str()),
+    // `hook-log-event` rides alongside the scar scan on every edit
+    // so Cursor edits produce the event files that power stream
+    // mode. Without it, `SupportLevel::Full` was a lie for Cursor:
+    // scar scanning worked, but the Stream view stayed empty.
+    let entries: &[(&str, &[&str])] = &[
+        ("afterFileEdit", &[post_cmd.as_str(), log_cmd.as_str()]),
+        ("stop", &[stop_cmd.as_str()]),
     ];
 
     let mut added = 0;
     let mut skipped = 0;
-    for &(event, command) in entries {
+    for &(event, commands) in entries {
         let arr = hooks_map
             .entry(event)
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("hooks.{event} is not an array"))?;
 
-        let already = arr.iter().any(|e| {
-            e.get("command").and_then(|v| v.as_str()).is_some_and(|c| {
-                c.contains("kizu hook-")
-                    || c.contains(" hook-post-tool")
-                    || c.contains(" hook-stop")
-            })
-        });
-        if already {
-            skipped += 1;
-        } else {
-            arr.push(serde_json::json!({"command": command, "timeout": 10}));
-            added += 1;
+        // Reconcile per-command (matching on the `hook-*`
+        // subcommand token) so a rerun of `kizu init` upgrades an
+        // older install that lacks `hook-log-event`. The previous
+        // logic short-circuited on any kizu entry and skipped
+        // every command, which is how stream mode stayed inert on
+        // upgrade.
+        for command in commands {
+            let want_token = kizu_command_token(command);
+            let already = arr.iter().any(|e| {
+                e.get("command")
+                    .and_then(|v| v.as_str())
+                    .and_then(kizu_command_token)
+                    == want_token
+                    && want_token.is_some()
+            });
+            if already {
+                skipped += 1;
+            } else {
+                arr.push(serde_json::json!({"command": command, "timeout": 10}));
+                added += 1;
+            }
         }
     }
 
@@ -1988,6 +2002,41 @@ mod tests {
         let shim = super::pre_commit_shim_body("/p with space/kizu", true);
         assert!(shim.contains("'/p with space/kizu' hook-pre-commit"));
         assert!(shim.contains("pre-commit.user"));
+    }
+
+    #[test]
+    fn install_cursor_writes_hook_log_event_for_stream_mode() {
+        // Cursor is advertised as `SupportLevel::Full`, which implies
+        // stream mode works — stream mode only works when the
+        // `hook-log-event` hook fires on every edit. Without it,
+        // `afterFileEdit` only runs `hook-post-tool` (scar scan)
+        // and no event file is ever written, leaving the Stream
+        // view permanently empty for Cursor sessions. Install must
+        // wire `hook-log-event` alongside the existing scar hook.
+        let tmp = tempfile::tempdir().unwrap();
+        let report = super::install_cursor(super::Scope::ProjectLocal, tmp.path()).unwrap();
+        assert!(
+            report.entries_added > 0,
+            "fresh install must add at least one entry"
+        );
+        let path = tmp.path().join(".cursor").join("hooks.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let after_edit = doc["hooks"]["afterFileEdit"]
+            .as_array()
+            .expect("afterFileEdit must be an array");
+        let commands: Vec<&str> = after_edit
+            .iter()
+            .filter_map(|e| e["command"].as_str())
+            .collect();
+        assert!(
+            commands.iter().any(|c| c.contains("hook-log-event")),
+            "afterFileEdit must install hook-log-event for stream mode, got {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("hook-post-tool")),
+            "afterFileEdit must also keep the scar scan hook, got {commands:?}"
+        );
     }
 
     #[test]
