@@ -941,25 +941,34 @@ fn take_cells(s: &str, max_cells: usize) -> (String, usize) {
     (out, cells)
 }
 
-/// `HH:MM` formatted local time. Returns `--:--` when the metadata read
-/// failed and the parser left the field at `UNIX_EPOCH`.
+/// `HH:MM` formatted **local** time. Returns `--:--` when the metadata
+/// read failed and the parser left the field at `UNIX_EPOCH`. Uses
+/// `libc::localtime_r` on Unix so the picker mtime column matches the
+/// user's wall clock; falls back to UTC on non-Unix platforms.
 fn format_mtime(t: SystemTime) -> String {
     if t == UNIX_EPOCH {
         return "--:--".to_string();
     }
-    // We avoid pulling in `chrono` for a single timestamp render: the
-    // duration since midnight UTC is enough to derive HH:MM, and any
-    // off-by-timezone is acceptable for an at-a-glance hint. Real local
-    // time will arrive with the v0.2 dependency on `time` if it pays for
-    // itself elsewhere.
     let secs = t
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let day_secs = secs % 86_400;
-    let hour = (day_secs / 3600) as u32;
-    let minute = ((day_secs % 3600) / 60) as u32;
-    format!("{hour:02}:{minute:02}")
+        .unwrap_or(0) as i64;
+
+    #[cfg(unix)]
+    {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let time_t = secs as libc::time_t;
+        unsafe { libc::localtime_r(&time_t, &mut tm) };
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let day_secs = (secs as u64) % 86_400;
+        let hour = (day_secs / 3600) as u32;
+        let minute = ((day_secs % 3600) / 60) as u32;
+        format!("{hour:02}:{minute:02}")
+    }
 }
 
 fn render_empty(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1295,6 +1304,45 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// Pad or truncate `s` so its display width (cells) equals exactly
+/// `target`. Truncation is rune-aware via `unicode-width` so CJK
+/// filenames do not land mid-codepoint or overflow by one cell.
+fn pad_or_truncate_display(s: &str, target: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let w = UnicodeWidthStr::width(s);
+    if w <= target {
+        let pad = target - w;
+        let mut out = String::with_capacity(s.len() + pad);
+        out.push_str(s);
+        for _ in 0..pad {
+            out.push(' ');
+        }
+        return out;
+    }
+    // Truncate, reserving 1 cell for an ellipsis when it fits.
+    let keep = target.saturating_sub(1);
+    let mut acc = 0usize;
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if acc + cw > keep {
+            break;
+        }
+        acc += cw;
+        out.push(ch);
+    }
+    // Add the ellipsis marker + a trailing space when target - acc >= 1.
+    if target > acc {
+        out.push('…');
+        acc += 1;
+    }
+    while acc < target {
+        out.push(' ');
+        acc += 1;
+    }
+    out
+}
+
 fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup_area = centered_rect(60, 60, area);
     let Some(picker) = &app.picker else { return };
@@ -1323,6 +1371,18 @@ fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ]);
     frame.render_widget(Paragraph::new(query_line), query_area);
 
+    // Reserve a fixed right-hand slot for `HH:MM` + `+N -M` so the
+    // minute column is never clipped by a long path. The selection
+    // gutter (2 cells) sits left of the path, so the usable width
+    // inside `list_area` is `width - 2`. The path takes the rest.
+    let list_width = list_area.width as usize;
+    const MTIME_WIDTH: usize = 5; // "HH:MM"
+    const COUNTS_WIDTH: usize = 10; // "+NNN -MMM" fits comfortably
+    const GAP: usize = 1;
+    const GUTTER: usize = 2; // space for "▸ "
+    let reserved = MTIME_WIDTH + GAP + COUNTS_WIDTH + GAP;
+    let path_width = list_width.saturating_sub(reserved + GUTTER).max(10);
+
     let items: Vec<ListItem<'_>> = results
         .iter()
         .map(|&file_idx| {
@@ -1338,15 +1398,21 @@ fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 DiffContent::Text(_) => format!("+{} -{}", file.added, file.deleted),
             };
             let mtime = format_mtime(file.mtime);
+            // Pad path to `path_width` using unicode-width so CJK
+            // filenames stay aligned. Truncate from the right if the
+            // name overflows the column so the right-hand mtime/counts
+            // columns are never pushed off-screen.
+            let path_str = file.path.display().to_string();
+            let padded_path = pad_or_truncate_display(&path_str, path_width);
+            // Right-pad counts to a fixed width so the mtime column
+            // lands at a stable offset even when +/- counts vary.
+            let padded_counts = format!("{counts:>width$}", width = COUNTS_WIDTH);
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:<40}", file.path.display()),
-                    Style::default().fg(path_color),
-                ),
+                Span::styled(padded_path, Style::default().fg(path_color)),
                 Span::raw(" "),
                 Span::styled(mtime, Style::default().fg(Color::DarkGray)),
                 Span::raw(" "),
-                Span::raw(counts),
+                Span::raw(padded_counts),
             ]))
         })
         .collect();
@@ -1484,6 +1550,7 @@ mod tests {
             saved_diff_scroll: 0,
             saved_stream_scroll: 0,
             stream_events: Vec::new(),
+            processed_event_paths: std::collections::HashSet::new(),
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
