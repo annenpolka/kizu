@@ -1016,6 +1016,39 @@ impl App {
         }
     }
 
+    /// Canonicalize an agent-supplied path and project it onto the
+    /// repo-relative form used by `git::compute_diff` outputs. Returns
+    /// `None` when the path does not resolve inside `self.root`.
+    ///
+    /// `self.root` is canonicalized by `git::find_root`
+    /// (`git rev-parse --show-toplevel`), so on macOS it lives on the
+    /// `/private/...` side of the `/tmp` → `/private/tmp` symlink.
+    /// Agent-provided file paths often follow the symlinked side
+    /// instead; `canonicalize` resolves both to the same absolute
+    /// path so downstream keys (`diff_snapshots`, `per_file_diffs`,
+    /// `StreamEvent.metadata.file_paths`) stay stable regardless of
+    /// symlink spelling.
+    ///
+    /// Falls back to the raw path when the file no longer exists
+    /// (deleted between the hook write and this handler); in that
+    /// case we still try to strip `self.root` so a fresh path that
+    /// already starts with the canonical root becomes repo-relative.
+    fn normalize_event_path(&self, p: &Path) -> Option<PathBuf> {
+        let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if let Ok(rel) = canon.strip_prefix(&self.root) {
+            return Some(rel.to_path_buf());
+        }
+        if let Ok(rel) = p.strip_prefix(&self.root) {
+            return Some(rel.to_path_buf());
+        }
+        // Already repo-relative? Accept if the absolute form lives
+        // inside root (e.g. tests that pass a pure "src/foo.rs").
+        if p.is_relative() && self.root.join(p).starts_with(&self.root) {
+            return Some(p.to_path_buf());
+        }
+        None
+    }
+
     /// Handle a new event-log file notification. Reads the event file,
     /// captures the per-operation diff snapshot, and appends to
     /// `stream_events`. Failures are silently ignored (non-critical).
@@ -1024,31 +1057,30 @@ impl App {
             Ok(c) => c,
             Err(_) => return,
         };
-        let event: SanitizedEvent = match serde_json::from_str(&content) {
+        let mut event: SanitizedEvent = match serde_json::from_str(&content) {
             Ok(e) => e,
             Err(_) => return,
         };
 
-        // Skip events where every file path resolves outside the
-        // project root. Edits to `~/.config`, `/tmp`, etc. can't
-        // produce a git diff and would appear as empty noise in the
-        // stream.
-        //
-        // `self.root` is canonicalized by `git::find_root`
-        // (`git rev-parse --show-toplevel`), so on macOS it lives on
-        // the `/private/...` side of the `/tmp` → `/private/tmp`
-        // symlink. Agent-provided file paths often follow the
-        // symlinked side instead. Run each candidate through
-        // `canonicalize` before comparing so both variants match —
-        // falling back to the raw path when the file no longer
-        // exists (deleted between the hook write and this handler).
-        let inside_root = event.file_paths.iter().any(|p| {
-            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-            canon.starts_with(&self.root) || p.starts_with(&self.root)
-        });
-        if !inside_root {
+        // Normalize every file path to repo-relative form **once**,
+        // up front. Downstream snapshot lookups, per-file diff keys,
+        // and the stored `metadata.file_paths` must all agree on the
+        // same key shape — otherwise an event on `/abs/src/foo.rs`
+        // misses the seeded `src/foo.rs` entry and the first event
+        // for a pre-existing dirty file is rendered as the entire
+        // cumulative diff instead of only the tool call's delta.
+        // Paths that do not resolve inside the repo root are dropped
+        // from the event (edits to `~/.config`, `/tmp`, etc.) so
+        // they never appear as empty noise in the stream.
+        let normalized: Vec<PathBuf> = event
+            .file_paths
+            .iter()
+            .filter_map(|p| self.normalize_event_path(p))
+            .collect();
+        if normalized.is_empty() {
             return;
         }
+        event.file_paths = normalized;
 
         // Capture per-operation diff for each affected file separately
         // so multi-file events keep one hunk set per path.
@@ -8660,6 +8692,72 @@ mod tests {
             app.diff_snapshots.get(&file),
             Some(&prev_diff),
             "snapshot must survive a failing `git diff` so the next event is still accurate"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_matches_seeded_snapshot_via_repo_relative_key() {
+        // `seed_diff_snapshots` keys the map by repo-relative paths
+        // (from `git::compute_diff`). Agent hooks, however, usually
+        // emit **absolute** paths. Without normalization, the seeded
+        // `src/foo.rs` entry is never found for an event on
+        // `/<root>/src/foo.rs`, so the first event for a
+        // pre-existing dirty file shows the entire cumulative diff
+        // as one tool call instead of only the delta.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        // Seed map with the repo-relative key, mirroring the
+        // `git::compute_diff` output shape that `seed_diff_snapshots`
+        // uses in production.
+        let rel = PathBuf::from("src/foo.rs");
+        let seeded = "diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+seed\n".to_string();
+        app.diff_snapshots.insert(rel.clone(), seeded.clone());
+
+        // The agent supplies an absolute path on the repo root.
+        let abs = root.join(&rel);
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![abs.clone()],
+            cwd: root.clone(),
+            timestamp_ms: 4000,
+        };
+        let event_path = events_dir.join("4000-Edit.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.handle_event_log(event_path);
+
+        // After the event fires, both the lookup side and the
+        // insert side must use the repo-relative key so a subsequent
+        // seed/event for the same file lands on the same entry.
+        assert_eq!(
+            app.diff_snapshots.keys().collect::<Vec<_>>(),
+            vec![&rel],
+            "snapshot map must not split one file across raw and repo-relative keys, \
+             found keys: {:?}",
+            app.diff_snapshots.keys().collect::<Vec<_>>()
+        );
+        // The seeded op_diff was `-old / +seed`. Regardless of what
+        // the current `git diff` returns (likely Err because no real
+        // repo), the seeded snapshot must have been consulted — so
+        // there must be exactly one StreamEvent and it must be keyed
+        // on the repo-relative path.
+        assert_eq!(app.stream_events.len(), 1);
+        let recorded = &app.stream_events[0];
+        let paths: Vec<&PathBuf> = recorded.metadata.file_paths.iter().collect();
+        assert_eq!(
+            paths,
+            vec![&rel],
+            "StreamEvent.metadata.file_paths must be stored repo-relative, got {paths:?}"
         );
     }
 

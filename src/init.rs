@@ -786,27 +786,38 @@ fn merge_hooks_into_settings(
             continue;
         }
 
-        // Prefer appending to an existing matcher group that already
-        // holds a kizu command with the same `matcher`, so the
-        // upgraded config remains a single cohesive group instead of
-        // splitting kizu's hooks across two siblings.
+        // Prefer appending to an existing matcher group that is
+        // **kizu-exclusive** and shares the same `matcher`, so the
+        // upgraded config stays cohesive across reruns. Groups that
+        // also contain user-owned commands are intentionally skipped
+        // here: `remove_kizu_hooks_from_json` drops any group that
+        // holds a kizu command wholesale, so appending into a mixed
+        // group would bind the user's hook to kizu's teardown path
+        // and erase it on `kizu teardown`. Creating a fresh
+        // kizu-exclusive group for the missing commands keeps the
+        // user's hook uninvolved in kizu's install/uninstall lifecycle.
         let target_idx = arr.iter().position(|group| {
             let matches_matcher = group
                 .get("matcher")
                 .and_then(|v| v.as_str())
                 .is_some_and(|m| m == *matcher);
-            let has_kizu = group
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .is_some_and(|cmds| {
-                    cmds.iter().any(|cmd| {
-                        cmd.get("command")
-                            .and_then(|v| v.as_str())
-                            .and_then(kizu_command_token)
-                            .is_some()
-                    })
-                });
-            matches_matcher && has_kizu
+            let cmds_opt = group.get("hooks").and_then(|h| h.as_array());
+            let Some(cmds) = cmds_opt else {
+                return false;
+            };
+            let has_any_kizu = cmds.iter().any(|cmd| {
+                cmd.get("command")
+                    .and_then(|v| v.as_str())
+                    .and_then(kizu_command_token)
+                    .is_some()
+            });
+            let all_kizu = cmds.iter().all(|cmd| {
+                cmd.get("command")
+                    .and_then(|v| v.as_str())
+                    .and_then(kizu_command_token)
+                    .is_some()
+            });
+            matches_matcher && has_any_kizu && all_kizu
         });
 
         let cmd_values: Vec<serde_json::Value> = missing
@@ -1487,6 +1498,83 @@ mod tests {
         // The duplicate `hook-post-tool` must not be added twice.
         let post_tool_count = cmds.iter().filter(|c| c.contains("hook-post-tool")).count();
         assert_eq!(post_tool_count, 1, "duplicate must be suppressed");
+    }
+
+    #[test]
+    fn merge_hooks_does_not_append_into_mixed_user_and_kizu_group() {
+        // If a user has added their own hook to a matcher group that
+        // also contains a kizu command, a rerun of `kizu init` must
+        // NOT append new kizu commands into that mixed group — doing
+        // so lets `teardown` later erase the user's hook because
+        // `remove_kizu_hooks_from_json` drops any group containing a
+        // kizu command. Instead, create a new kizu-exclusive group.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write|MultiEdit","hooks":[
+                {"type":"command","command":"kizu hook-post-tool --agent claude-code","timeout":10},
+                {"type":"command","command":"my-user-linter","timeout":5}
+            ]}]}}"#,
+        )
+        .unwrap();
+
+        merge_hooks_into_settings(
+            &path,
+            &[(
+                "PostToolUse",
+                "Edit|Write|MultiEdit",
+                &[
+                    HookCmd {
+                        command: "kizu hook-post-tool --agent claude-code",
+                        timeout: Some(10),
+                        is_async: false,
+                    },
+                    HookCmd {
+                        command: "kizu hook-log-event",
+                        timeout: None,
+                        is_async: true,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = doc["hooks"]["PostToolUse"].as_array().unwrap();
+
+        // The original mixed group must remain untouched: it still
+        // contains exactly the original kizu hook-post-tool AND the
+        // user's linter, and it did NOT grow a new kizu command.
+        let mixed = &arr[0];
+        let mixed_cmds: Vec<&str> = mixed["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["command"].as_str())
+            .collect();
+        assert!(
+            mixed_cmds.iter().any(|c| c.contains("my-user-linter")),
+            "mixed group must keep the user linter, got {mixed_cmds:?}"
+        );
+        assert!(
+            !mixed_cmds.iter().any(|c| c.contains("hook-log-event")),
+            "new kizu command must NOT be appended into a mixed group: {mixed_cmds:?}"
+        );
+
+        // The missing kizu command must still be installed — it
+        // lives in a fresh kizu-exclusive group, so teardown can
+        // remove it without touching the user's linter.
+        let all_cmds: Vec<&str> = arr
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+            .filter_map(|c| c["command"].as_str())
+            .collect();
+        assert!(
+            all_cmds.iter().any(|c| c.contains("hook-log-event")),
+            "hook-log-event must still be installed somewhere, got {all_cmds:?}"
+        );
     }
 
     #[test]
