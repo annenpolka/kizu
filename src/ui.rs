@@ -291,6 +291,11 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport_height);
     let mut row_idx = viewport_top;
     let mut skip_remaining = skip_visual;
+    // Viewport-relative line index where the cursor's own visual line
+    // lands. Recorded during the render loop so the flash overlay
+    // afterwards knows which row to paint without rebuilding the
+    // visual index.
+    let mut cursor_viewport_line: Option<usize> = None;
     while row_idx < total_rows && lines.len() < viewport_height {
         // The cursor row gets `Some(sub)` so wrap-mode rendering
         // can position the arrow on the correct visual sub-row;
@@ -319,17 +324,29 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // Discard any leading visual lines requested by the
         // placement layer (only the first logical row ever carries
         // a non-zero `skip_remaining` budget).
+        let initial_skip = skip_remaining;
         for _ in 0..skip_remaining {
             if take.next().is_none() {
                 break;
             }
         }
         skip_remaining = 0;
+        let row_start_line = lines.len();
         for line in take {
             if lines.len() >= viewport_height {
                 break;
             }
             lines.push(line);
+        }
+        if row_idx == cursor_row && cursor_viewport_line.is_none() {
+            // The cursor's visual sub-row within this logical row,
+            // minus any leading lines the placement layer asked us to
+            // discard for the *first* row in the viewport.
+            let sub_in_view = app.cursor_sub_row.saturating_sub(initial_skip);
+            let candidate = row_start_line + sub_in_view;
+            if candidate < lines.len() {
+                cursor_viewport_line = Some(candidate);
+            }
         }
         row_idx += 1;
     }
@@ -345,6 +362,11 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     frame.render_widget(Paragraph::new(lines), content_area);
+
+    // Paint a subtle background tint on the cursor row's left gutter
+    // so the user can pick out the current row at a glance without
+    // the diff body's `bg_added` / `bg_deleted` colors being obscured.
+    apply_cursor_gutter_tint(frame, content_area, cursor_viewport_line);
 
     // Pin the header on top after the body, so the overlay always wins.
     if let (Some(header_rect), Some((file_idx, hunk_idx))) = (header_area, sticky)
@@ -363,6 +385,57 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Walk `rows` to find the row index of the `HunkHeader` matching
 /// `(file_idx, hunk_idx)`. Returns `None` if the layout is empty or the
 /// cursor's hunk has no header row (binary, etc).
+/// Darken every cell of the cursor row's bg, hue preserved. No
+/// separate gutter tint — the gutter gets the same semi-transparent
+/// darken treatment as the diff body, so the row is visually recessed
+/// uniformly and the `+` / `-` add/delete signal carried by the
+/// surrounding full-intensity rows stays legible.
+fn apply_cursor_gutter_tint(
+    frame: &mut Frame<'_>,
+    content_area: Rect,
+    cursor_viewport_line: Option<usize>,
+) {
+    let Some(line_in_viewport) = cursor_viewport_line else {
+        return;
+    };
+    if line_in_viewport >= content_area.height as usize {
+        return;
+    }
+    let y = content_area.y + line_in_viewport as u16;
+    let end_x = content_area.x.saturating_add(content_area.width);
+    let buf = frame.buffer_mut();
+    for x in content_area.x..end_x {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            let darkened = darken_cursor_body_bg(cell.style().bg);
+            let new_style = cell.style().bg(darkened);
+            cell.set_style(new_style);
+        }
+    }
+}
+
+/// Return a background color that sits behind the cursor row's body
+/// cells. `Color::Rgb` values are scaled down (hue preserved, value
+/// reduced) so `bg_added` green stays green-but-dimmer; cells without
+/// a set bg (`Color::Reset` / unset) pick up a subtle dark gray.
+/// Other color kinds (ANSI names) fall through to the same dim gray
+/// since scaling them precisely would require resolving terminal
+/// palette which we don't control.
+fn darken_cursor_body_bg(existing: Option<Color>) -> Color {
+    // `bg_added = Rgb(10, 50, 10)` (default) maps to Rgb(7, 37, 7) —
+    // still clearly green, just slightly muted against the surrounding
+    // full-intensity rows. Earlier 0.5 made it too stark a contrast.
+    const FACTOR: f32 = 0.75;
+    const DEFAULT_DIM: Color = Color::Rgb(30, 30, 36);
+    match existing {
+        Some(Color::Rgb(r, g, b)) => Color::Rgb(
+            (r as f32 * FACTOR) as u8,
+            (g as f32 * FACTOR) as u8,
+            (b as f32 * FACTOR) as u8,
+        ),
+        _ => DEFAULT_DIM,
+    }
+}
+
 fn find_hunk_header_row(rows: &[RowKind], file_idx: usize, hunk_idx: usize) -> Option<usize> {
     rows.iter().position(|r| {
         matches!(
