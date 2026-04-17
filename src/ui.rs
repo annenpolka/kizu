@@ -502,7 +502,11 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                 &hunks[*hunk_idx],
                 is_selected,
                 cursor_sub.is_some(),
-                seen_hunks.contains(&(files[*file_idx].path.clone(), hunks[*hunk_idx].old_start)),
+                crate::app::is_hunk_seen(
+                    seen_hunks,
+                    &files[*file_idx].path,
+                    hunks[*hunk_idx].old_start,
+                ),
             )]
         }
         RowKind::DiffLine {

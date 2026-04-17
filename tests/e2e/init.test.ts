@@ -43,11 +43,13 @@ test("non-interactive init creates claude-code hooks in project scope", async ()
   const postGroup = settings.hooks.PostToolUse[0];
   expect(postGroup.matcher).toBe("Edit|Write|MultiEdit");
   expect(postGroup.hooks).toBeArray();
-  expect(postGroup.hooks[0].command).toContain("kizu hook-post-tool");
+  // Project-local scope single-quotes the kizu binary path so spaces
+  // / shell metachars in the install path don't break hook startup.
+  expect(postGroup.hooks[0].command).toContain("kizu' hook-post-tool");
   expect(postGroup.hooks[0].command).toContain("--agent claude-code");
 
   const stopGroup = settings.hooks.Stop[0];
-  expect(stopGroup.hooks[0].command).toContain("kizu hook-stop");
+  expect(stopGroup.hooks[0].command).toContain("kizu' hook-stop");
 });
 
 test("non-interactive init is idempotent (skips on second run)", async () => {

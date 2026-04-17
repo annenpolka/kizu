@@ -72,12 +72,6 @@ impl CommentSyntax {
 pub enum ScarKind {
     Ask,
     Reject,
-    // Wired up in the later M4 slice that adds the `c` free-text
-    // input mode. Until then `Free` is exercised only by the
-    // render / insert unit tests, so dead_code would otherwise
-    // fire — explicit allow keeps the variant visible in the
-    // API surface without hiding it behind a conditional compile.
-    #[allow(dead_code)]
     Free,
 }
 

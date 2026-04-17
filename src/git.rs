@@ -145,9 +145,10 @@ pub fn diff_single_file(root: &Path, baseline_sha: &str, file_path: &Path) -> Re
 /// files as untracked, which would leak their contents into stream
 /// snapshots.
 fn is_untracked_and_visible(root: &Path, rel: &Path) -> Result<bool> {
-    if !root.join(rel).exists() {
-        return Ok(false);
-    }
+    // No pre-existence check: `git status --porcelain -- <missing>`
+    // returns an empty record list, which falls through to `Ok(false)`
+    // below. The pre-check would also be racy (TOCTOU) with the git
+    // subprocess anyway.
     let output = Command::new("git")
         .args([
             "status",

@@ -516,7 +516,10 @@ const KIZU_SHIM_MARKER: &str = "# kizu-managed-shim";
 /// spaces, `$`, `"`, `\`, `*`, etc. Kizu binaries installed under
 /// paths like `/Users/John Doe/.cargo/bin/kizu` would otherwise
 /// wordsplit in the generated pre-commit shim.
-fn shell_single_quote(s: &str) -> String {
+///
+/// Shared with [`crate::attach`] so the Ghostty `osascript` builder
+/// reuses the same quoting contract.
+pub(crate) fn shell_single_quote(s: &str) -> String {
     let escaped = s.replace('\'', r"'\''");
     format!("'{escaped}'")
 }

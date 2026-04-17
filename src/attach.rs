@@ -124,21 +124,11 @@ fn run_split_command(mut cmd: Command, context: &str) -> Result<()> {
 /// a command-injection boundary.
 #[cfg(target_os = "macos")]
 fn build_ghostty_split_script(bin: &str) -> String {
-    let bin_shell = shell_single_quote(bin);
+    let bin_shell = crate::init::shell_single_quote(bin);
     let bin_escaped = escape_applescript_string(&bin_shell);
     format!(
         r#"tell application "Ghostty" to tell front window to split horizontally with command "{bin_escaped}""#,
     )
-}
-
-/// Wrap a string in POSIX single quotes, escaping any interior single
-/// quotes with the standard `'\''` sequence. Kept in-module so the
-/// Ghostty builder does not reach across crates for the same quoting
-/// contract `init.rs` already uses.
-#[cfg(target_os = "macos")]
-fn shell_single_quote(s: &str) -> String {
-    let escaped = s.replace('\'', r"'\''");
-    format!("'{escaped}'")
 }
 
 /// Escape a string for embedding inside an AppleScript double-quoted

@@ -2,7 +2,15 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Compiled once per process. Hook subcommands fire on every
+/// PostToolUse / Stop invocation, so recompiling this regex per call
+/// would bill the cost to Claude Code's tool-use latency.
+static SCAR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--)\s*@kizu\[(\w+)\]:\s*(.*)").expect("scar regex")
+});
 
 /// Supported AI coding agent kinds. Determines how stdin JSON is
 /// parsed and how stdout feedback is formatted.
@@ -125,8 +133,6 @@ pub struct ScarHit {
 /// after optional whitespace). This avoids false positives from
 /// string literals in test code that happen to contain `@kizu[`.
 pub fn scan_scars(paths: &[PathBuf]) -> Vec<ScarHit> {
-    let re = regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--)\s*@kizu\[(\w+)\]:\s*(.*)")
-        .expect("scar regex");
     let mut hits = Vec::new();
     for path in paths {
         let content = match std::fs::read_to_string(path) {
@@ -134,7 +140,12 @@ pub fn scan_scars(paths: &[PathBuf]) -> Vec<ScarHit> {
             Err(_) => continue,
         };
         let fence_aware = is_fenced_code_aware(path);
-        hits.extend(scan_content_for_scars(&re, &content, path, fence_aware));
+        hits.extend(scan_content_for_scars(
+            &SCAR_RE,
+            &content,
+            path,
+            fence_aware,
+        ));
     }
     hits
 }
@@ -241,8 +252,6 @@ fn scan_content_for_scars(
 /// staged blob via `git show :<path>` so that worktree edits after
 /// staging don't mask scars that are actually about to be committed.
 pub fn scan_scars_from_index(root: &Path, paths: &[PathBuf]) -> Vec<ScarHit> {
-    let re = regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--)\s*@kizu\[(\w+)\]:\s*(.*)")
-        .expect("scar regex");
     let mut hits = Vec::new();
     for path in paths {
         let rel = match path.strip_prefix(root) {
@@ -259,7 +268,12 @@ pub fn scan_scars_from_index(root: &Path, paths: &[PathBuf]) -> Vec<ScarHit> {
         };
         let content = String::from_utf8_lossy(&output.stdout);
         let fence_aware = is_fenced_code_aware(path);
-        hits.extend(scan_content_for_scars(&re, &content, path, fence_aware));
+        hits.extend(scan_content_for_scars(
+            &SCAR_RE,
+            &content,
+            path,
+            fence_aware,
+        ));
     }
     hits
 }
@@ -464,12 +478,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .context("git diff baseline..HEAD")?;
         if diff_base.status.success() {
-            for record in diff_base.stdout.split(|&b| b == 0) {
-                if !record.is_empty() {
-                    let rel = String::from_utf8_lossy(record);
-                    paths.push(root.join(rel.as_ref()));
-                }
-            }
+            extend_from_nul_list(&mut paths, root, &diff_base.stdout);
         } else {
             any_failed = true;
         }
@@ -481,12 +490,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .context("git diff HEAD")?;
         if diff_head.status.success() {
-            for record in diff_head.stdout.split(|&b| b == 0) {
-                if !record.is_empty() {
-                    let rel = String::from_utf8_lossy(record);
-                    paths.push(root.join(rel.as_ref()));
-                }
-            }
+            extend_from_nul_list(&mut paths, root, &diff_head.stdout);
         } else {
             any_failed = true;
         }
@@ -498,12 +502,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .context("git diff --cached")?;
         if diff_cached.status.success() {
-            for record in diff_cached.stdout.split(|&b| b == 0) {
-                if !record.is_empty() {
-                    let rel = String::from_utf8_lossy(record);
-                    paths.push(root.join(rel.as_ref()));
-                }
-            }
+            extend_from_nul_list(&mut paths, root, &diff_cached.stdout);
         } else {
             any_failed = true;
         }
@@ -518,12 +517,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
                 .output()
                 .context("git ls-files (fallback)")?;
             if ls_output.status.success() {
-                for record in ls_output.stdout.split(|&b| b == 0) {
-                    if !record.is_empty() {
-                        let rel = String::from_utf8_lossy(record);
-                        paths.push(root.join(rel.as_ref()));
-                    }
-                }
+                extend_from_nul_list(&mut paths, root, &ls_output.stdout);
             }
         }
     } else {
@@ -534,12 +528,7 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .context("git ls-files")?;
         if ls_output.status.success() {
-            for record in ls_output.stdout.split(|&b| b == 0) {
-                if !record.is_empty() {
-                    let rel = String::from_utf8_lossy(record);
-                    paths.push(root.join(rel.as_ref()));
-                }
-            }
+            extend_from_nul_list(&mut paths, root, &ls_output.stdout);
         }
     }
 
@@ -562,6 +551,18 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+/// Extend `paths` with each NUL-separated relative path in `stdout`,
+/// joined onto `root`. Shared by the four `git diff --name-only -z` /
+/// `git ls-files -z` branches in [`enumerate_session_files`].
+fn extend_from_nul_list(paths: &mut Vec<PathBuf>, root: &Path, stdout: &[u8]) {
+    for record in stdout.split(|&b| b == 0) {
+        if !record.is_empty() {
+            let rel = String::from_utf8_lossy(record);
+            paths.push(root.join(rel.as_ref()));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -382,6 +382,16 @@ fn uses_plus_line_format(basename: &str) -> bool {
     )
 }
 
+/// Linear membership probe for [`App::seen_hunks`] that takes the
+/// path by reference, so the renderer can check every visible hunk
+/// header without allocating a `PathBuf` per frame. The set size is
+/// bounded by user toggles (typically tens of entries), so the scan
+/// is cheaper than the clone it replaces.
+pub fn is_hunk_seen(seen: &BTreeSet<(PathBuf, usize)>, path: &Path, old_start: usize) -> bool {
+    seen.iter()
+        .any(|(p, o)| *o == old_start && p.as_path() == path)
+}
+
 /// Insert a single character at `cursor_pos` (char index) and advance
 /// the cursor. Works correctly with multi-byte characters.
 fn edit_insert_char(text: &mut String, cursor_pos: &mut usize, c: char) {
@@ -820,8 +830,6 @@ pub fn find_matches(layout: &ScrollLayout, files: &[FileDiff], query: &str) -> V
 /// slice.
 #[derive(Debug, Clone)]
 pub struct FileViewState {
-    #[allow(dead_code)]
-    pub file_idx: usize,
     pub path: PathBuf,
     pub return_scroll: usize,
     pub lines: Vec<String>,
@@ -2448,15 +2456,13 @@ impl App {
         };
         match crate::scar::insert_scar(&path, line, kind, body) {
             Ok(Some(receipt)) => {
+                let focus = Some((path.clone(), receipt.line_1indexed));
                 self.scar_undo_stack.push(ScarUndoEntry {
                     path,
                     line_1indexed: receipt.line_1indexed,
                     rendered: receipt.rendered,
                 });
-                self.refresh_after_scar_write(Some((
-                    self.scar_undo_stack.last().unwrap().path.clone(),
-                    self.scar_undo_stack.last().unwrap().line_1indexed,
-                )));
+                self.refresh_after_scar_write(focus);
             }
             Ok(None) => {
                 // Idempotent no-op (same scar already above target).
@@ -2509,15 +2515,13 @@ impl App {
         match crate::scar::insert_scar(&state.target_path, state.target_line, ScarKind::Free, body)
         {
             Ok(Some(receipt)) => {
+                let focus = Some((state.target_path.clone(), receipt.line_1indexed));
                 self.scar_undo_stack.push(ScarUndoEntry {
                     path: state.target_path,
                     line_1indexed: receipt.line_1indexed,
                     rendered: receipt.rendered,
                 });
-                self.refresh_after_scar_write(Some((
-                    self.scar_undo_stack.last().unwrap().path.clone(),
-                    self.scar_undo_stack.last().unwrap().line_1indexed,
-                )));
+                self.refresh_after_scar_write(focus);
             }
             Ok(None) => {}
             Err(err) => {
@@ -2813,7 +2817,6 @@ impl App {
 
         let scroll_top = initial_cursor.saturating_sub(self.last_body_height.get() / 2);
         self.file_view = Some(FileViewState {
-            file_idx,
             path: file.path.clone(),
             return_scroll: self.scroll,
             lines,
@@ -3129,8 +3132,7 @@ impl App {
         let Some(hunk) = hunks.get(hunk_idx) else {
             return false;
         };
-        self.seen_hunks
-            .contains(&(file.path.clone(), hunk.old_start))
+        is_hunk_seen(&self.seen_hunks, &file.path, hunk.old_start)
     }
 
     /// Resolve the cursor's current target (path + 1-indexed line)
@@ -8283,7 +8285,6 @@ mod tests {
         // Use file-view mode to target line 3 (where `fn b` lives)
         // deterministically — the line above is the pre-existing scar.
         app.file_view = Some(FileViewState {
-            file_idx: 0,
             path: PathBuf::from("src/main.rs"),
             return_scroll: 0,
             lines: vec![
@@ -8415,7 +8416,6 @@ mod tests {
         // hunk-centering logic). `cursor: 1` is 0-indexed → scar
         // targets 1-indexed line 2.
         app.file_view = Some(FileViewState {
-            file_idx: 0,
             path: PathBuf::from("src/main.rs"),
             return_scroll: 0,
             lines: vec!["line1".into(), "line2".into(), "line3".into()],
@@ -8446,7 +8446,6 @@ mod tests {
         // key, which requires the diff layout to have a hunk under
         // the cursor).
         app.file_view = Some(FileViewState {
-            file_idx: 0,
             path: PathBuf::from("src/main.rs"),
             return_scroll: 0,
             lines: vec!["line1".into(), "line2".into(), "line3".into()],
