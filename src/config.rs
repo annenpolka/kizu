@@ -35,6 +35,10 @@ pub struct KeyConfig {
     pub reset_baseline: char,
     pub cursor_placement: char,
     pub wrap_toggle: char,
+    /// Undo the most recent scar insertion (Ask / Reject / Free). The
+    /// key pops the top of the session's scar undo stack and reverses
+    /// just that one write, matching text-editor undo ergonomics.
+    pub undo: char,
 }
 
 /// Diff background color configuration. Each field is an `[R, G, B]`
@@ -90,6 +94,7 @@ impl Default for KeyConfig {
             reset_baseline: 'R',
             cursor_placement: 'z',
             wrap_toggle: 'w',
+            undo: 'u',
         }
     }
 }
@@ -97,7 +102,7 @@ impl Default for KeyConfig {
 impl KeyConfig {
     /// Every `(action_name, char)` pair in this map, in a stable
     /// order. Used by [`Self::conflicts`] for duplicate detection.
-    fn bindings(&self) -> [(&'static str, char); 14] {
+    fn bindings(&self) -> [(&'static str, char); 15] {
         [
             ("ask", self.ask),
             ("reject", self.reject),
@@ -113,6 +118,7 @@ impl KeyConfig {
             ("reset_baseline", self.reset_baseline),
             ("cursor_placement", self.cursor_placement),
             ("wrap_toggle", self.wrap_toggle),
+            ("undo", self.undo),
         ]
     }
 

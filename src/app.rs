@@ -184,6 +184,30 @@ pub struct App {
     /// Per-file diff snapshots used to compute per-operation diffs.
     /// Maps file path → most recent cumulative diff output.
     pub diff_snapshots: std::collections::HashMap<PathBuf, String>,
+    /// Session-scoped undo stack for scar insertions. Each successful
+    /// [`crate::scar::insert_scar`] pushes an entry; the `u` key pops
+    /// the top and calls [`crate::scar::remove_scar`], reversing only
+    /// that one write. Receipts capture the post-insert line number and
+    /// rendered line so undo refuses to delete content the user edited
+    /// in the meantime (scar.rs `ScarRemove::Mismatch`).
+    pub scar_undo_stack: Vec<ScarUndoEntry>,
+    /// Sticky cursor target set when a scar is inserted or undone.
+    /// Persists across watcher-driven `recompute_diff` calls so the
+    /// asynchronous filesystem notification can't snap the cursor
+    /// back to the hunk header. Cleared as soon as the user presses
+    /// any navigation key.
+    pub scar_focus: Option<(PathBuf, usize)>,
+}
+
+/// One entry on the scar undo stack: the path that was edited, plus
+/// the receipt returned by `insert_scar`. The pair `(line, rendered)`
+/// is what `remove_scar` uses to verify the line still matches before
+/// deleting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScarUndoEntry {
+    pub path: PathBuf,
+    pub line_1indexed: usize,
+    pub rendered: String,
 }
 
 /// Tracks whether the underlying notify debouncers are still pushing
@@ -896,6 +920,8 @@ impl App {
             saved_stream_scroll: 0,
             stream_events: Vec::new(),
             diff_snapshots: std::collections::HashMap::new(),
+            scar_undo_stack: Vec::new(),
+            scar_focus: None,
         };
         app.apply_computed_files(initial);
         Ok(app)
@@ -1131,6 +1157,28 @@ impl App {
         // hunk if possible; the sub-row offset starts fresh there.
         self.cursor_sub_row = 0;
         self.refresh_anchor();
+        // Sticky scar focus: if a scar op recently set a focus
+        // target, re-apply it after `refresh_anchor` so the
+        // asynchronous watcher-driven recompute doesn't snap the
+        // cursor back to the hunk header. If the target line is no
+        // longer representable in the layout (e.g. the file was
+        // deleted or the scar was manually removed), clear the
+        // focus so subsequent recomputes follow normal anchoring.
+        if let Some((abs, line)) = self.scar_focus.clone() {
+            if let Some(row) = self.find_new_file_line_row(&abs, line) {
+                self.scroll_to(row);
+            } else {
+                self.scar_focus = None;
+            }
+        }
+    }
+
+    /// Drop any pending scar-focus target. Called from navigation
+    /// key dispatch so the user's explicit movement "sticks" — the
+    /// next watcher-driven recompute won't yank them back to the
+    /// scar line they've since moved past.
+    pub(crate) fn clear_scar_focus_on_nav(&mut self) {
+        self.scar_focus = None;
     }
 
     /// Re-capture HEAD as the new baseline (R key).
@@ -1321,6 +1369,13 @@ impl App {
             return KeyEffect::None;
         }
 
+        // Any user keypress drops the sticky scar-focus target. Scar
+        // actions (`a`/`r`/`c`/`u`) re-establish the focus later in
+        // this frame via `refresh_after_scar_write`, so clearing here
+        // costs nothing for them but protects every other key from
+        // leaving the cursor pinned to the last scar.
+        self.clear_scar_focus_on_nav();
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('d') => {
@@ -1439,6 +1494,8 @@ impl App {
                     self.toggle_cursor_placement();
                 } else if ch == k.wrap_toggle {
                     self.toggle_wrap_lines();
+                } else if ch == k.undo {
+                    self.undo_scar();
                 }
             }
             _ => {}
@@ -2012,8 +2069,26 @@ impl App {
         let Some((path, line)) = self.scar_target_line() else {
             return;
         };
-        if let Err(err) = crate::scar::insert_scar(&path, line, kind, body) {
-            self.last_error = Some(format!("scar: {err:#}"));
+        match crate::scar::insert_scar(&path, line, kind, body) {
+            Ok(Some(receipt)) => {
+                self.scar_undo_stack.push(ScarUndoEntry {
+                    path,
+                    line_1indexed: receipt.line_1indexed,
+                    rendered: receipt.rendered,
+                });
+                self.refresh_after_scar_write(Some((
+                    self.scar_undo_stack.last().unwrap().path.clone(),
+                    self.scar_undo_stack.last().unwrap().line_1indexed,
+                )));
+            }
+            Ok(None) => {
+                // Idempotent no-op (same scar already above target).
+                // Nothing to undo; don't pollute the stack with a
+                // phantom entry.
+            }
+            Err(err) => {
+                self.last_error = Some(format!("scar: {err:#}"));
+            }
         }
     }
 
@@ -2054,10 +2129,136 @@ impl App {
         if body.is_empty() {
             return;
         }
-        if let Err(err) =
-            crate::scar::insert_scar(&state.target_path, state.target_line, ScarKind::Free, body)
+        match crate::scar::insert_scar(&state.target_path, state.target_line, ScarKind::Free, body)
         {
-            self.last_error = Some(format!("scar: {err:#}"));
+            Ok(Some(receipt)) => {
+                self.scar_undo_stack.push(ScarUndoEntry {
+                    path: state.target_path,
+                    line_1indexed: receipt.line_1indexed,
+                    rendered: receipt.rendered,
+                });
+                self.refresh_after_scar_write(Some((
+                    self.scar_undo_stack.last().unwrap().path.clone(),
+                    self.scar_undo_stack.last().unwrap().line_1indexed,
+                )));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.last_error = Some(format!("scar: {err:#}"));
+            }
+        }
+    }
+
+    /// Sync the on-screen diff + file view with the on-disk state
+    /// after a scar write or undo. Without this, the user would wait
+    /// for the watcher debounce (~300ms) before seeing their scar
+    /// appear. We run `git diff` synchronously and re-read the file
+    /// view's line buffer — cheap on any normal repo, and eliminates
+    /// the visible input lag.
+    ///
+    /// `focus` is an optional `(absolute path, 1-indexed new-file
+    /// line)` pair. After the diff rebuild, the cursor is snapped to
+    /// the layout row that represents that line. This is what keeps
+    /// the user parked on the scar they just inserted (otherwise
+    /// `refresh_anchor` re-targets to the hunk header in follow mode).
+    ///
+    /// Best-effort: a git-diff failure here is swallowed. The scar
+    /// write itself already succeeded, the watcher will retry on its
+    /// next tick, and this keeps `last_error` from being polluted by
+    /// the refresh attempt (tests running against a non-git scratch
+    /// dir also benefit).
+    fn refresh_after_scar_write(&mut self, focus: Option<(PathBuf, usize)>) {
+        // Pin the focus target *before* the recompute so
+        // `apply_computed_files`'s tail will honour it. The pin then
+        // persists through the asynchronous watcher tick that fires
+        // ~300ms later — without it, that second recompute would snap
+        // the cursor back to the hunk header.
+        self.scar_focus = focus;
+        if let Ok(files) = git::compute_diff(&self.root, &self.baseline_sha) {
+            self.apply_computed_files(files);
+        }
+        if let Some(fv) = self.file_view.as_mut() {
+            let abs = self.root.join(&fv.path);
+            if let Ok(content) = std::fs::read_to_string(&abs) {
+                fv.lines = content.lines().map(String::from).collect();
+                // line_bg stays stale until the next full rebuild;
+                // reopening file view (Esc → Enter) refreshes it.
+                // Clamp cursor so a shortened file doesn't point past
+                // the end.
+                let max = fv.lines.len().saturating_sub(1);
+                if fv.cursor > max {
+                    fv.cursor = max;
+                }
+            }
+        }
+    }
+
+    /// Find the layout row that renders the given new-file line
+    /// (1-indexed) in the file whose **absolute** path matches `abs`.
+    /// Returns `None` if the file isn't in the current diff, or the
+    /// line isn't currently part of any hunk's new-side window.
+    fn find_new_file_line_row(&self, abs: &Path, line_1indexed: usize) -> Option<usize> {
+        let rel = abs.strip_prefix(&self.root).unwrap_or(abs);
+        let file_idx = self.files.iter().position(|f| f.path == rel)?;
+        let DiffContent::Text(hunks) = &self.files[file_idx].content else {
+            return None;
+        };
+        for (hunk_idx, hunk) in hunks.iter().enumerate() {
+            let mut new_line = hunk.new_start;
+            for (offset, dl) in hunk.lines.iter().enumerate() {
+                if matches!(dl.kind, LineKind::Deleted) {
+                    continue;
+                }
+                if new_line == line_1indexed {
+                    return self.layout.rows.iter().position(|r| {
+                        matches!(
+                            r,
+                            RowKind::DiffLine {
+                                file_idx: f,
+                                hunk_idx: hi,
+                                line_idx: li,
+                            } if *f == file_idx && *hi == hunk_idx && *li == offset,
+                        )
+                    });
+                }
+                new_line += 1;
+            }
+        }
+        None
+    }
+
+    /// Reverse the most recent scar insertion on the session's undo
+    /// stack. No-op when the stack is empty. If the target file has
+    /// been edited such that the captured line no longer matches,
+    /// the op is popped (so repeated `u` presses walk further back)
+    /// and an informational message is placed on `last_error`.
+    pub fn undo_scar(&mut self) {
+        let Some(entry) = self.scar_undo_stack.pop() else {
+            return;
+        };
+        match crate::scar::remove_scar(&entry.path, entry.line_1indexed, &entry.rendered) {
+            Ok(crate::scar::ScarRemove::Removed) => {
+                // The scar is gone; focus the line that now sits at
+                // its old position (the code the scar was annotating).
+                self.refresh_after_scar_write(Some((entry.path.clone(), entry.line_1indexed)));
+            }
+            Ok(crate::scar::ScarRemove::Mismatch) => {
+                self.last_error = Some(format!(
+                    "undo: line {} in {} was edited — skipped",
+                    entry.line_1indexed,
+                    entry.path.display(),
+                ));
+            }
+            Ok(crate::scar::ScarRemove::OutOfRange) => {
+                self.last_error = Some(format!(
+                    "undo: {} has fewer than {} lines — skipped",
+                    entry.path.display(),
+                    entry.line_1indexed,
+                ));
+            }
+            Err(err) => {
+                self.last_error = Some(format!("undo: {err:#}"));
+            }
         }
     }
 
@@ -2087,9 +2288,12 @@ impl App {
 
     /// Open the full-file zoom view for the cursor's current hunk.
     /// Reads the worktree file, builds a line_bg map from diff
-    /// hunks, and parks the viewport so the hunk's first line is
-    /// visible. No-op when the cursor is not on a text hunk, or
-    /// the file cannot be read.
+    /// hunks, and parks the viewport so the **cursor's current
+    /// new-file line** is visible (not the hunk header). That way
+    /// zooming into a hunk keeps the reader on whatever row they
+    /// were already inspecting instead of snapping back to the top
+    /// of the hunk. No-op when the cursor is not on a text hunk,
+    /// or the file cannot be read.
     pub fn open_file_view(&mut self) {
         use ratatui::style::Color;
         use std::collections::HashMap;
@@ -2136,12 +2340,23 @@ impl App {
             }
         }
 
-        // Find cursor's hunk new_start to center the initial viewport.
-        let initial_cursor = self
-            .current_hunk()
-            .and_then(|(_, hi)| hunks.get(hi))
-            .map(|h| h.new_start.saturating_sub(1))
-            .unwrap_or(0)
+        // Inherit the cursor's current new-file line instead of
+        // snapping to the hunk header: `scar_target_line` already
+        // does this mapping (DiffLine → new-file line, HunkHeader →
+        // first changed line). Fall back to the hunk's `new_start`
+        // when the cursor is on a row with no mapping, e.g. a file
+        // header.
+        let target_1indexed = self
+            .scar_target_line()
+            .map(|(_, line)| line)
+            .or_else(|| {
+                self.current_hunk()
+                    .and_then(|(_, hi)| hunks.get(hi))
+                    .map(|h| h.new_start)
+            })
+            .unwrap_or(1);
+        let initial_cursor = target_1indexed
+            .saturating_sub(1)
             .min(lines.len().saturating_sub(1));
 
         let scroll_top = initial_cursor.saturating_sub(self.last_body_height.get() / 2);
@@ -2177,6 +2392,9 @@ impl App {
             self.should_quit = true;
             return KeyEffect::None;
         }
+        // Same sticky-focus discipline as normal mode: every keypress
+        // drops the scar-focus pin; scar action keys re-establish it.
+        self.clear_scar_focus_on_nav();
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('d') => {
@@ -2231,6 +2449,22 @@ impl App {
                     {
                         return KeyEffect::OpenEditor(inv);
                     }
+                }
+            }
+            // Scar operations reuse the diff-view handlers, which
+            // already consult `scar_target_line()` — and that function
+            // is now file-view aware. Config bindings apply (so a user
+            // who remaps `ask` to `A` gets the new key here too).
+            KeyCode::Char(ch) => {
+                let k = &self.config.keys;
+                if ch == k.ask {
+                    self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+                } else if ch == k.reject {
+                    self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+                } else if ch == k.comment {
+                    self.open_scar_comment();
+                } else if ch == k.undo {
+                    self.undo_scar();
                 }
             }
             _ => {}
@@ -2636,6 +2870,13 @@ impl App {
     ///   hunk tail we fall through to the same offset, which matches
     ///   "insert the scar right after the deletion block".
     pub fn scar_target_line(&self) -> Option<(PathBuf, usize)> {
+        // File-view override: when the user is zoomed into a whole file,
+        // the cursor addresses a direct worktree line. Every line is
+        // scar-able, so there's no hunk/deletion mapping to do — just
+        // return `(path, cursor + 1)` (1-indexed).
+        if let Some(fv) = &self.file_view {
+            return Some((self.root.join(&fv.path), fv.cursor + 1));
+        }
         let row = self.layout.rows.get(self.scroll)?;
         let (file_idx, hunk_idx, diff_line_idx) = match *row {
             RowKind::DiffLine {
@@ -3542,6 +3783,8 @@ mod tests {
             saved_stream_scroll: 0,
             stream_events: Vec::new(),
             diff_snapshots: std::collections::HashMap::new(),
+            scar_undo_stack: Vec::new(),
+            scar_focus: None,
         };
         app.files = files;
         app.files.sort_by(|a, b| a.mtime.cmp(&b.mtime));
@@ -5844,7 +6087,7 @@ mod tests {
 
         let after = std::fs::read_to_string(tmp.path().join("auth.py")).expect("read back");
         assert_eq!(
-            after, "def main():\n# @kizu[reject]: revert this change\n    return 1\n",
+            after, "def main():\n    # @kizu[reject]: revert this change\n    return 1\n",
             "`r` key must insert the canned reject scar using python # syntax",
         );
     }
@@ -6224,6 +6467,32 @@ mod tests {
             "line 1 (fn two) should have added bg"
         );
         assert!(!fv.line_bg.contains_key(&0), "line 0 is context — no bg");
+    }
+
+    #[test]
+    fn enter_file_view_starts_at_cursor_not_hunk_header() {
+        // Context + two added lines. The diff surfaces all 3 as
+        // DiffLine rows: [Context "fn one", Added "fn two", Added
+        // "fn three"] with `hunk.new_start = 1`. Parking the cursor
+        // on the 3rd DiffLine (Added "fn three" → new-file line 3)
+        // must take file view to 0-indexed line 2, NOT to 0 (the old
+        // behavior which snapped to `hunk.new_start - 1`).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 2);
+
+        app.handle_key(key(KeyCode::Enter));
+
+        let fv = app.file_view.as_ref().expect("file view opened");
+        assert_eq!(
+            fv.cursor, 2,
+            "file view cursor must track the diff cursor's new-file line (was snapping to hunk.new_start - 1 = 0)",
+        );
     }
 
     #[test]
@@ -7068,6 +7337,297 @@ mod tests {
         assert_eq!(
             after, "a\n// @kizu[ask]: explain this change\nd\n",
             "scar on all-deleted hunk must land at the deletion gap"
+        );
+    }
+
+    // ---- scar undo stack ----
+
+    #[test]
+    fn insert_canned_scar_pushes_entry_to_undo_stack() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn a() {}\nfn b() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn b() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+
+        assert_eq!(app.scar_undo_stack.len(), 1);
+        let entry = &app.scar_undo_stack[0];
+        assert_eq!(entry.line_1indexed, 2);
+        assert_eq!(entry.rendered, "// @kizu[ask]: explain this change");
+        assert_eq!(entry.path, tmp.path().join("src/main.rs"));
+    }
+
+    #[test]
+    fn idempotent_scar_reinsert_does_not_grow_undo_stack() {
+        // Pre-seed the file with the same scar one line above the
+        // intended target. `insert_scar` sees the duplicate and
+        // returns `None`, so the undo stack must stay empty (no
+        // phantom entry that would otherwise cause `u` to "undo" a
+        // write that never happened).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn a() {}\n// @kizu[ask]: explain this change\nfn b() {}\n",
+            1,
+            vec![diff_line(LineKind::Context, "fn a() {}")],
+        );
+        // Use file-view mode to target line 3 (where `fn b` lives)
+        // deterministically — the line above is the pre-existing scar.
+        app.file_view = Some(FileViewState {
+            file_idx: 0,
+            path: PathBuf::from("src/main.rs"),
+            return_scroll: 0,
+            lines: vec![
+                "fn a() {}".into(),
+                "// @kizu[ask]: explain this change".into(),
+                "fn b() {}".into(),
+            ],
+            line_bg: std::collections::HashMap::new(),
+            cursor: 2, // 0-indexed → 1-indexed line 3
+            scroll_top: 0,
+            anim: None,
+            visual_top: 0.0,
+        });
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        assert!(
+            app.scar_undo_stack.is_empty(),
+            "no-op insert must not push an undo entry"
+        );
+    }
+
+    #[test]
+    fn undo_scar_on_empty_stack_is_noop() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn a() {}\n",
+            1,
+            vec![diff_line(LineKind::Context, "fn a() {}")],
+        );
+        app.undo_scar();
+        assert!(app.last_error.is_none(), "empty undo must not error");
+    }
+
+    #[test]
+    fn undo_scar_removes_the_last_inserted_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let abs = tmp.path().join("src/main.rs");
+        let before = "fn a() {}\nfn b() {}\n".to_string();
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            &before,
+            2,
+            vec![diff_line(LineKind::Added, "fn b() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        let inserted = std::fs::read_to_string(&abs).expect("read after insert");
+        assert_ne!(inserted, before);
+
+        app.undo_scar();
+
+        let after_undo = std::fs::read_to_string(&abs).expect("read after undo");
+        assert_eq!(after_undo, before, "undo must restore the original file");
+        assert!(app.scar_undo_stack.is_empty());
+    }
+
+    #[test]
+    fn undo_scar_mismatch_surfaces_on_last_error_and_pops_stack() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let abs = tmp.path().join("src/main.rs");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "fn a() {}\nfn b() {}\n",
+            2,
+            vec![diff_line(LineKind::Added, "fn b() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        // User edits the scar line between insert and undo.
+        std::fs::write(&abs, "fn a() {}\n// @kizu[ask]: USER EDIT\nfn b() {}\n").expect("rewrite");
+
+        app.undo_scar();
+
+        assert!(
+            app.last_error
+                .as_deref()
+                .map(|s| s.contains("edited"))
+                .unwrap_or(false),
+            "mismatched undo must set a last_error with 'edited', got {:?}",
+            app.last_error,
+        );
+        assert!(app.scar_undo_stack.is_empty(), "entry must still pop");
+    }
+
+    #[test]
+    fn undo_unwinds_multiple_inserts_in_reverse_order() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let abs = tmp.path().join("src/main.rs");
+        let before = "fn a() {}\nfn b() {}\nfn c() {}\n".to_string();
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            &before,
+            2,
+            vec![diff_line(LineKind::Added, "fn b() {}")],
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        // First insertion above line 2.
+        app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        // Reuse the diff view layout — second insertion at same logical
+        // position now lands above what shifted to line 3 (the scar
+        // occupies line 2).
+        app.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+        assert_eq!(app.scar_undo_stack.len(), 2);
+
+        // LIFO: the second scar must come off first.
+        app.undo_scar();
+        app.undo_scar();
+
+        let after = std::fs::read_to_string(&abs).expect("read back");
+        assert_eq!(after, before, "two undos must fully restore the file");
+        assert!(app.scar_undo_stack.is_empty());
+    }
+
+    #[test]
+    fn file_view_scar_target_line_is_cursor_plus_one() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            "line1\nline2\nline3\n",
+            1,
+            vec![diff_line(LineKind::Added, "line1")],
+        );
+        // Fake a file-view state directly (bypassing open_file_view's
+        // hunk-centering logic). `cursor: 1` is 0-indexed → scar
+        // targets 1-indexed line 2.
+        app.file_view = Some(FileViewState {
+            file_idx: 0,
+            path: PathBuf::from("src/main.rs"),
+            return_scroll: 0,
+            lines: vec!["line1".into(), "line2".into(), "line3".into()],
+            line_bg: std::collections::HashMap::new(),
+            cursor: 1,
+            scroll_top: 0,
+            anim: None,
+            visual_top: 0.0,
+        });
+        let (path, line) = app.scar_target_line().expect("target");
+        assert_eq!(line, 2);
+        assert_eq!(path, tmp.path().join("src/main.rs"));
+    }
+
+    #[test]
+    fn file_view_a_key_inserts_scar_at_cursor_line_and_u_undoes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let abs = tmp.path().join("src/main.rs");
+        let before = "line1\nline2\nline3\n".to_string();
+        let mut app = scar_app_with_real_fs(
+            &tmp,
+            "src/main.rs",
+            &before,
+            1,
+            vec![diff_line(LineKind::Added, "line1")],
+        );
+        // Enter file view programmatically (don't rely on the Enter
+        // key, which requires the diff layout to have a hunk under
+        // the cursor).
+        app.file_view = Some(FileViewState {
+            file_idx: 0,
+            path: PathBuf::from("src/main.rs"),
+            return_scroll: 0,
+            lines: vec!["line1".into(), "line2".into(), "line3".into()],
+            line_bg: std::collections::HashMap::new(),
+            cursor: 1,
+            scroll_top: 0,
+            anim: None,
+            visual_top: 0.0,
+        });
+
+        // `a` in file view must route to insert_canned_scar via
+        // handle_file_view_key.
+        app.handle_key(key(KeyCode::Char('a')));
+        let inserted = std::fs::read_to_string(&abs).expect("read after insert");
+        assert_eq!(
+            inserted, "line1\n// @kizu[ask]: explain this change\nline2\nline3\n",
+            "`a` in file view must scar above the cursor's 1-indexed line"
+        );
+        assert_eq!(app.scar_undo_stack.len(), 1);
+
+        // `u` in file view reverses that one write.
+        app.handle_key(key(KeyCode::Char('u')));
+        let undone = std::fs::read_to_string(&abs).expect("read after undo");
+        assert_eq!(undone, before, "`u` in file view must undo the scar");
+        assert!(app.scar_undo_stack.is_empty());
+    }
+
+    #[test]
+    fn scar_focus_sticks_across_subsequent_recomputes() {
+        // Regression: the watcher fires a second `recompute_diff` ~300ms
+        // after the scar write, which used to yank the cursor back to
+        // the hunk header via `refresh_anchor`. A sticky `scar_focus`
+        // pin should survive both that second recompute and any further
+        // ones until the user explicitly navigates.
+        let mut app = fake_app(vec![make_file(
+            "src/main.rs",
+            vec![hunk(
+                2,
+                vec![
+                    diff_line(LineKind::Added, "// @kizu[ask]: explain this change"),
+                    diff_line(LineKind::Added, "fn two() {}"),
+                ],
+            )],
+            100,
+        )]);
+        app.scar_focus = Some((PathBuf::from("/tmp/fake/src/main.rs"), 2));
+        // Directly drive `apply_computed_files` with the same file
+        // set — simulates a watcher tick that re-delivers the diff.
+        // The sticky focus must push the scroll to the scar row (line
+        // 2 = the Added "// @kizu[ask]..." line), not the hunk header.
+        let files_snapshot = app.files.clone();
+        app.apply_computed_files(files_snapshot.clone());
+        let scroll_after_first = app.scroll;
+        assert!(
+            matches!(
+                app.layout.rows[scroll_after_first],
+                RowKind::DiffLine { .. }
+            ),
+            "first recompute must land on a DiffLine, not a header"
+        );
+        // Second apply (another watcher tick): focus still sticks.
+        app.apply_computed_files(files_snapshot);
+        assert_eq!(
+            app.scroll, scroll_after_first,
+            "repeated recomputes must keep the cursor on the scar line"
+        );
+        assert!(app.scar_focus.is_some(), "focus persists until user nav");
+    }
+
+    #[test]
+    fn scar_focus_cleared_by_navigation_keys() {
+        // After any user navigation in normal mode, the sticky focus
+        // pin is released so subsequent recomputes follow normal
+        // anchoring rules (the user has explicitly moved elsewhere).
+        let mut app = fake_app(vec![make_file(
+            "src/main.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
+            100,
+        )]);
+        app.scar_focus = Some((PathBuf::from("/tmp/fake/src/main.rs"), 1));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert!(
+            app.scar_focus.is_none(),
+            "j must clear scar_focus so the next recompute doesn't pull the cursor back"
         );
     }
 

@@ -104,3 +104,89 @@ test("e key with EDITOR=true does not panic", async () => {
   const view = await session.text({ trimEnd: true });
   expect(view).toContain("src/main.rs");
 });
+
+test("u key undoes the most recent scar insertion", async () => {
+  repo = createTempRepo();
+  seedOneLineDiff(repo);
+
+  session = await launchKizu({ cwd: repo.path });
+  await session.waitForText("src/main.rs", { timeout: 10_000 });
+
+  await session.press("j");
+  await session.press("a");
+  await Bun.sleep(200);
+  expect(readFileSync(join(repo.path, "src/main.rs"), "utf8")).toContain(
+    "@kizu[ask]"
+  );
+
+  await session.press("u");
+  await Bun.sleep(200);
+
+  // File is restored to its pre-scar shape.
+  expect(readFileSync(join(repo.path, "src/main.rs"), "utf8")).not.toContain(
+    "@kizu"
+  );
+});
+
+test("u with empty undo stack is a safe no-op", async () => {
+  repo = createTempRepo();
+  seedOneLineDiff(repo);
+
+  session = await launchKizu({ cwd: repo.path });
+  await session.waitForText("src/main.rs", { timeout: 10_000 });
+
+  // No scars inserted yet; `u` should do nothing and not crash.
+  await session.press("u");
+  await Bun.sleep(200);
+
+  const view = await session.text({ trimEnd: true });
+  expect(view).toContain("src/main.rs");
+  // File unchanged.
+  expect(readFileSync(join(repo.path, "src/main.rs"), "utf8")).toBe(
+    "fn one() {}\nfn two() {}\n"
+  );
+});
+
+test("scar from file view (Enter → a → Esc) writes to the worktree file", async () => {
+  repo = createTempRepo();
+  seedOneLineDiff(repo);
+
+  session = await launchKizu({ cwd: repo.path });
+  await session.waitForText("src/main.rs", { timeout: 10_000 });
+
+  // Open the file view on the current hunk, press `a`, then close.
+  await session.press("j");
+  await session.press("enter");
+  // File view is active. Cursor is centered on the changed line.
+  await session.press("a");
+  await Bun.sleep(200);
+
+  const content = readFileSync(join(repo.path, "src/main.rs"), "utf8");
+  expect(content).toContain("@kizu[ask]:");
+
+  // Close file view.
+  await session.press("escape");
+});
+
+test("u in file view undoes the scar inserted there", async () => {
+  repo = createTempRepo();
+  seedOneLineDiff(repo);
+
+  session = await launchKizu({ cwd: repo.path });
+  await session.waitForText("src/main.rs", { timeout: 10_000 });
+
+  await session.press("j");
+  await session.press("enter"); // file view
+  await session.press("a");
+  await Bun.sleep(200);
+  expect(readFileSync(join(repo.path, "src/main.rs"), "utf8")).toContain(
+    "@kizu[ask]"
+  );
+
+  await session.press("u");
+  await Bun.sleep(200);
+
+  expect(readFileSync(join(repo.path, "src/main.rs"), "utf8")).not.toContain(
+    "@kizu"
+  );
+});
