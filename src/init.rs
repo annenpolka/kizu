@@ -697,6 +697,57 @@ struct HookCmd<'a> {
 /// Each event holds an array of **matcher groups**, each with a
 /// `matcher` string (tool name filter, `""` = match all) and a
 /// `hooks` sub-array of command objects.
+/// Walk a matcher-group array for one hook event and split any
+/// **mixed** group (contains both kizu and user commands) into two
+/// sibling groups with the same `matcher`: a user-only group and a
+/// kizu-only group. This keeps `remove_kizu_hooks_from_json`'s
+/// group-level removal safe — after the split, the kizu group can
+/// be dropped wholesale without touching user commands.
+///
+/// Ordering: the resulting array keeps the original group at its
+/// position (now user-only) and inserts the kizu-only group
+/// immediately after it, so stable ordering is preserved and the
+/// usual "append to kizu-exclusive group" lookup still finds it.
+fn split_mixed_kizu_groups(arr: &mut Vec<serde_json::Value>) {
+    let mut i = 0;
+    while i < arr.len() {
+        let Some(group_obj) = arr[i].as_object() else {
+            i += 1;
+            continue;
+        };
+        let Some(hooks_arr) = group_obj.get("hooks").and_then(|h| h.as_array()) else {
+            i += 1;
+            continue;
+        };
+        let (kizu_cmds, user_cmds): (Vec<_>, Vec<_>) = hooks_arr.iter().cloned().partition(|cmd| {
+            cmd.get("command")
+                .and_then(|v| v.as_str())
+                .and_then(kizu_command_token)
+                .is_some()
+        });
+        if kizu_cmds.is_empty() || user_cmds.is_empty() {
+            // All-kizu or all-user — nothing to split.
+            i += 1;
+            continue;
+        }
+        // Mixed group. Rebuild into two siblings preserving the
+        // matcher string and any other group-level fields.
+        let matcher_val = group_obj.get("matcher").cloned();
+        let mut user_group = serde_json::Map::new();
+        let mut kizu_group = serde_json::Map::new();
+        if let Some(m) = matcher_val {
+            user_group.insert("matcher".to_string(), m.clone());
+            kizu_group.insert("matcher".to_string(), m);
+        }
+        user_group.insert("hooks".to_string(), serde_json::Value::Array(user_cmds));
+        kizu_group.insert("hooks".to_string(), serde_json::Value::Array(kizu_cmds));
+        arr[i] = serde_json::Value::Object(user_group);
+        arr.insert(i + 1, serde_json::Value::Object(kizu_group));
+        // Skip both the user group and its new kizu sibling.
+        i += 2;
+    }
+}
+
 /// Extract the `hook-<name>` token from a kizu hook invocation so we
 /// can reconcile by subcommand instead of by full command string.
 /// Returns `None` when the command does not look like a kizu hook
@@ -745,6 +796,16 @@ fn merge_hooks_into_settings(
         let arr = matcher_groups
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("hooks.{event_name} is not an array"))?;
+
+        // Pre-pass: split any pre-existing **mixed** matcher group
+        // (contains both kizu and user commands) into a user-only
+        // group plus a kizu-only sibling. `remove_kizu_hooks_from_json`
+        // removes any group containing a kizu command wholesale, so
+        // as long as a mixed group exists kizu's teardown path will
+        // still delete the user's hook. Migrating it here during
+        // `kizu init` makes subsequent teardowns safe without
+        // requiring the user to touch settings.json manually.
+        split_mixed_kizu_groups(arr);
 
         // Gather all existing commands on this event so we can
         // reconcile per-command instead of per-matcher-group. This is
@@ -1498,6 +1559,76 @@ mod tests {
         // The duplicate `hook-post-tool` must not be added twice.
         let post_tool_count = cmds.iter().filter(|c| c.contains("hook-post-tool")).count();
         assert_eq!(post_tool_count, 1, "duplicate must be suppressed");
+    }
+
+    #[test]
+    fn init_then_teardown_preserves_user_hook_in_pre_existing_mixed_group() {
+        // The realistic upgrade path: a user's settings.json already
+        // has a mixed matcher group `[kizu hook-post-tool,
+        // my-user-linter]` from an older install plus a manual
+        // addition. `kizu init` must migrate that mixed group into
+        // a kizu-only group (carrying the pre-existing kizu command
+        // with it) and a user-only group, so that later
+        // `remove_kizu_hooks_from_json` removes only the kizu-only
+        // group and leaves `my-user-linter` alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write|MultiEdit","hooks":[
+                {"type":"command","command":"kizu hook-post-tool --agent claude-code","timeout":10},
+                {"type":"command","command":"my-user-linter","timeout":5}
+            ]}]}}"#,
+        )
+        .unwrap();
+
+        // Simulate a `kizu init` rerun with the v0.3 hook set.
+        merge_hooks_into_settings(
+            &path,
+            &[(
+                "PostToolUse",
+                "Edit|Write|MultiEdit",
+                &[
+                    HookCmd {
+                        command: "kizu hook-post-tool --agent claude-code",
+                        timeout: Some(10),
+                        is_async: false,
+                    },
+                    HookCmd {
+                        command: "kizu hook-log-event",
+                        timeout: None,
+                        is_async: true,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+
+        // Now run teardown.
+        remove_kizu_hooks_from_json(&path).unwrap();
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = doc
+            .get("hooks")
+            .and_then(|h| h.get("PostToolUse"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let remaining_cmds: Vec<String> = arr
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|c| c["command"].as_str().map(String::from))
+            .collect();
+
+        assert!(
+            remaining_cmds.iter().any(|c| c.contains("my-user-linter")),
+            "user linter must survive `init` → `teardown`, remaining: {remaining_cmds:?}"
+        );
+        assert!(
+            !remaining_cmds.iter().any(|c| c.contains("kizu hook-")),
+            "no kizu command must remain after teardown, remaining: {remaining_cmds:?}"
+        );
     }
 
     #[test]
