@@ -185,6 +185,14 @@ pub struct App {
     pub saved_stream_scroll: usize,
     /// Stream mode events, ordered by timestamp ascending.
     pub stream_events: Vec<StreamEvent>,
+    /// Event-log file paths that have already been ingested by
+    /// [`Self::handle_event_log`]. Prevents double-processing when
+    /// `replay_events_dir` scans startup-gap files and the watcher
+    /// later re-delivers the same path (some notify backends fire
+    /// pre-existing files on arm). Keyed on absolute event-file
+    /// path, which is stable because `hook::write_event` uses a
+    /// uniqueness suffix.
+    pub processed_event_paths: std::collections::HashSet<PathBuf>,
     /// Per-file diff snapshots used to compute per-operation diffs.
     /// Maps file path → most recent cumulative diff output.
     pub diff_snapshots: std::collections::HashMap<PathBuf, String>,
@@ -944,6 +952,7 @@ impl App {
             saved_diff_scroll: 0,
             saved_stream_scroll: 0,
             stream_events: Vec::new(),
+            processed_event_paths: std::collections::HashSet::new(),
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
@@ -1041,9 +1050,19 @@ impl App {
         if let Ok(rel) = p.strip_prefix(&self.root) {
             return Some(rel.to_path_buf());
         }
-        // Already repo-relative? Accept if the absolute form lives
-        // inside root (e.g. tests that pass a pure "src/foo.rs").
-        if p.is_relative() && self.root.join(p).starts_with(&self.root) {
+        // Already repo-relative? Accept only when every component is
+        // forward-only (no `..` traversal) AND the resolved absolute
+        // form still lives inside `self.root`. Checking parent
+        // components is required because
+        // `root.join("../outside.rs").starts_with(root)` is true
+        // lexically — the filesystem escape happens only at resolve
+        // time. This is the security boundary for stream mode's
+        // repo filter.
+        if p.is_relative()
+            && p.components()
+                .all(|c| !matches!(c, std::path::Component::ParentDir))
+            && self.root.join(p).starts_with(&self.root)
+        {
             return Some(p.to_path_buf());
         }
         None
@@ -1052,7 +1071,15 @@ impl App {
     /// Handle a new event-log file notification. Reads the event file,
     /// captures the per-operation diff snapshot, and appends to
     /// `stream_events`. Failures are silently ignored (non-critical).
+    ///
+    /// Idempotent per-path: if this exact event file was already
+    /// ingested (e.g. replayed at startup and then re-delivered by
+    /// the watcher), the call is a no-op. The path key is stable
+    /// because `hook::write_event` embeds a uniqueness suffix.
     pub fn handle_event_log(&mut self, path: PathBuf) {
+        if !self.processed_event_paths.insert(path.clone()) {
+            return;
+        }
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => return,
@@ -1152,6 +1179,44 @@ impl App {
             if name_str.ends_with(".json") {
                 let _ = std::fs::remove_file(entry.path());
             }
+        }
+    }
+
+    /// Scan an events directory in timestamp order and feed each
+    /// `.json` file through [`Self::handle_event_log`]. Closes the
+    /// gap between `clean_stale_events` and `watcher::start`: any
+    /// `hook-log-event` written in that window lands on disk but is
+    /// never delivered by the notify backend because the watcher is
+    /// not yet armed. Calling this once after watcher startup drains
+    /// those files before the main loop begins.
+    ///
+    /// Dedup is handled by [`Self::handle_event_log`]: if the watcher
+    /// later re-delivers one of these paths (some notify backends
+    /// fire pre-existing entries on arm), the call becomes a no-op.
+    pub fn replay_events_dir(&mut self, dir: &Path) {
+        if !dir.is_dir() {
+            return;
+        }
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return;
+        };
+        // Collect + sort by filename so older timestamps play back
+        // first. Filenames are `<ms>-<tool>-<uniq>.json`, and the
+        // lexicographic ordering of the `<ms>` prefix coincides with
+        // chronological order as long as ms values have the same
+        // digit count (true for all contemporary timestamps).
+        let mut entries: Vec<PathBuf> = Vec::new();
+        for entry in read_dir.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if s.starts_with('.') || !s.ends_with(".json") {
+                continue;
+            }
+            entries.push(entry.path());
+        }
+        entries.sort();
+        for path in entries {
+            self.handle_event_log(path);
         }
     }
 
@@ -3808,7 +3873,18 @@ pub async fn run() -> Result<()> {
             app.current_branch_ref.as_deref(),
         )?;
         stage("watcher::start", t_watcher);
-        stage("total before loop", t_total);
+
+        // Replay any event files that were written in the gap
+        // between `clean_stale_events` and `watcher::start`. Without
+        // this the next event for the same file would absorb the
+        // dropped operation's contents into its op_diff because the
+        // seeded snapshot is still the pre-edit state. Dedup inside
+        // `handle_event_log` makes this safe even when the watcher
+        // later re-delivers the same file.
+        if let Some(events_dir) = crate::paths::events_dir(&app.root) {
+            app.replay_events_dir(&events_dir);
+        }
+        stage("replay startup-gap events", t_total);
         let result = run_loop(&mut terminal, &mut app, &mut watch).await;
         crate::session::remove_session(&app.root);
         result
@@ -4127,6 +4203,7 @@ mod tests {
             saved_diff_scroll: 0,
             saved_stream_scroll: 0,
             stream_events: Vec::new(),
+            processed_event_paths: std::collections::HashSet::new(),
             diff_snapshots: std::collections::HashMap::new(),
             scar_undo_stack: Vec::new(),
             scar_focus: None,
@@ -8692,6 +8769,135 @@ mod tests {
             app.diff_snapshots.get(&file),
             Some(&prev_diff),
             "snapshot must survive a failing `git diff` so the next event is still accurate"
+        );
+    }
+
+    #[test]
+    fn replay_events_dir_ingests_files_written_during_startup_gap() {
+        // During startup there is a window between
+        // `clean_stale_events` and `watcher::start`. Any event
+        // file written in that gap is never delivered via the
+        // watcher, so the next event for that file would include
+        // the dropped operation's contents in its `op_diff`.
+        // A replay step must drain the directory once at startup
+        // so no event is silently skipped.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            file_paths: vec![root.join("src/a.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 6000,
+        };
+        let event_path = events_dir.join("6000-Write-abc.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        // `replay_events_dir` must scan the directory and feed each
+        // event through `handle_event_log`, just as the watcher
+        // would once it is armed.
+        app.replay_events_dir(&events_dir);
+
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "replay must ingest the pre-existing event, got: {:?}",
+            app.stream_events
+                .iter()
+                .map(|e| e.metadata.tool_name.as_deref().unwrap_or("?"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn replay_events_dir_does_not_double_process_already_seen_events() {
+        // If `replay_events_dir` runs and then the watcher also
+        // delivers the same event (because the watcher was armed
+        // after the file already existed on some notify backends),
+        // the event must be recorded exactly once — otherwise
+        // stream history shows phantom duplicates.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Edit".into()),
+            file_paths: vec![root.join("src/b.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 7000,
+        };
+        let event_path = events_dir.join("7000-Edit-def.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.replay_events_dir(&events_dir);
+        // Simulate the watcher later delivering the same file.
+        app.handle_event_log(event_path.clone());
+
+        assert_eq!(
+            app.stream_events.len(),
+            1,
+            "same event must not be recorded twice"
+        );
+    }
+
+    #[test]
+    fn handle_event_log_rejects_parent_traversal_relative_paths() {
+        // `normalize_event_path` must not accept a relative path that
+        // escapes the repo via `..`. The earlier implementation only
+        // checked `root.join(p).starts_with(root)` lexically, so
+        // `../outside.rs` slipped through (the joined string starts
+        // with `root` before lexical resolution). Any such path
+        // would pollute stream mode with rows that sit outside the
+        // worktree and whose git-diff lookups always fail.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let mut app = fake_app(vec![]);
+        app.root = root.clone();
+
+        let events_dir = root.join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        let event = crate::hook::SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".into(),
+            tool_name: Some("Write".into()),
+            // Traversal path — lexically begins with root but the
+            // `..` escapes the worktree.
+            file_paths: vec![PathBuf::from("../outside.rs")],
+            cwd: root.clone(),
+            timestamp_ms: 5000,
+        };
+        let event_path = events_dir.join("5000-Write.json");
+        std::fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+
+        app.handle_event_log(event_path);
+
+        assert!(
+            app.stream_events.is_empty(),
+            "traversal path must not pass the repo-root filter, got {:?}",
+            app.stream_events
+                .iter()
+                .map(|e| &e.metadata.file_paths)
+                .collect::<Vec<_>>()
         );
     }
 

@@ -298,24 +298,51 @@ pub fn sanitize_event(input: &NormalizedHookInput) -> SanitizedEvent {
 /// JSON file. Returns the path of the written file. The events
 /// directory is created with `0700` permissions if it doesn't exist.
 /// Individual event files are written with `0600` permissions.
+///
+/// Filenames include a uniqueness suffix (`pid` + nanosecond remainder)
+/// so two hook processes firing in the same millisecond cannot
+/// overwrite each other — the earlier format `<ms>-<tool>.json` was
+/// collision-prone because `SanitizedEvent.timestamp_ms` is only
+/// millisecond-precise. Temp files use the same suffix and are
+/// created with `create_new` so a cross-process collision fails the
+/// rename cleanly instead of silently replacing an in-flight event.
 pub fn write_event(event: &SanitizedEvent) -> Result<PathBuf> {
     let dir = crate::paths::events_dir(&event.cwd)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve kizu events directory"))?;
     crate::paths::ensure_private_dir(&dir)?;
 
     let tool = event.tool_name.as_deref().unwrap_or("unknown");
-    let filename = format!("{}-{}.json", event.timestamp_ms, tool);
+    let uniq = unique_filename_suffix();
+    let filename = format!("{}-{}-{}.json", event.timestamp_ms, tool, uniq);
     let dest = dir.join(&filename);
 
     let json = serde_json::to_string(event).context("serializing event")?;
 
-    // Atomic write: write to temp file then rename.
+    // Atomic write: write to a **unique** temp path (same uniqueness
+    // suffix as the final filename) then rename. `create_new`
+    // equivalent via OpenOptions::create_new prevents two concurrent
+    // writers from racing on the same temp file.
     let tmp_path = dir.join(format!(".{filename}.tmp"));
-    std::fs::write(&tmp_path, &json)
-        .with_context(|| format!("writing temp event file {}", tmp_path.display()))?;
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp_path)
+            .with_context(|| format!("creating temp event file {}", tmp_path.display()))?;
+        f.write_all(json.as_bytes())
+            .with_context(|| format!("writing temp event file {}", tmp_path.display()))?;
+    }
 
     #[cfg(unix)]
     {
+        // Belt-and-braces: enforce 0600 even when OpenOptions::mode
+        // is a no-op (non-Unix fallback builds).
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
     }
@@ -324,6 +351,19 @@ pub fn write_event(event: &SanitizedEvent) -> Result<PathBuf> {
         .with_context(|| format!("renaming event file to {}", dest.display()))?;
 
     Ok(dest)
+}
+
+/// Build a per-invocation uniqueness suffix from the process id and
+/// the sub-millisecond nanosecond remainder. Collisions require two
+/// processes sharing the same pid **and** the same ns timestamp in
+/// the same millisecond window — not possible on a single machine.
+fn unique_filename_suffix() -> String {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{pid:x}{nanos:09}")
 }
 
 /// Prune the events directory: remove entries older than `ttl` and
@@ -528,6 +568,11 @@ pub fn enumerate_session_files(root: &Path) -> Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate `KIZU_STATE_DIR` so cargo's
+    /// parallel test runner does not interleave env-var writes.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_hook_input_extracts_claude_code_post_tool_use() {
@@ -890,6 +935,7 @@ mod tests {
 
     #[test]
     fn write_event_creates_file_with_correct_content() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("KIZU_STATE_DIR", tmp.path().to_str().unwrap()) };
 
@@ -906,7 +952,15 @@ mod tests {
         unsafe { std::env::remove_var("KIZU_STATE_DIR") };
 
         assert!(path.exists());
-        assert!(path.to_str().unwrap().contains("1700000000000-Edit.json"));
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            name.starts_with("1700000000000-Edit-"),
+            "filename must begin with `<ms>-<tool>-` and carry a uniqueness suffix, got {name}"
+        );
+        assert!(
+            name.ends_with(".json"),
+            "filename must end with `.json`, got {name}"
+        );
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: SanitizedEvent = serde_json::from_str(&content).unwrap();
@@ -914,7 +968,51 @@ mod tests {
     }
 
     #[test]
+    fn write_event_same_millisecond_produces_distinct_files() {
+        // Two hook invocations in the same millisecond with the same
+        // tool name must NOT overwrite each other. The earlier
+        // implementation used `<ms>-<tool>.json` with a predictable
+        // `.{filename}.tmp` scratch path, so two concurrent writes
+        // raced on both the temp and destination names — one event
+        // silently vanished, poisoning later per-operation diffs
+        // because the next event for the same file diffed against
+        // the wrong prior snapshot.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("KIZU_STATE_DIR", tmp.path().to_str().unwrap()) };
+
+        let event_a = SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Edit".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/a.rs")],
+            cwd: PathBuf::from("/tmp"),
+            timestamp_ms: 1_800_000_000_000,
+        };
+        let event_b = SanitizedEvent {
+            session_id: None,
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Edit".to_string()),
+            file_paths: vec![PathBuf::from("/tmp/b.rs")],
+            cwd: PathBuf::from("/tmp"),
+            timestamp_ms: 1_800_000_000_000, // same ms
+        };
+        let path_a = write_event(&event_a).unwrap();
+        let path_b = write_event(&event_b).unwrap();
+
+        unsafe { std::env::remove_var("KIZU_STATE_DIR") };
+
+        assert_ne!(
+            path_a, path_b,
+            "same-millisecond writes must land in distinct files, got {path_a:?} vs {path_b:?}"
+        );
+        assert!(path_a.exists(), "first event file missing: {path_a:?}");
+        assert!(path_b.exists(), "second event file missing: {path_b:?}");
+    }
+
+    #[test]
     fn write_event_sets_0600_permissions() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("KIZU_STATE_DIR", tmp.path().to_str().unwrap()) };
 
