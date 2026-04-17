@@ -452,6 +452,17 @@ pub struct ScrollLayout {
 /// to update [`App::last_body_height`]. 24 is the classic VT100 height.
 const DEFAULT_BODY_HEIGHT: usize = 24;
 
+/// Threshold for treating a change run as "long" in adaptive motion.
+/// Long runs get walked chunk-by-chunk so their body isn't teleported
+/// past; short runs are atomic landings (one press per run). A run is
+/// long when its visual height exceeds this fraction of the viewport —
+/// so a run filling 80% of the screen or more is considered long.
+const LONG_RUN_RATIO: f32 = 0.8;
+
+fn is_long_run(run_visual: usize, viewport: usize) -> bool {
+    run_visual as f32 > viewport as f32 * LONG_RUN_RATIO
+}
+
 /// Per-render map from logical row index → visual y offset, computed
 /// against the current wrap body width. Every frame the renderer
 /// rebuilds a fresh index (cheap: O(rows) with the 2000-row cap from
@@ -1902,88 +1913,184 @@ impl App {
         }
     }
 
-    /// `J` — adaptive forward motion that switches between scroll and
-    /// hunk jump based on the current hunk's size.
+    /// `j` — adaptive forward motion. Only lands on **reviewable
+    /// rows**: change-run starts, long-run bodies (chunk-walked), or
+    /// the next hunk's header (via [`Self::next_hunk`]). Never parks
+    /// the cursor mid-context.
     ///
-    /// - **Short hunk** (fits in the viewport): instant jump to the next
-    ///   hunk's first row, same as `j`. No chunk-scroll mid-hunk, so
-    ///   walking dense edit clusters doesn't fragment into micro-presses.
-    /// - **Long hunk** (taller than the viewport): scroll forward by
-    ///   [`Self::chunk_size`] rows, clamped to the hunk's last row. Once
-    ///   the cursor lands on the last row, the next `J` flows into the
-    ///   next hunk's first row, so walking through a 200-line hunk ends
-    ///   at the next hunk without any extra key press.
-    /// - Crosses file boundaries the same way [`Self::next_hunk`] does,
-    ///   so `J` keeps flowing through the whole scroll.
+    /// Decision ladder:
+    ///
+    /// 1. **Inside a long run, not at its last row** — chunk-scroll
+    ///    forward by [`Self::chunk_size`], clamped to the run's last
+    ///    row. A 30-line Added block gets walked top-to-bottom in a
+    ///    few presses instead of teleporting past its body.
+    /// 2. **Next run exists within this hunk** — land on its start.
+    ///    (The jump is visually tweened by [`ScrollAnim`] so the
+    ///    motion feels gradual even though the cursor doesn't stop
+    ///    on any intermediate context rows.)
+    /// 3. **No more runs in this hunk** — hand off to
+    ///    [`Self::next_hunk`].
+    ///
+    /// A change run is a maximal stretch of non-`Context` rows — `-`
+    /// and `+` lines share a run because a typical one-line edit
+    /// (`-old\n+new`) is reviewed as a single unit.
     pub fn next_change(&mut self) {
         let cursor = self.scroll;
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
-        if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
-            let last_row = hunk_end.saturating_sub(1);
-            // Measure hunk size in **visual** rows so a single
-            // wrapped long line doesn't falsely register as "short
-            // hunk, just jump". Under nowrap the VisualIndex is the
-            // identity and this collapses to the old logical-row
-            // check.
-            let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-            let hunk_visual = vi.visual_y(hunk_end).saturating_sub(vi.visual_y(hunk_top));
-            // Visual position inside the hunk: logical row y plus
-            // intra-row offset. The cursor can now walk through a
-            // single wrapped diff line (ADR-0009 fix), so we must
-            // compare against the hunk's visual *last line*, not
-            // its last logical row.
-            let cur_y = vi.visual_y(cursor) + self.cursor_sub_row;
-            let hunk_last_y = vi
-                .visual_y(hunk_end)
-                .saturating_sub(1)
-                .max(vi.visual_y(hunk_top));
-            let at_hunk_end = cur_y >= hunk_last_y;
-            if hunk_visual > viewport && !at_hunk_end {
-                // Advance by a visual chunk, clamp to the hunk's
-                // last visual line so the cursor never escapes the
-                // current hunk on an intra-hunk step. `scroll_to_visual`
-                // preserves the resolved sub-row so a walk inside a
-                // long wrapped line actually moves the visible
-                // cursor.
-                let target_y = (cur_y + self.chunk_size()).min(hunk_last_y);
-                let (target_row, target_sub) = vi.logical_at(target_y);
-                let clamped_row = target_row.min(last_row);
-                if body_width.is_some() {
-                    self.scroll_to_visual(clamped_row, target_sub, &vi);
-                } else {
-                    self.scroll_to(clamped_row);
-                }
+
+        let Some((_, hunk_end)) = self.current_hunk_range() else {
+            self.next_hunk();
+            return;
+        };
+
+        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
+
+        // Inside a long run, not at its last row → chunk forward
+        // within the run so its body isn't teleported past.
+        if let Some(&(run_start, run_end)) = self
+            .layout
+            .change_runs
+            .iter()
+            .find(|(s, e)| *s <= cursor && cursor < *e)
+        {
+            let run_visual = vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start));
+            if is_long_run(run_visual, viewport) && cursor + 1 < run_end {
+                let last_row = run_end.saturating_sub(1);
+                let target = (cursor + self.chunk_size()).min(last_row);
+                self.scroll_to(target);
                 return;
             }
         }
+
+        // Next run start in this hunk → jump (never lands on the
+        // intervening context).
+        if let Some(&(run_start, _)) = self
+            .layout
+            .change_runs
+            .iter()
+            .find(|(s, _)| *s > cursor && *s < hunk_end)
+        {
+            self.scroll_to(run_start);
+            return;
+        }
+
         self.next_hunk();
     }
 
-    /// `K` — adaptive backward motion. Mirror of [`Self::next_change`].
+    /// `k` — adaptive backward motion. Mirror of [`Self::next_change`].
+    /// Only lands on change-run starts, long-run bodies, or the prev
+    /// hunk's last run start (via [`Self::prev_hunk_last_run_start`]).
     pub fn prev_change(&mut self) {
         let cursor = self.scroll;
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
-        if let Some((hunk_top, hunk_end)) = self.current_hunk_range() {
-            let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-            let hunk_visual = vi.visual_y(hunk_end).saturating_sub(vi.visual_y(hunk_top));
-            let cur_y = vi.visual_y(cursor) + self.cursor_sub_row;
-            let hunk_top_y = vi.visual_y(hunk_top);
-            let at_hunk_top = cur_y <= hunk_top_y;
-            if hunk_visual > viewport && !at_hunk_top {
-                let target_y = cur_y.saturating_sub(self.chunk_size()).max(hunk_top_y);
-                let (target_row, target_sub) = vi.logical_at(target_y);
-                let clamped_row = target_row.max(hunk_top);
-                if body_width.is_some() {
-                    self.scroll_to_visual(clamped_row, target_sub, &vi);
-                } else {
-                    self.scroll_to(clamped_row);
-                }
+
+        let Some((hunk_top, _)) = self.current_hunk_range() else {
+            self.prev_hunk_last_run_start();
+            return;
+        };
+
+        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
+
+        // Inside a long run, not at its start → chunk back within.
+        if let Some(&(run_start, run_end)) = self
+            .layout
+            .change_runs
+            .iter()
+            .find(|(s, e)| *s <= cursor && cursor < *e)
+        {
+            let run_visual = vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start));
+            if is_long_run(run_visual, viewport) && cursor > run_start {
+                let target = cursor.saturating_sub(self.chunk_size()).max(run_start);
+                self.scroll_to(target);
                 return;
             }
         }
-        self.prev_hunk();
+
+        // Prev run start in this hunk → jump.
+        if let Some(&(run_start, _)) = self
+            .layout
+            .change_runs
+            .iter()
+            .rev()
+            .find(|(s, _)| *s < cursor && *s >= hunk_top)
+        {
+            self.scroll_to(run_start);
+            return;
+        }
+
+        self.prev_hunk_last_run_start();
+    }
+
+    /// Land the cursor on the **start of the last change run** inside
+    /// the hunk immediately before the current one. Used by
+    /// [`Self::prev_change`] as the boundary-crossing handoff.
+    ///
+    /// Landing on the last run's start (rather than the hunk's literal
+    /// last row) keeps the cursor parked on reviewable code. A hunk
+    /// frequently ends with trailing `Context` lines; landing there
+    /// would drop the reader on unchanged code. From the last run's
+    /// start, subsequent `k` presses walk backward through the hunk's
+    /// runs naturally.
+    ///
+    /// "Prev hunk" is defined relative to the *current hunk's header*,
+    /// not the scroll position — otherwise, when the cursor sits past
+    /// the current hunk's header (e.g. on its first change run), this
+    /// helper would pick the current hunk's own header as the "prev"
+    /// and bounce the cursor back inside the same hunk. When there is
+    /// no preceding hunk, this is a no-op.
+    fn prev_hunk_last_run_start(&mut self) {
+        let threshold = self
+            .current_hunk_range()
+            .map(|(top, _)| top)
+            .unwrap_or(self.scroll);
+        let Some(&prev_start) = self
+            .layout
+            .hunk_starts
+            .iter()
+            .rev()
+            .find(|&&s| s < threshold)
+        else {
+            return;
+        };
+        // Extract the (file_idx, hunk_idx) of the prev hunk so we can
+        // scope the run search to it.
+        let (target_file, target_hunk) = match self.layout.rows.get(prev_start) {
+            Some(RowKind::HunkHeader { file_idx, hunk_idx }) => (*file_idx, *hunk_idx),
+            _ => {
+                self.scroll_to(prev_start);
+                return;
+            }
+        };
+        // Walk forward from the prev hunk's header to find its
+        // exclusive end row (first row that no longer belongs to it).
+        let mut prev_hunk_end = prev_start + 1;
+        for (i, row) in self.layout.rows.iter().enumerate().skip(prev_start + 1) {
+            let belongs = match row {
+                RowKind::HunkHeader { file_idx, hunk_idx }
+                | RowKind::DiffLine {
+                    file_idx, hunk_idx, ..
+                } => *file_idx == target_file && *hunk_idx == target_hunk,
+                _ => false,
+            };
+            if belongs {
+                prev_hunk_end = i + 1;
+            } else {
+                break;
+            }
+        }
+        // Last change-run start inside the prev hunk. Defensive
+        // fallback to the hunk header if (somehow) no runs exist.
+        let landing = self
+            .layout
+            .change_runs
+            .iter()
+            .rev()
+            .find(|(s, _)| *s >= prev_start && *s < prev_hunk_end)
+            .map(|(s, _)| *s)
+            .unwrap_or(prev_start);
+        self.scroll_to(landing);
     }
 
     pub fn jump_to_file_first_hunk(&mut self, file_idx: usize) {
@@ -3989,8 +4096,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_j_jumps_to_next_hunk_and_disables_follow() {
-        // After M4v.swap, lowercase `j` is hunk-forward.
+    fn handle_key_j_walks_changes_and_disables_follow() {
+        // Lowercase `j` is run-forward: from the file header it jumps
+        // to the first hunk's header (no hunk to look inside yet),
+        // then to the Added line within that hunk (the run), then to
+        // the next hunk. Repeatedly pressing `j` eventually crosses
+        // into the next hunk even without a "short hunk shortcut".
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![
@@ -4002,6 +4113,8 @@ mod tests {
         app.scroll_to(0);
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, app.layout.hunk_starts[0]);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, app.layout.hunk_starts[0] + 1, "walks to run");
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, app.layout.hunk_starts[1]);
         assert!(!app.follow_mode);
@@ -4060,24 +4173,25 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_j_in_long_hunk_scrolls_by_chunk() {
-        // Force a small body height so the chunk size is exactly 5 rows
-        // (15 / 3 = 5) — this way the test's expected scroll positions
-        // are fixed regardless of the DEFAULT_BODY_HEIGHT used outside
-        // of tests.
+    fn lowercase_j_in_long_run_chunk_scrolls_through_body() {
+        // Long run (20 Added lines, viewport = 15). `j` must not
+        // teleport past the run body — it chunk-scrolls through it so
+        // the user actually sees the change. Once the cursor reaches
+        // the run's last row, the next `j` hands off to the straight
+        // hunk-cross path (no trailing-context dwell).
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
         let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
-        assert_eq!(chunk, 5);
+        assert_eq!(chunk, 5, "viewport=15 → chunk=5");
         let (start, end) = app.layout.change_runs[0];
         let last = end - 1;
 
         app.scroll_to(start);
         app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.scroll, start + chunk);
+        assert_eq!(app.scroll, start + chunk, "first `j`: chunk forward");
 
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, start + 2 * chunk);
@@ -4085,7 +4199,11 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, start + 3 * chunk);
 
-        // Subsequent presses clamp at the last row of the run.
+        // Fourth press clamps to run_end - 1 (4 * 5 = 20 > 19 span).
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, last, "clamps to last row of run");
+
+        // Fifth press: at run end, no next run, no next hunk → stay put.
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, last);
     }
@@ -4120,28 +4238,229 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_k_in_long_hunk_walks_back_by_chunk() {
+    fn lowercase_k_in_long_run_chunk_scrolls_back_through_body() {
+        // Backward mirror of `lowercase_j_in_long_run_chunk_scrolls_through_body`.
+        // A 20-line run with viewport = 15 gives chunk = 5. `k` from
+        // the tail chunk-walks back until the cursor reaches the run
+        // start; subsequent `k` hands off to the prev-hunk pathway (no
+        // prev hunk here → stay put; no hunk-top dwell).
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
         let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
-        // Hunk spans header + 20 diff rows → [1, 22). viewport = 15 < 21,
-        // so `k` chunk-scrolls back clamped to the header row.
-        let hunk_top = app.layout.hunk_starts[0];
-        let last = 21;
+        let (run_start, run_end) = app.layout.change_runs[0];
+        let last = run_end - 1;
 
         app.scroll_to(last);
         app.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(app.scroll, last - chunk);
+        assert_eq!(app.scroll, last - chunk, "first `k`: chunk back");
 
-        // Continue back; scroll must stay within the hunk's row range,
-        // flooring at the hunk header.
         app.handle_key(key(KeyCode::Char('k')));
         app.handle_key(key(KeyCode::Char('k')));
         app.handle_key(key(KeyCode::Char('k')));
-        assert!(app.scroll >= hunk_top);
+        assert_eq!(
+            app.scroll, run_start,
+            "keeps chunking back; magnet snaps to run_start once it's in range"
+        );
+
+        // From run_start, `k` continues chunking back toward the hunk
+        // header (no magnet hit, no current-run re-snap).
+        // At run_start: no more runs in this hunk and no prev hunk →
+        // `prev_hunk_last_run_start` is a no-op, cursor stays put.
+        // (No chunk through the hunk header — that would be stopping
+        // on a non-reviewable row.)
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.scroll, run_start, "no prev hunk → stay put");
+    }
+
+    #[test]
+    fn lowercase_j_teleports_between_runs_never_landing_on_context() {
+        // Hunk with three separate change runs. `j` teleports straight
+        // from run to run — never parks the cursor on an intermediate
+        // Context row. ScrollAnim (not tested here) supplies the
+        // visual "gradual" feel via its 150ms tween.
+        let lines: Vec<DiffLine> = vec![
+            diff_line(LineKind::Added, "r1-a1"),   // run 1 start
+            diff_line(LineKind::Deleted, "r1-d1"), // still run 1
+            diff_line(LineKind::Context, "ctx1"),
+            diff_line(LineKind::Added, "r2-a1"), // run 2 start
+            diff_line(LineKind::Context, "ctx2"),
+            diff_line(LineKind::Context, "ctx3"),
+            diff_line(LineKind::Context, "ctx4"),
+            diff_line(LineKind::Context, "ctx5"),
+            diff_line(LineKind::Context, "ctx6"),
+            diff_line(LineKind::Context, "ctx7"),
+            diff_line(LineKind::Context, "ctx8"),
+            diff_line(LineKind::Context, "ctx9"),
+            diff_line(LineKind::Context, "ctx10"),
+            diff_line(LineKind::Added, "r3-a1"), // run 3 start
+            diff_line(LineKind::Context, "ctx11"),
+        ];
+        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        app.last_body_height.set(10);
+        let runs: Vec<_> = app.layout.change_runs.clone();
+        assert_eq!(runs.len(), 3);
+        let hunk_top = app.layout.hunk_starts[0];
+
+        app.scroll_to(hunk_top);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[0].0, "1st `j`: run 1 start");
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[1].0, "2nd `j`: run 2 start");
+
+        // Run 3 is 10 rows past run 2; `j` still teleports straight to
+        // it, skipping all intervening Context rows.
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.scroll, runs[2].0,
+            "3rd `j`: teleports across context directly to run 3"
+        );
+    }
+
+    #[test]
+    fn lowercase_j_walks_runs_even_in_short_hunk() {
+        // Even when the whole hunk fits on screen (viewport = 40, hunk
+        // is ~4 rows), `j` still walks change runs — short hunks have
+        // no special skip. This keeps the press count consistent with
+        // what the user sees needs reviewing: 2 runs = 2 landings, not
+        // "the hunk's small so let's just skip".
+        let mut app = fake_app(vec![
+            make_file(
+                "a.rs",
+                vec![hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Added, "a1"),
+                        diff_line(LineKind::Context, "c1"),
+                        diff_line(LineKind::Added, "a2"),
+                    ],
+                )],
+                100,
+            ),
+            make_file(
+                "b.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "b1")])],
+                200,
+            ),
+        ]);
+        app.last_body_height.set(40);
+        let runs = app.layout.change_runs.clone();
+        let second_hunk_top = app.layout.hunk_starts[1];
+
+        app.scroll_to(app.layout.hunk_starts[0]);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[0].0, "1st `j`: run 1 start");
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[1].0, "2nd `j`: run 2 start (same hunk)");
+
+        // 3rd press: no more runs in hunk a → crosses to hunk b's
+        // header. The run inside hunk b is reached on the 4th press.
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, second_hunk_top, "3rd `j`: next hunk header");
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, runs[2].0, "4th `j`: run in hunk 2");
+    }
+
+    #[test]
+    fn lowercase_k_at_hunk_top_lands_on_prev_hunk_last_run_start() {
+        // `k` at the second hunk's header must jump into the previous
+        // hunk — landing on the **start of its last change run**, not
+        // its literal last row. In this fixture the first hunk's 3
+        // Added lines form a single run; the run's start is the first
+        // Added line ("a1"), so that's the landing.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Added, "a1"),
+                        diff_line(LineKind::Added, "a2"),
+                        diff_line(LineKind::Added, "a3"),
+                    ],
+                ),
+                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
+            ],
+            100,
+        )]);
+        let second_hunk_top = app.layout.hunk_starts[1];
+        // First hunk's sole run: its start row.
+        let (first_hunk_last_run_start, _) = app.layout.change_runs[0];
+
+        app.scroll_to(second_hunk_top);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.scroll, first_hunk_last_run_start,
+            "`k` crosses into prev hunk and lands on its last run's start"
+        );
+    }
+
+    #[test]
+    fn lowercase_k_skips_prev_hunk_trailing_context() {
+        // Prev hunk has a run followed by trailing context rows.
+        // Backward `k` must land on the RUN start, skipping the
+        // context that trails it — landing on the literal last row
+        // would park the cursor on unchanged code.
+        let mut lines_a: Vec<DiffLine> = vec![diff_line(LineKind::Added, "change")];
+        for _ in 0..5 {
+            lines_a.push(diff_line(LineKind::Context, "tail"));
+        }
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, lines_a),
+                hunk(20, vec![diff_line(LineKind::Added, "b1")]),
+            ],
+            100,
+        )]);
+        let second_hunk_top = app.layout.hunk_starts[1];
+        // First hunk's sole run's start (the Added "change" row).
+        let (first_run_start, _) = app.layout.change_runs[0];
+
+        app.scroll_to(second_hunk_top);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.scroll, first_run_start,
+            "`k` skips trailing context and lands on the run's start"
+        );
+    }
+
+    #[test]
+    fn lowercase_j_skips_trailing_context_and_crosses_to_next_hunk() {
+        // Hunk with a single change run followed by trailing context.
+        // `j` from the run's sole row crosses straight into the next
+        // hunk (ScrollAnim tweens the motion) — never stops on any of
+        // the Context rows between.
+        let mut lines: Vec<DiffLine> = vec![];
+        for _ in 0..4 {
+            lines.push(diff_line(LineKind::Context, "lead"));
+        }
+        lines.push(diff_line(LineKind::Added, "change"));
+        for _ in 0..4 {
+            lines.push(diff_line(LineKind::Context, "trail"));
+        }
+        let mut app = fake_app(vec![
+            make_file("a.rs", vec![hunk(1, lines)], 100),
+            make_file(
+                "b.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+                200,
+            ),
+        ]);
+        app.last_body_height.set(10);
+        let (run_start, _) = app.layout.change_runs[0];
+
+        app.scroll_to(run_start);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.scroll, app.layout.hunk_starts[1],
+            "`j` skips trailing context and crosses directly to next hunk header"
+        );
     }
 
     #[test]
