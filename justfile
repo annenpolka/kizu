@@ -48,6 +48,12 @@ e2e-install:
 run:
     cargo run --release
 
+# Regenerate the README demo GIF via VHS + tmux + scripts/demo/fake-agent.sh.
+# Requires `vhs` and `tmux` on PATH, plus a kizu binary reachable as `kizu`
+# (e.g. `cargo install --path .`).
+demo: release
+    PATH="$(pwd)/target/release:$PATH" vhs docs/media/demo.tape
+
 # Remove cargo artifacts + e2e node_modules.
 clean:
     cargo clean
