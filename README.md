@@ -53,7 +53,7 @@ kizu
 
 Let your agent edit files in another pane; kizu redraws on every change. Press `q` to quit.
 
-That's the v0.1 value proposition: you stop losing the "wait, what?" moments. Once that feels useful, wire up the scar workflow so you can _react_ to a change in one keystroke (see [AI agent integration](#ai-agent-integration) below).
+That alone solves the first friction: you stop losing the "wait, what?" moments. Once that feels useful, wire up the scar workflow so you can _react_ to a change in one keystroke (see [AI agent integration](#ai-agent-integration) below).
 
 ## Usage
 
@@ -192,7 +192,7 @@ command = ""                  # empty = use $EDITOR
 terminal = ""                 # empty = auto-detect; "tmux" | "zellij" | "kitty" | "ghostty"
 ```
 
-Non-character keys (`Enter`, `Tab`, arrows) are not remappable in v0.3.
+Non-character keys (`Enter`, `Tab`, arrows) are not remappable.
 
 ## AI agent integration
 
@@ -263,7 +263,7 @@ cargo clippy -- -D warnings
 
 Architecture, design decisions, and the canonical specification:
 
-- [`docs/SPEC.md`](docs/SPEC.md) — full specification (v0.1 → v0.3, architecture, TUI/hook layer schemas)
+- [`docs/SPEC.md`](docs/SPEC.md) — full specification: architecture, TUI and hook-layer schemas
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records for non-reversible design choices (git CLI shell-out, notify-debouncer-full, tuistory e2e, stream mode, …)
 - [`docs/inline-scar-pattern.md`](docs/inline-scar-pattern.md) — the file-write + Stop-hook async review pattern (kizu's core mechanism)
 - [`docs/related-tools.md`](docs/related-tools.md) — survey of diffpane / diffwatch / revdiff / watchexec+delta / hwatch / Claude Code Hooks pipelines
