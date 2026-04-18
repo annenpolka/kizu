@@ -10,7 +10,7 @@
 
 ## What it does
 
-While a terminal AI coding agent (Claude Code, Cursor, …) edits files in one pane, kizu sits in another and shows you what changed in real time. When something looks wrong, you press one key and a `@kizu[ask|reject|free]:` comment is written into the source file at the change site. The agent picks it up on its next read — or on the next `Stop` hook firing — and fixes it without you having to type a sentence.
+While a terminal AI coding agent (Claude Code, Cursor, …) edits files in one pane, kizu sits in another and shows you what changed in real time. When something looks wrong, you press one key and a `@kizu[ask|reject|free]:` comment is written into the source file at the change site. The agent picks it up on its next `PostToolUse` fire — or, failing that, when its `Stop` hook is forced to keep working — and fixes it without you having to type a sentence.
 
 kizu is designed around three frictions of watching an agent stream output out of the corner of your eye:
 
@@ -18,11 +18,7 @@ kizu is designed around three frictions of watching an agent stream output out o
 2. **Articulating the problem is annoying.** You feel something is wrong but you can't put it into words quickly enough.
 3. **Even when you do articulate it, the agent fixes the wrong thing.** Vague human prose becomes vague agent interpretation.
 
-kizu's answer is **the precision of pointing**: capture every change, let the human point with one keystroke, and the language problem disappears.
-
-## Status
-
-Alpha (v0.3). TUI, scar review, multi-agent hook integration + init/teardown, stream mode, `--attach` terminal auto-split, `~/.config/kizu/config.toml`, scar undo, and a Claude Code plugin are all implemented. Roadmap and phase history live in [`docs/SPEC.md`](docs/SPEC.md).
+kizu's answer is **the precision of pointing**: capture every change, let the human point with one keystroke, and the language problem disappears. The name _kizu_ (傷) is Japanese for "wound" or "scar" — every questionable change leaves a small, visible mark in the source that has to be healed before the agent can move on.
 
 ## Install
 
@@ -63,37 +59,37 @@ That's the v0.1 value proposition: you stop losing the "wait, what?" moments. On
 
 ### Three views
 
-kizu is a single TUI with three modes. `Tab` toggles between Main and Stream; `Enter` zooms into File.
+kizu is a single TUI with three modes. `Tab` toggles between Main and Stream; `Enter` zooms into File. The _session baseline_ referenced below is the `HEAD` SHA at the moment you launched kizu (or the last `R` press), so "what changed" always means "what's changed since you started reviewing."
 
 | Key | View | What you see |
 |-----|------|--------------|
 | _(default)_ | **Main diff** | Per-file hunks based on `git diff <session-baseline>`. Added lines on dark green, deleted on dark red. Hunks are merged the way git sees them. |
-| `Tab` | **Stream mode** | Per-operation history of what the agent actually did, one entry per `Write`/`Edit`/`MultiEdit` tool call. Backed by the `hook-log-event` JSON log, not by git. |
+| `Tab` | **Stream mode** | Per-operation history of what the agent actually did — one entry per file-edit tool call (Claude Code / Qwen: `Write` / `Edit` / `MultiEdit`; Cursor: `afterFileEdit`). Backed by the `hook-log-event` JSON log, not by git. |
 | `Enter` | **File view** | The whole file under the cursor, with added lines highlighted inline. Useful when hunk context isn't enough. `Enter` / `Esc` closes. |
 
 ### Scars
 
-A _scar_ is an inline comment kizu writes directly into your source file, using the target language's comment syntax:
+A _scar_ is an inline comment kizu writes directly into your source file, using the target language's comment syntax. Each scar carries a kind tag (`ask` / `reject` / `free`) and a one-line body:
 
 ```rust
-// @kizu[ask]: why is this null-safe?
+// @kizu[ask]: explain this change
 ```
 
 ```python
-# @kizu[reject]: revert this change — we shouldn't be touching this file
+# @kizu[reject]: revert this change
 ```
 
 ```html
 <!-- @kizu[free]: elaborate on the edge case here -->
 ```
 
-Three kinds:
+Three kinds, each bound to a single key:
 
-- **`ask`** (`a`) — a question. The agent is expected to answer inline and resume.
-- **`reject`** (`r`) — a veto. The agent is expected to undo the change.
-- **`free`** (`c`) — freeform text. You type the body; anything goes.
+- **`ask`** (`a`) — a question. Inserts the canned body `explain this change`; no prompt, no typing. The agent is expected to answer inline and resume.
+- **`reject`** (`r`) — a veto. Inserts the canned body `revert this change`. The agent is expected to undo the edit.
+- **`free`** (`c`) — freeform. Opens an input field where you type the body yourself; anything goes.
 
-Scars are idempotent — pressing `a` twice on the same line is a no-op. `u` undoes the last scar you wrote in this session.
+`a` and `r` are deliberately type-free: the whole point of pointing is that you don't have to compose a sentence. If you need nuance, reach for `c`. Scars are idempotent — pressing `a` twice on the same line is a no-op. `u` undoes the last scar you wrote in this session.
 
 The feedback path back to the agent has two channels:
 
@@ -216,24 +212,28 @@ kizu init --agent claude-code --scope project-local --non-interactive
 
 ### Supported agents
 
-| Agent identifier | Notes |
-|------------------|-------|
-| `claude-code` | PostToolUse + Stop hooks, session binding, pre-commit scar block |
-| `cursor` | PostToolUse + Stop hooks via the session_id binding |
-| `codex` | PostToolUse + Stop hooks |
-| `qwen` | PostToolUse + Stop hooks |
-| `cline` | Config-dir detection, PostToolUse + Stop hooks |
-| `gemini` | PostToolUse + Stop hooks |
+Each agent's host gives kizu a different amount of surface area, so the hook set `kizu init` actually installs varies. "Full" means both a PostToolUse-equivalent and a Stop-equivalent — that is, scars show up mid-turn _and_ block the agent from ending the turn with unresolved review requests.
+
+| Agent identifier | Support level | What `kizu init` installs |
+|------------------|---------------|---------------------------|
+| `claude-code` | Full | PostToolUse (scar notify + async event log) + Stop gate, with `session_id` binding |
+| `cursor` | Full | `afterFileEdit` (scar notify + event log) + `stop` gate in `.cursor/hooks.json`, `session_id` binding |
+| `qwen` | Full | PostToolUse (scar notify + event log) + Stop gate |
+| `codex` | Stop only | Stop gate only — Codex's PreTool / PostTool events fire for Bash tools alone, so there's nothing to hook on file edits |
+| `cline` | PostToolUse only (best-effort) | File-based `.clinerules/hooks/PostToolUse`; no Stop gate, so unresolved scars _cannot_ block task completion |
+| `gemini` | Write-side only | No host-side install — Gemini CLI exposes no hook mechanism yet. You still get the diff pane and can write scars; pipe-based stream integration is planned |
+
+Across every agent, `kizu init` also installs one repo-wide git `pre-commit` shim (see below), regardless of which agent(s) you picked.
 
 See [`docs/deep-research-ai-agent-hooks.md`](docs/deep-research-ai-agent-hooks.md) for the full per-agent survey and [`docs/claude-code-hooks.md`](docs/claude-code-hooks.md) for the Claude Code hook schema and infinite-loop pitfalls.
 
 ### Hook roles
 
-`kizu init` installs up to three hooks per agent:
+`kizu init` wires up three distinct concerns. Which of the first two actually land depends on the agent's hook surface (see the table above); the third is a git hook and is installed once per repo.
 
-- **PostToolUse** → `kizu hook-post-tool` (per-file scar notification) + `kizu hook-log-event` (async event log that feeds Stream mode).
-- **Stop** → `kizu hook-stop` scans tracked + untracked files; any unresolved `@kizu[...]` blocks the agent from finishing.
-- **Git `pre-commit`** → `kizu hook-pre-commit` blocks `git commit` when staged files still contain scars, so reviews can't escape into a commit by accident.
+- **PostToolUse** (per-agent, where supported) → `kizu hook-post-tool` (per-file scar notification) + `kizu hook-log-event` (async event log that feeds Stream mode).
+- **Stop** (per-agent, where supported) → `kizu hook-stop` scans tracked + untracked files; any unresolved `@kizu[...]` blocks the agent from finishing. For agents without a Stop hook (Cline, Gemini), scar resolution is best-effort — the git `pre-commit` is the only remaining safety net.
+- **Git `pre-commit`** (repo-wide, installed once) → `kizu hook-pre-commit` blocks `git commit` when staged files still contain scars, so reviews can't escape into a commit by accident. The shim is kizu-managed: if `.git/hooks/pre-commit` already exists, it's renamed to `pre-commit.user` and chained from the new shim.
 
 ## Stack
 
