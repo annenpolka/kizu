@@ -1,0 +1,51 @@
+name: Demo refresh
+
+# Manual demo regeneration. Opens a PR against `main` with a fresh
+# `docs/media/demo.gif` so the README stays visually current without
+# requiring a maintainer to run `just demo` locally (which needs tmux,
+# vhs, and a release binary installed). Kept separate from the release
+# workflow so a tagged release doesn't have to wait on PR review.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    name: vhs / refresh demo.gif
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install tmux (vhs tape dependency)
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Install kizu on PATH
+        run: cargo install --path . --locked
+
+      - name: Record demo with vhs
+        uses: charmbracelet/vhs-action@v2
+        with:
+          path: docs/media/demo.tape
+
+      - name: Open PR with refreshed demo.gif
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/demo-refresh
+          title: 'chore: refresh demo.gif via CI'
+          commit-message: 'chore: refresh demo.gif via CI'
+          body: |
+            Auto-refreshed VHS demo from `docs/media/demo.tape`.
+
+            Triggered manually via `workflow_dispatch`. Review the
+            playback then merge to update the README preview.
+          add-paths: docs/media/demo.gif
+          delete-branch: true
