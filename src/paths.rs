@@ -95,6 +95,16 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    /// Cargo runs tests in parallel within a single process, and
+    /// `std::env::set_var` mutates global process state. The tests below
+    /// that toggle `KIZU_STATE_DIR` / `KIZU_CONFIG` would otherwise race
+    /// each other (one test's `remove_var` clears another's `set_var`
+    /// before the second assertion runs). Serialising them through a
+    /// shared mutex is cheaper than switching the whole module to
+    /// `--test-threads=1`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn project_hash_is_deterministic() {
@@ -112,7 +122,8 @@ mod tests {
 
     #[test]
     fn session_file_with_override() {
-        // SAFETY: test is single-threaded and restores the var immediately.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: guarded against parallel env-var mutation by `ENV_LOCK`.
         unsafe { std::env::set_var("KIZU_STATE_DIR", "/tmp/kizu-test-state") };
         let path = session_file(Path::new("/project")).unwrap();
         unsafe { std::env::remove_var("KIZU_STATE_DIR") };
@@ -122,6 +133,7 @@ mod tests {
 
     #[test]
     fn events_dir_is_per_project() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("KIZU_STATE_DIR", "/tmp/kizu-test-state") };
         let path_a = events_dir(Path::new("/project-a")).unwrap();
         let path_b = events_dir(Path::new("/project-b")).unwrap();
@@ -135,6 +147,7 @@ mod tests {
 
     #[test]
     fn config_file_with_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("KIZU_CONFIG", "/tmp/kizu-test.toml") };
         let path = config_file().unwrap();
         unsafe { std::env::remove_var("KIZU_CONFIG") };

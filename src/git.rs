@@ -5,8 +5,10 @@ use std::process::Command;
 use std::time::SystemTime;
 
 /// Maximum number of bytes read from an untracked file when synthesizing its
-/// "all-added" diff. See M1.9 / Decision Log for rationale.
-pub const UNTRACKED_READ_CAP: usize = 8 * 1024;
+/// "all-added" diff. 64 MiB is effectively unlimited for source / text files
+/// while keeping an OOM guard against pathological large binaries that an
+/// agent might accidentally drop into the worktree. See plans/v0.3.2.md.
+pub const UNTRACKED_READ_CAP: usize = 64 * 1024 * 1024;
 
 /// Empty tree SHA — used as the baseline when a repository has no commits yet.
 /// See ADR notes in plans/v0.1-mvp.md (Decision Log: empty tree fallback).
@@ -535,20 +537,33 @@ fn parse_quoted_token(bytes: &[u8]) -> Option<(Vec<u8>, &[u8])> {
 /// (NUL byte detected in the read window) are returned as
 /// [`DiffContent::Binary`].
 fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
+    synthesize_untracked_with_cap(root, rel_path, UNTRACKED_READ_CAP)
+}
+
+/// Same as [`synthesize_untracked`] but with an explicit byte cap. Factored
+/// out so tests can exercise the truncation / binary-detection paths with a
+/// small cap instead of materialising a `UNTRACKED_READ_CAP`-sized fixture
+/// on disk each run.
+fn synthesize_untracked_with_cap(root: &Path, rel_path: &Path, cap: usize) -> Result<FileDiff> {
     let abs = root.join(rel_path);
     let total_size = std::fs::metadata(&abs)
         .with_context(|| format!("statting untracked file {}", abs.display()))?
         .len() as usize;
     let mut file = std::fs::File::open(&abs)
         .with_context(|| format!("opening untracked file {}", abs.display()))?;
-    let mut buf: Vec<u8> = Vec::with_capacity(UNTRACKED_READ_CAP + 1);
+    // Reserve space that matches the smaller of the file and the cap, plus
+    // one so `read_to_end` can still pull `cap + 1` bytes and let us detect
+    // "file is strictly larger than cap" without allocating the full cap
+    // upfront for every tiny untracked entry.
+    let capacity = total_size.saturating_add(1).min(cap.saturating_add(1));
+    let mut buf: Vec<u8> = Vec::with_capacity(capacity);
     file.by_ref()
-        .take((UNTRACKED_READ_CAP + 1) as u64)
+        .take((cap as u64).saturating_add(1))
         .read_to_end(&mut buf)
         .with_context(|| format!("reading untracked file {}", abs.display()))?;
-    let truncated = buf.len() > UNTRACKED_READ_CAP;
+    let truncated = buf.len() > cap;
     if truncated {
-        buf.truncate(UNTRACKED_READ_CAP);
+        buf.truncate(cap);
     }
 
     if buf.contains(&0u8) {
@@ -563,7 +578,7 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
         });
     }
 
-    // We may have stopped mid-codepoint at the 8KB boundary; fall back to a
+    // We may have stopped mid-codepoint at the cap boundary; fall back to a
     // lossy decode so we never refuse a valid file because of an awkward cut.
     let text = String::from_utf8_lossy(&buf);
     let lines: Vec<DiffLine> = split_logical_lines(&text)
@@ -576,7 +591,7 @@ fn synthesize_untracked(root: &Path, rel_path: &Path) -> Result<FileDiff> {
         .collect();
     let mut lines = lines;
     if truncated {
-        let remaining = total_size.saturating_sub(UNTRACKED_READ_CAP);
+        let remaining = total_size.saturating_sub(cap);
         lines.push(DiffLine {
             kind: LineKind::Context,
             content: format!("[+{remaining} more bytes from new file]"),
@@ -1733,21 +1748,61 @@ index 1111111..2222222 100644
     }
 
     #[test]
-    fn compute_diff_caps_untracked_file_at_read_limit() {
+    fn synthesize_untracked_reports_truncation_marker_when_file_exceeds_cap() {
+        // Exercise the cap / truncation / binary-detection plumbing without
+        // materialising a `UNTRACKED_READ_CAP` (64 MiB) fixture on disk.
+        let repo = init_repo();
+        let cap = 4 * 1024usize;
+        let line: String = "x".repeat(99);
+        let body = (0..200)
+            .map(|_| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.len() > cap, "fixture must exceed the test cap");
+        fs::write(repo.path().join("big.txt"), &body).expect("write big");
+
+        let synth = synthesize_untracked_with_cap(repo.path(), Path::new("big.txt"), cap)
+            .expect("synthesize_untracked_with_cap");
+        let hunks = match &synth.content {
+            DiffContent::Text(h) => h,
+            DiffContent::Binary => panic!("unexpected binary classification"),
+        };
+        let total_bytes: usize = hunks[0].lines.iter().map(|l| l.content.len() + 1).sum();
+        assert!(
+            total_bytes <= cap + 100,
+            "untracked content should be capped near {cap} bytes, got {total_bytes}"
+        );
+        assert!(
+            hunks[0]
+                .lines
+                .iter()
+                .any(|line| line.content.contains("more bytes from new file")),
+            "expected a visible truncation marker instead of silent truncation"
+        );
+        assert!(
+            synth.added < 200,
+            "expected fewer than 200 lines after cap, got {}",
+            synth.added
+        );
+    }
+
+    #[test]
+    fn compute_diff_reads_untracked_file_below_cap_in_full() {
         let repo = init_repo();
         fs::write(repo.path().join("seed.txt"), "seed").expect("write seed");
         run_git(repo.path(), &["add", "seed.txt"]);
         run_git(repo.path(), &["commit", "--quiet", "-m", "initial"]);
         let baseline = head_sha(repo.path()).expect("head_sha");
 
-        // 200 lines × 100 bytes = 20000 bytes (well over the 8KB cap).
-        let line: String = "x".repeat(99);
-        let body = (0..200)
+        // 100 KiB worth of lines: far above the legacy 8 KiB cap and far
+        // below the post-v0.3.2 cap. Must be returned in full with no
+        // truncation marker once the cap has been raised.
+        let line: String = "y".repeat(99);
+        let body = (0..1024)
             .map(|_| line.as_str())
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(repo.path().join("big.txt"), &body).expect("write big");
-        assert!(body.len() > UNTRACKED_READ_CAP);
 
         let files = compute_diff(repo.path(), &baseline).expect("compute_diff");
         let big = files
@@ -1758,22 +1813,16 @@ index 1111111..2222222 100644
             DiffContent::Text(h) => h,
             DiffContent::Binary => panic!("unexpected binary classification"),
         };
-        let total_bytes: usize = hunks[0].lines.iter().map(|l| l.content.len() + 1).sum();
-        assert!(
-            total_bytes <= UNTRACKED_READ_CAP + 100,
-            "untracked content should be capped near {UNTRACKED_READ_CAP} bytes, got {total_bytes}"
-        );
         assert!(
             hunks[0]
                 .lines
                 .iter()
-                .any(|line| line.content.contains("more bytes from new file")),
-            "expected a visible truncation marker instead of silent truncation"
+                .all(|line| !line.content.contains("more bytes from new file")),
+            "files well below the cap must not carry a truncation marker"
         );
-        assert!(
-            big.added < 200,
-            "expected fewer than 200 lines after cap, got {}",
-            big.added
+        assert_eq!(
+            big.added, 1024,
+            "all 1024 generated lines must be present as Added"
         );
     }
 
