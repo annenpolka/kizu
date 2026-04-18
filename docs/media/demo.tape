@@ -64,39 +64,50 @@ Type "kizu"
 Enter
 Sleep 9s
 
-# Follow mode pins the cursor to the newest change, so we move up to
-# reach earlier hunks.
-Type "k"
-Sleep 450ms
-Type "k"
-Sleep 450ms
-Type "k"
-Sleep 450ms
+# Follow mode pins the cursor to the newest change. `h` hops back to
+# the previous hunk header (main.rs), then `J` steps down line-by-line
+# until the cursor parks on the `let count = 1 / 0;` bug line.
+Type "h"
+Sleep 700ms
+Type "J"
+Sleep 300ms
+Type "J"
+Sleep 300ms
+Type "J"
+Sleep 300ms
+Type "J"
+Sleep 300ms
+Type "J"
+Sleep 300ms
+Type "J"
+Sleep 300ms
 
-# Insert an ask scar at the buggy line.
+# Insert an ask scar on the buggy line.
 Type "a"
 Sleep 2000ms
 
-# Move to another line, then open a freeform comment scar with `c`.
-Type "k"
-Sleep 400ms
-Type "k"
-Sleep 400ms
+# Jump back to util.rs: the first `h` rewinds to main.rs's own hunk
+# header (prev_hunk finds the closest `< cursor` hunk start), the
+# second crosses into util.rs. Drop a free-text scar there.
+Type "h"
+Sleep 700ms
+Type "h"
+Sleep 1000ms
 Type "c"
 Sleep 500ms
-Type "revisit this once util lands"
+Type "missing tests for this helper"
 Sleep 1500ms
 Enter
 Sleep 2500ms
 
-# Jump across files with h (previous) / l (next).
-Type "h"
-Sleep 1200ms
-Type "h"
-Sleep 1200ms
+# Jump across files with l (next) / h (previous) to showcase navigation.
 Type "l"
-Sleep 800ms
+Sleep 1000ms
 Type "l"
+Sleep 1000ms
+Type "h"
+Sleep 1000ms
+Type "h"
 Sleep 800ms
 
 # Tab → Stream mode: per-operation history from hook-log-event.
