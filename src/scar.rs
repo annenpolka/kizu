@@ -257,7 +257,7 @@ pub fn insert_scar(
         out.push_str(line);
     }
 
-    std::fs::write(path, out)
+    write_preserving_mtime(path, out.as_bytes())
         .with_context(|| format!("writing {} with scar inserted", path.display()))?;
     // Post-insert: the scar occupies 1-indexed line `insert_at + 1`,
     // which equals the clamped `target`.
@@ -265,6 +265,22 @@ pub fn insert_scar(
         line_1indexed: insert_at + 1,
         rendered: scar_line,
     }))
+}
+
+/// Write `content` to `path` while keeping the file's modified time at
+/// its pre-write value. A scar insert/remove is an annotation, not a
+/// code edit — preserving mtime prevents the scarred file from floating
+/// to the tail of kizu's mtime-sorted file list, which would visibly
+/// jerk the hunk to the bottom of follow mode.
+fn write_preserving_mtime(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let pre_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    std::fs::write(path, content)?;
+    if let Some(mtime) = pre_mtime
+        && let Ok(f) = std::fs::File::options().write(true).open(path)
+    {
+        let _ = f.set_times(std::fs::FileTimes::new().set_modified(mtime));
+    }
+    Ok(())
 }
 
 /// Return the leading whitespace string to reuse for a scar inserted
@@ -348,7 +364,7 @@ pub fn remove_scar(path: &Path, line_1indexed: usize, expected: &str) -> Result<
         }
         out.push_str(line);
     }
-    std::fs::write(path, out)
+    write_preserving_mtime(path, out.as_bytes())
         .with_context(|| format!("writing {} with scar removed", path.display()))?;
     Ok(ScarRemove::Removed)
 }
@@ -357,6 +373,7 @@ pub fn remove_scar(path: &Path, line_1indexed: usize, expected: &str) -> Result<
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::SystemTime;
 
     fn syntax(path: &str) -> CommentSyntax {
         detect_comment_syntax(&PathBuf::from(path))
@@ -835,5 +852,72 @@ mod tests {
         assert_eq!(outcome, ScarRemove::Removed);
         let after = fs::read_to_string(&path).expect("read after");
         assert_eq!(after, before);
+    }
+
+    /// A scar insert is a review annotation, not a code edit. The on-disk
+    /// mtime must therefore survive the write so that kizu's mtime-sorted
+    /// file list does not float the scarred file to the "latest" slot —
+    /// the hunk would visibly jump to the bottom of the follow-mode
+    /// viewport otherwise.
+    #[test]
+    fn insert_scar_preserves_file_mtime() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(&dir, "main.rs", "fn a() {}\nfn b() {}\n");
+        // Back-date the file so "now" and "pre-insert mtime" are
+        // distinguishable even on coarse-resolution filesystems.
+        let pre = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let f = fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open for set_times");
+        f.set_times(fs::FileTimes::new().set_modified(pre))
+            .expect("set pre mtime");
+        drop(f);
+
+        insert_scar(&path, 2, ScarKind::Ask, "look")
+            .expect("insert")
+            .expect("receipt");
+
+        let post = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        assert_eq!(
+            post, pre,
+            "scar insert should preserve the file's modified time"
+        );
+    }
+
+    /// Symmetric with `insert_scar_preserves_file_mtime`: undoing a scar
+    /// (`u` key) must also leave mtime untouched, so that
+    /// insert-then-remove round-trips are invisible to the mtime sort.
+    #[test]
+    fn remove_scar_preserves_file_mtime() {
+        let dir = TempDir::new().expect("tmp");
+        let path = write_tmp(
+            &dir,
+            "main.rs",
+            "fn a() {}\n// @kizu[ask]: look\nfn b() {}\n",
+        );
+        let pre = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let f = fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open for set_times");
+        f.set_times(fs::FileTimes::new().set_modified(pre))
+            .expect("set pre mtime");
+        drop(f);
+
+        let outcome = remove_scar(&path, 2, "// @kizu[ask]: look").expect("remove");
+        assert_eq!(outcome, ScarRemove::Removed);
+
+        let post = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        assert_eq!(
+            post, pre,
+            "scar remove should preserve the file's modified time"
+        );
     }
 }
