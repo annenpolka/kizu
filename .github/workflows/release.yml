@@ -42,14 +42,31 @@ jobs:
         run: cargo publish --locked
 
   # -----------------------------------------------------------------
+  # Create the GitHub Release once, from a single job, before the
+  # binary matrix fans out. `taiki-e/upload-rust-binary-action` does
+  # not reliably handle three matrix jobs racing to create the same
+  # release — they each saw "release not found" on v0.3.1. Doing it
+  # here first removes the race and gives us a place to hang release
+  # notes off in the future.
+  # -----------------------------------------------------------------
+  create-release:
+    name: create github release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # -----------------------------------------------------------------
   # Build release binaries for the supported targets and upload
-  # each as an archive to the GitHub Release (auto-creates the
-  # release if the tag doesn't have one yet). Windows is
-  # intentionally omitted: kizu is a Unix TUI (crossterm + notify +
+  # each as an archive to the GitHub Release created above. Windows
+  # is intentionally omitted: kizu is a Unix TUI (crossterm + notify +
   # raw tmux workflow).
   # -----------------------------------------------------------------
   release-binaries:
     name: binary / ${{ matrix.target }}
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:

@@ -1,1 +1,1 @@
-/Users/annenpolka/ghq/github.com/annenpolka/kizu/CLAUDE.md
+CLAUDE.md
