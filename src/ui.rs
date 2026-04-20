@@ -422,6 +422,13 @@ fn apply_cursor_gutter_tint(
 /// Other color kinds (ANSI names) fall through to the same dim gray
 /// since scaling them precisely would require resolving terminal
 /// palette which we don't control.
+///
+/// `Color::Yellow` is preserved as-is: it is used exclusively as the
+/// `/`-search current-match bg, and the whole point of the highlight
+/// is to stand out. Without this carve-out, every `n`/`N` press
+/// (which parks the cursor on the match row) would collapse the
+/// Yellow reversal into `DEFAULT_DIM` and the user would perceive
+/// the highlight as "dark".
 fn darken_cursor_body_bg(existing: Option<Color>) -> Color {
     // `bg_added = Rgb(10, 50, 10)` (default) maps to Rgb(7, 37, 7) —
     // still clearly green, just slightly muted against the surrounding
@@ -429,6 +436,7 @@ fn darken_cursor_body_bg(existing: Option<Color>) -> Color {
     const FACTOR: f32 = 0.75;
     const DEFAULT_DIM: Color = Color::Rgb(30, 30, 36);
     match existing {
+        Some(Color::Yellow) => Color::Yellow,
         Some(Color::Rgb(r, g, b)) => Color::Rgb(
             (r as f32 * FACTOR) as u8,
             (g as f32 * FACTOR) as u8,
@@ -639,12 +647,16 @@ fn classify_chars_by_match(content: &str, matches: &[(usize, usize, bool)]) -> V
 /// for one char. `Current` fully overrides the base with the
 /// yellow-reversal look; `Other` keeps the base bg/fg but adds a
 /// bold underline so the word stands out without swallowing the
-/// add/delete signal.
+/// add/delete signal. `Other` explicitly strips `DIM` because matches
+/// that land in an unfocused hunk still need to pop — otherwise the
+/// whole point of a search highlight is lost on everything but the
+/// currently selected hunk.
 fn apply_search_overlay(base: Style, fg: Color, hl: SearchHl) -> Style {
     match hl {
         SearchHl::None => base.fg(fg),
         SearchHl::Other => base
             .fg(fg)
+            .remove_modifier(Modifier::DIM)
             .add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
         SearchHl::Current => Style::default()
             .bg(Color::Yellow)
@@ -1524,6 +1536,26 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ));
+        }
+
+        // Confirmed search status: echo the query and a `[i/n]`
+        // counter so the user always knows which hit `n`/`N` jumps to
+        // next. Only drawn when a search is installed (empty query
+        // never reaches this branch because `commit_search_input`
+        // bails on empty input).
+        if let Some(state) = app.search.as_ref() {
+            spans.push(sep());
+            spans.push(Span::styled(
+                format!("/{}", state.query),
+                Style::default().fg(Color::Yellow).add_modifier(bold),
+            ));
+            spans.push(Span::raw(" "));
+            let position = if state.matches.is_empty() {
+                "[0/0]".to_string()
+            } else {
+                format!("[{}/{}]", state.current + 1, state.matches.len())
+            };
+            spans.push(Span::styled(position, Style::default().fg(Color::DarkGray)));
         }
 
         // Cursor placement indicator. `z` toggles Centered ↔ Top.
@@ -3021,11 +3053,15 @@ mod tests {
     /// the search-highlight tests to locate the rendered `foo` runs
     /// without depending on concrete x offsets (which shift when the
     /// left gutter evolves).
+    ///
+    /// Skips the last row — the footer echoes the confirmed `/query`
+    /// so a naive scan would double-count matches from the status bar.
     fn find_text_runs(buf: &ratatui::buffer::Buffer, needle: &str) -> Vec<(u16, u16, usize)> {
         let mut out = Vec::new();
         let width = buf.area().width;
         let height = buf.area().height;
-        for y in 0..height {
+        let body_height = height.saturating_sub(1);
+        for y in 0..body_height {
             let row: String = (0..width)
                 .map(|x| buf[(x, y)].symbol().to_string())
                 .collect();
@@ -3187,6 +3223,160 @@ mod tests {
                 "inter-match cell at ({},{}) must NOT be underlined, got {:?}",
                 xi,
                 y0,
+                style,
+            );
+        }
+    }
+
+    #[test]
+    fn search_current_match_on_cursor_row_retains_yellow_background() {
+        // `commit_search_input` and `search_jump_next`/`_prev` both call
+        // `scroll_to(row)`, so the cursor almost always sits on top of
+        // the current match. `apply_cursor_gutter_tint` darkens every
+        // cell bg on the cursor row; without a carve-out for search
+        // colors, the Yellow reversal collapses into `DEFAULT_DIM`
+        // (Rgb(30,30,36)) and the user perceives the highlight as
+        // "dark". This test pins the carve-out.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "let foo = 1;")])],
+            100,
+        )]);
+        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
+        let match_row = matches[0].row;
+        app.search = Some(crate::app::SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 0,
+        });
+        // Force the cursor onto the match row (mirrors the
+        // post-`n`/`N` state where `scroll_to(match.row)` runs).
+        app.scroll = match_row;
+        app.follow_mode = false;
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let runs = find_text_runs(&buffer, "foo");
+        assert_eq!(runs.len(), 1, "rendered buffer should contain one `foo`");
+        let (x, y, len) = runs[0];
+        for dx in 0..len as u16 {
+            let cell = &buffer[(x + dx, y)];
+            let style = cell.style();
+            assert_eq!(
+                style.bg,
+                Some(Color::Yellow),
+                "current-match cell at ({},{}) must keep Yellow bg even on the cursor row, got {:?}",
+                x + dx,
+                y,
+                style,
+            );
+            assert_eq!(
+                style.fg,
+                Some(Color::Black),
+                "current-match cell at ({},{}) must keep Black fg on the cursor row, got {:?}",
+                x + dx,
+                y,
+                style,
+            );
+        }
+    }
+
+    #[test]
+    fn footer_shows_search_query_and_position() {
+        // With an active `SearchState`, the footer must echo the query
+        // and a `[current/total]` counter so the user can tell which
+        // hit `n`/`N` is about to jump to without counting visually.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo one"),
+                    diff_line(LineKind::Added, "foo two"),
+                    diff_line(LineKind::Added, "foo three"),
+                ],
+            )],
+            100,
+        )]);
+        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(matches.len(), 3);
+        app.search = Some(crate::app::SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 1, // 2/3
+        });
+        app.follow_mode = false;
+
+        let view = render_to_string(&app, 120, 8);
+        assert!(
+            view.contains("/foo"),
+            "footer must echo the confirmed search query, got:\n{view}"
+        );
+        assert!(
+            view.contains("[2/3]"),
+            "footer must show [current/total] position, got:\n{view}"
+        );
+    }
+
+    #[test]
+    fn search_other_match_in_unfocused_hunk_is_not_dimmed() {
+        // When matches land in a hunk that is NOT currently selected,
+        // `base_style` carries `Modifier::DIM` (the rest of the hunk
+        // body dims so the focused hunk stands out). The search
+        // overlay must strip DIM so matches stay loud regardless of
+        // which hunk the cursor is in — otherwise every non-focus
+        // match looks "dark" even though underline + bold are set.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "first foo")]),
+                hunk(50, vec![diff_line(LineKind::Added, "second foo")]),
+            ],
+            100,
+        )]);
+        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(matches.len(), 2, "test fixture precondition");
+        // `current = 0` -> first hunk's `foo` is current; the cursor
+        // sits on the first match row so the second hunk is unfocused.
+        let first_row = matches[0].row;
+        app.search = Some(crate::app::SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 0,
+        });
+        app.follow_mode = false;
+        // Place the cursor explicitly on the first hunk's DiffLine so
+        // `current_hunk()` resolves to hunk 0 and hunk 1 is unfocused.
+        app.scroll = first_row;
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let runs = find_text_runs(&buffer, "foo");
+        assert_eq!(runs.len(), 2, "both `foo` runs must render in the viewport");
+        // The second run is in the unfocused hunk — `apply_search_overlay`
+        // must have stripped `DIM` from `base_style` so the highlight
+        // does not look washed out.
+        let (x1, y1, len1) = runs[1];
+        for dx in 0..len1 as u16 {
+            let style = buffer[(x1 + dx, y1)].style();
+            assert!(
+                !style.add_modifier.contains(Modifier::DIM),
+                "non-current match in unfocused hunk at ({},{}) must NOT carry DIM, got {:?}",
+                x1 + dx,
+                y1,
+                style,
+            );
+            assert!(
+                style.add_modifier.contains(Modifier::UNDERLINED),
+                "non-current match in unfocused hunk at ({},{}) must be underlined, got {:?}",
+                x1 + dx,
+                y1,
                 style,
             );
         }

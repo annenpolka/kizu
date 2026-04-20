@@ -3337,9 +3337,14 @@ impl App {
 
     /// Commit the composed query: run [`find_matches`] against the
     /// current layout, install the resulting `SearchState`, and
-    /// jump the cursor to the first match (if any). Empty queries
-    /// close the composer without touching confirmed state so a
-    /// stray `/` + `Enter` does not wipe an existing search.
+    /// jump the cursor to the first match **after the current cursor
+    /// position** (vim-style). Wraps around to the global first match
+    /// when every hit is before the cursor, so the press always lands
+    /// somewhere as long as matches exist. `N` / `search_jump_prev`
+    /// is the way to step backward from there.
+    ///
+    /// Empty queries close the composer without touching confirmed
+    /// state so a stray `/` + `Enter` does not wipe an existing search.
     pub fn commit_search_input(&mut self) {
         let Some(input) = self.search_input.take() else {
             return;
@@ -3349,13 +3354,18 @@ impl App {
             return;
         }
         let matches = find_matches(&self.layout, &self.files, &query);
-        let first_row = matches.first().map(|m| m.row);
+        let cursor_row = self.scroll;
+        // Pick the first match whose row is strictly after the cursor.
+        // Falling back to index 0 gives wrap-around when the cursor
+        // sits past the last match.
+        let current = matches.iter().position(|m| m.row > cursor_row).unwrap_or(0);
+        let target_row = matches.get(current).map(|m| m.row);
         self.search = Some(SearchState {
             query,
             matches,
-            current: 0,
+            current,
         });
-        if let Some(row) = first_row {
+        if let Some(row) = target_row {
             self.follow_mode = false;
             self.scroll_to(row);
         }
@@ -8647,10 +8657,12 @@ mod tests {
             )],
             100,
         )]);
-        cursor_on_nth_diff_line(&mut app, 0);
+        // Park the cursor on the file header (row 0) so commit picks
+        // match 0 (the first match after the cursor in layout order).
+        app.scroll = 0;
         commit_search(&mut app, "foo");
 
-        // After commit, current = 0 (first foo row). Advance twice.
+        // After commit, current = 0. Advance twice: 0 → 1 → 2.
         app.handle_key(key(KeyCode::Char('n')));
         let mid = app.search.as_ref().unwrap().current;
         app.handle_key(key(KeyCode::Char('n')));
@@ -8672,7 +8684,7 @@ mod tests {
             )],
             100,
         )]);
-        cursor_on_nth_diff_line(&mut app, 0);
+        app.scroll = 0;
         commit_search(&mut app, "foo");
 
         // current=0 → n → 1 → n → 0 (wrap)
@@ -8695,7 +8707,7 @@ mod tests {
             )],
             100,
         )]);
-        cursor_on_nth_diff_line(&mut app, 0);
+        app.scroll = 0;
         commit_search(&mut app, "foo");
 
         // current=0 → N → 2 (wrap to tail)
@@ -8773,6 +8785,71 @@ mod tests {
             ),
             "rehydrated match must index a DiffLine row in the new layout",
         );
+    }
+
+    #[test]
+    fn search_commit_starts_from_first_match_after_cursor() {
+        // vim-style `/`: commit jumps to the first match strictly
+        // after the cursor position, not the global first match.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo one"),
+                    diff_line(LineKind::Added, "mid"),
+                    diff_line(LineKind::Added, "foo two"),
+                    diff_line(LineKind::Added, "foo three"),
+                ],
+            )],
+            100,
+        )]);
+        // Cursor on the middle diff line (between first and third foo).
+        cursor_on_nth_diff_line(&mut app, 1);
+        let cursor_row = app.scroll;
+
+        commit_search(&mut app, "foo");
+
+        let state = app.search.as_ref().expect("search installed");
+        assert_eq!(state.matches.len(), 3);
+        // `current` must point at the first match whose row > cursor_row.
+        assert!(
+            state.matches[state.current].row > cursor_row,
+            "expected current match after cursor row {}, got row {} (idx {})",
+            cursor_row,
+            state.matches[state.current].row,
+            state.current,
+        );
+        // Specifically: the middle cursor is between match 0 ("foo one")
+        // and match 1 ("foo two"). After-cursor = match 1.
+        assert_eq!(state.current, 1);
+    }
+
+    #[test]
+    fn search_commit_wraps_to_first_match_when_cursor_is_past_all_matches() {
+        // When no match lives after the cursor, wrap around to the
+        // global first match so `/foo<Enter>` always lands on SOMETHING
+        // (never a no-op with matches.len() > 0).
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo a"),
+                    diff_line(LineKind::Added, "foo b"),
+                    diff_line(LineKind::Added, "trailing"),
+                ],
+            )],
+            100,
+        )]);
+        // Cursor sits AFTER both matches.
+        cursor_on_nth_diff_line(&mut app, 2);
+
+        commit_search(&mut app, "foo");
+
+        let state = app.search.as_ref().expect("search installed");
+        assert_eq!(state.matches.len(), 2);
+        assert_eq!(state.current, 0, "wrap-around lands on first match");
     }
 
     #[test]
