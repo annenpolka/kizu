@@ -1712,6 +1712,23 @@ impl App {
         // else: pin is either already cleared by scroll_to above
         // (scar_focus_applied = true) or was never set (bootstrap
         // / follow mode / cursor off-screen) — nothing to do.
+
+        // Rehydrate search matches: `MatchLocation.row` indexes the
+        // layout, so the rebuild above silently invalidated every row
+        // pointer. Re-run `find_matches` against the new layout with
+        // the confirmed query so `n`/`N` keep working and the body-view
+        // highlight overlay lands on the right cells. Clamp `current`
+        // into range; empty matches reset to 0 so a future re-entry
+        // starts from the top.
+        if let Some(state) = self.search.as_mut() {
+            let query = state.query.clone();
+            state.matches = find_matches(&self.layout, &self.files, &query);
+            state.current = if state.matches.is_empty() {
+                0
+            } else {
+                state.current.min(state.matches.len() - 1)
+            };
+        }
     }
 
     /// Drop any pending scar-focus target. Called from navigation
@@ -8700,6 +8717,97 @@ mod tests {
 
         assert!(app.search.is_none());
         assert_eq!(app.scroll, before, "stray `n` must not move the cursor");
+    }
+
+    #[test]
+    fn search_matches_rehydrate_after_recompute_preserves_query() {
+        // A watcher-driven recompute rebuilds the layout (row indices
+        // change) so stale `MatchLocation.row` values would point at
+        // the wrong content. After `apply_computed_files`, the search
+        // must re-run `find_matches` against the fresh layout, and the
+        // confirmed query must survive so `n`/`N` still work.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
+            100,
+        )]);
+        let matches = find_matches(&app.layout, &app.files, "foo");
+        app.search = Some(SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 0,
+        });
+        let pre_row = app.search.as_ref().unwrap().matches[0].row;
+
+        // Simulate a watcher-driven recompute that prepends a new file
+        // so every layout row index downstream of it shifts.
+        app.apply_computed_files(vec![
+            make_file(
+                "b.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Context, "ctx")])],
+                50,
+            ),
+            make_file(
+                "a.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
+                100,
+            ),
+        ]);
+
+        let state = app.search.as_ref().expect("search survives recompute");
+        assert_eq!(state.query, "foo");
+        assert_eq!(
+            state.matches.len(),
+            1,
+            "recomputed matches must point at the new layout",
+        );
+        let post_row = state.matches[0].row;
+        assert_ne!(
+            post_row, pre_row,
+            "layout rebuild should have shifted the match row; rehydrate must track",
+        );
+        assert!(
+            matches!(
+                app.layout.rows.get(post_row),
+                Some(RowKind::DiffLine { .. })
+            ),
+            "rehydrated match must index a DiffLine row in the new layout",
+        );
+    }
+
+    #[test]
+    fn search_matches_rehydrate_clamps_current_when_matches_shrink() {
+        // Before recompute: 2 matches, current=1. After recompute the
+        // underlying file drops one match. `current` must clamp into
+        // range so `n`/`N` never panic.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo foo")])],
+            100,
+        )]);
+        let matches = find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(matches.len(), 2);
+        app.search = Some(SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 1,
+        });
+
+        // Recompute with only one `foo` remaining.
+        app.apply_computed_files(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
+            100,
+        )]);
+
+        let state = app.search.as_ref().unwrap();
+        assert_eq!(state.matches.len(), 1);
+        assert!(
+            state.current < state.matches.len(),
+            "current ({}) must be < matches.len ({})",
+            state.current,
+            state.matches.len(),
+        );
     }
 
     // ---- M4 slice 5: `e` external editor --------------------------
