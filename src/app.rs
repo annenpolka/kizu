@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -222,13 +222,18 @@ pub struct App {
     /// jump between hits.
     pub search: Option<SearchState>,
     /// "Seen" marks for hunks the user has visually reviewed and
-    /// wants to hide from the attention surface. Keyed by
-    /// `(relative file path, hunk.old_start)` so the mark survives
-    /// a watcher-driven `compute_diff` as long as the hunk's
-    /// pre-image anchor doesn't move — same fingerprint used by
-    /// [`HunkAnchor`]. Space toggles; nothing is written to disk
-    /// (see plans/v0.2.md M4).
-    pub seen_hunks: BTreeSet<(PathBuf, usize)>,
+    /// wants to collapse out of the attention surface (v0.4). Keyed
+    /// by `(relative file path, hunk.old_start)`; the value is the
+    /// hunk's content fingerprint at the moment Space was pressed.
+    ///
+    /// A watcher-driven recompute invalidates the mark when **either**
+    /// the pre-image anchor (`old_start`) moves **or** the content
+    /// fingerprint changes, so a mark only survives when the hunk is
+    /// bit-for-bit the one the user saw. Seen hunks have their
+    /// `DiffLine` rows omitted from the layout (only the `HunkHeader`
+    /// remains). Space toggles; nothing is written to disk
+    /// (see plans/v0.2.md M4, plans/v0.4.md).
+    pub seen_hunks: BTreeMap<(PathBuf, usize), u64>,
     pub follow_mode: bool,
     /// Set when the most recent `compute_diff` failed. Cleared on success.
     pub last_error: Option<String>,
@@ -489,12 +494,74 @@ fn uses_plus_line_format(basename: &str) -> bool {
 
 /// Linear membership probe for [`App::seen_hunks`] that takes the
 /// path by reference, so the renderer can check every visible hunk
-/// header without allocating a `PathBuf` per frame. The set size is
+/// header without allocating a `PathBuf` per frame. The map size is
 /// bounded by user toggles (typically tens of entries), so the scan
 /// is cheaper than the clone it replaces.
-pub fn is_hunk_seen(seen: &BTreeSet<(PathBuf, usize)>, path: &Path, old_start: usize) -> bool {
+///
+/// v0.4: the mark is bound to the hunk's content fingerprint (not
+/// just the `(path, old_start)` pre-image anchor). A key hit with a
+/// mismatched fingerprint means the hunk has been edited since it
+/// was marked seen — in that case the mark is considered stale and
+/// the hunk behaves as if it were unmarked (auto-expand).
+pub fn is_hunk_seen(
+    seen: &BTreeMap<(PathBuf, usize), u64>,
+    path: &Path,
+    old_start: usize,
+    current_fp: u64,
+) -> bool {
     seen.iter()
-        .any(|(p, o)| *o == old_start && p.as_path() == path)
+        .any(|((p, o), fp)| *o == old_start && *fp == current_fp && p.as_path() == path)
+}
+
+/// v0.4 adaptive-navigation helper: given the nearest "run start"
+/// and "hunk header" row strictly after the cursor, return the row
+/// that `j` should land on — whichever is closer. Both inputs are
+/// already row indices that satisfy `> cursor`.
+fn nearest_landing_forward(next_run: Option<usize>, next_hh: Option<usize>) -> Option<usize> {
+    match (next_run, next_hh) {
+        (Some(r), Some(h)) => Some(r.min(h)),
+        (Some(r), None) => Some(r),
+        (None, Some(h)) => Some(h),
+        (None, None) => None,
+    }
+}
+
+/// Backward mirror of [`nearest_landing_forward`]. Row indices here
+/// satisfy `< cursor`, so the closer one is the *larger* index.
+fn nearest_landing_backward(prev_run: Option<usize>, prev_hh: Option<usize>) -> Option<usize> {
+    match (prev_run, prev_hh) {
+        (Some(r), Some(h)) => Some(r.max(h)),
+        (Some(r), None) => Some(r),
+        (None, Some(h)) => Some(h),
+        (None, None) => None,
+    }
+}
+
+/// Hash the full `lines` vector of a hunk (kind + content + trailing
+/// newline flag) into a single u64 fingerprint. Used by the seen
+/// mark to detect content drift between the moment the user pressed
+/// Space and the current watcher-driven recompute (v0.4).
+///
+/// `DefaultHasher` is not guaranteed deterministic across process
+/// runs, but the fingerprint only needs to be stable within a single
+/// kizu session — the seen set is not persisted to disk.
+pub fn hunk_fingerprint(hunk: &crate::git::Hunk) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for line in &hunk.lines {
+        // Stable discriminator for LineKind — the enum itself is
+        // not `Hash`, so map to a small byte tag.
+        let tag: u8 = match line.kind {
+            crate::git::LineKind::Context => 0,
+            crate::git::LineKind::Added => 1,
+            crate::git::LineKind::Deleted => 2,
+        };
+        tag.hash(&mut h);
+        line.content.hash(&mut h);
+        line.has_trailing_newline.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Insert a single character at `cursor_pos` (char index) and advance
@@ -1172,7 +1239,7 @@ impl App {
             file_view: None,
             search_input: None,
             search: None,
-            seen_hunks: BTreeSet::new(),
+            seen_hunks: BTreeMap::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -1645,6 +1712,23 @@ impl App {
         // else: pin is either already cleared by scroll_to above
         // (scar_focus_applied = true) or was never set (bootstrap
         // / follow mode / cursor off-screen) — nothing to do.
+
+        // Rehydrate search matches: `MatchLocation.row` indexes the
+        // layout, so the rebuild above silently invalidated every row
+        // pointer. Re-run `find_matches` against the new layout with
+        // the confirmed query so `n`/`N` keep working and the body-view
+        // highlight overlay lands on the right cells. Clamp `current`
+        // into range; empty matches reset to 0 so a future re-entry
+        // starts from the top.
+        if let Some(state) = self.search.as_mut() {
+            let query = state.query.clone();
+            state.matches = find_matches(&self.layout, &self.files, &query);
+            state.current = if state.matches.is_empty() {
+                0
+            } else {
+                state.current.min(state.matches.len() - 1)
+            };
+        }
     }
 
     /// Drop any pending scar-focus target. Called from navigation
@@ -2428,11 +2512,6 @@ impl App {
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
 
-        let Some((_, hunk_end)) = self.current_hunk_range() else {
-            self.next_hunk();
-            return;
-        };
-
         let vi = VisualIndex::build(&self.layout, &self.files, body_width);
 
         // Inside a long run, not at its last row → chunk forward
@@ -2452,19 +2531,27 @@ impl App {
             }
         }
 
-        // Next run start in this hunk → jump (never lands on the
-        // intervening context).
-        if let Some(&(run_start, _)) = self
+        // v0.4: landing candidates are `{HunkHeader rows} ∪
+        // {change-run starts}`. Step to whichever comes first after
+        // the cursor. This is what makes `j` stop on both hunk
+        // headers *and* run starts, matching how a reader walks
+        // through a diff (header = "here comes a hunk", run =
+        // "here's a change inside it").
+        let next_run = self
             .layout
             .change_runs
             .iter()
-            .find(|(s, _)| *s > cursor && *s < hunk_end)
-        {
-            self.scroll_to(run_start);
-            return;
+            .find(|(s, _)| *s > cursor)
+            .map(|(s, _)| *s);
+        let next_hh = self
+            .layout
+            .hunk_starts
+            .iter()
+            .find(|&&s| s > cursor)
+            .copied();
+        if let Some(target) = nearest_landing_forward(next_run, next_hh) {
+            self.scroll_to(target);
         }
-
-        self.next_hunk();
     }
 
     /// `k` — adaptive backward motion. Mirror of [`Self::next_change`].
@@ -2474,11 +2561,6 @@ impl App {
         let cursor = self.scroll;
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
-
-        let Some((hunk_top, _)) = self.current_hunk_range() else {
-            self.prev_hunk_last_run_start();
-            return;
-        };
 
         let vi = VisualIndex::build(&self.layout, &self.files, body_width);
 
@@ -2497,89 +2579,25 @@ impl App {
             }
         }
 
-        // Prev run start in this hunk → jump.
-        if let Some(&(run_start, _)) = self
+        // v0.4: landing candidates are `{HunkHeader rows} ∪
+        // {change-run starts}`. Mirror of [`Self::next_change`].
+        let prev_run = self
             .layout
             .change_runs
             .iter()
             .rev()
-            .find(|(s, _)| *s < cursor && *s >= hunk_top)
-        {
-            self.scroll_to(run_start);
-            return;
-        }
-
-        self.prev_hunk_last_run_start();
-    }
-
-    /// Land the cursor on the **start of the last change run** inside
-    /// the hunk immediately before the current one. Used by
-    /// [`Self::prev_change`] as the boundary-crossing handoff.
-    ///
-    /// Landing on the last run's start (rather than the hunk's literal
-    /// last row) keeps the cursor parked on reviewable code. A hunk
-    /// frequently ends with trailing `Context` lines; landing there
-    /// would drop the reader on unchanged code. From the last run's
-    /// start, subsequent `k` presses walk backward through the hunk's
-    /// runs naturally.
-    ///
-    /// "Prev hunk" is defined relative to the *current hunk's header*,
-    /// not the scroll position — otherwise, when the cursor sits past
-    /// the current hunk's header (e.g. on its first change run), this
-    /// helper would pick the current hunk's own header as the "prev"
-    /// and bounce the cursor back inside the same hunk. When there is
-    /// no preceding hunk, this is a no-op.
-    fn prev_hunk_last_run_start(&mut self) {
-        let threshold = self
-            .current_hunk_range()
-            .map(|(top, _)| top)
-            .unwrap_or(self.scroll);
-        let Some(&prev_start) = self
+            .find(|(s, _)| *s < cursor)
+            .map(|(s, _)| *s);
+        let prev_hh = self
             .layout
             .hunk_starts
             .iter()
             .rev()
-            .find(|&&s| s < threshold)
-        else {
-            return;
-        };
-        // Extract the (file_idx, hunk_idx) of the prev hunk so we can
-        // scope the run search to it.
-        let (target_file, target_hunk) = match self.layout.rows.get(prev_start) {
-            Some(RowKind::HunkHeader { file_idx, hunk_idx }) => (*file_idx, *hunk_idx),
-            _ => {
-                self.scroll_to(prev_start);
-                return;
-            }
-        };
-        // Walk forward from the prev hunk's header to find its
-        // exclusive end row (first row that no longer belongs to it).
-        let mut prev_hunk_end = prev_start + 1;
-        for (i, row) in self.layout.rows.iter().enumerate().skip(prev_start + 1) {
-            let belongs = match row {
-                RowKind::HunkHeader { file_idx, hunk_idx }
-                | RowKind::DiffLine {
-                    file_idx, hunk_idx, ..
-                } => *file_idx == target_file && *hunk_idx == target_hunk,
-                _ => false,
-            };
-            if belongs {
-                prev_hunk_end = i + 1;
-            } else {
-                break;
-            }
+            .find(|&&s| s < cursor)
+            .copied();
+        if let Some(target) = nearest_landing_backward(prev_run, prev_hh) {
+            self.scroll_to(target);
         }
-        // Last change-run start inside the prev hunk. Defensive
-        // fallback to the hunk header if (somehow) no runs exist.
-        let landing = self
-            .layout
-            .change_runs
-            .iter()
-            .rev()
-            .find(|(s, _)| *s >= prev_start && *s < prev_hunk_end)
-            .map(|(s, _)| *s)
-            .unwrap_or(prev_start);
-        self.scroll_to(landing);
     }
 
     pub fn jump_to_file_first_hunk(&mut self, file_idx: usize) {
@@ -2934,6 +2952,12 @@ impl App {
     /// binary notice, or any other row with no enclosing hunk.
     /// Pure state change — nothing is written to disk (the mark
     /// lives only for the session, see plans/v0.2.md M4).
+    ///
+    /// v0.4: the mark also stores the hunk's content fingerprint so
+    /// a later recompute can detect content drift and auto-expand.
+    /// After the toggle the layout is rebuilt so the DiffLine rows
+    /// of a newly-seen hunk collapse out (or reappear when the mark
+    /// is cleared) on the next frame.
     pub fn toggle_seen_current_hunk(&mut self) {
         let Some((file_idx, hunk_idx)) = self.current_hunk() else {
             return;
@@ -2948,8 +2972,39 @@ impl App {
             return;
         };
         let key = (file.path.clone(), hunk.old_start);
-        if !self.seen_hunks.remove(&key) {
-            self.seen_hunks.insert(key);
+        if self.seen_hunks.remove(&key).is_none() {
+            let fp = hunk_fingerprint(hunk);
+            self.seen_hunks.insert(key, fp);
+        }
+        // The set of visible rows just changed (collapsed or
+        // expanded). Rebuild so the next frame reflects it; also
+        // snap the cursor to the target hunk's HunkHeader whenever
+        // the old scroll index no longer points *at that same hunk*.
+        //
+        // A plain "is the row still a DiffLine/HunkHeader?" check
+        // isn't enough: collapsing a multi-line hunk shortens the
+        // layout, which can cause the old scroll index to coincide
+        // with a neighbor hunk's DiffLine. That would silently
+        // teleport the cursor out from under the user.
+        let target_hunk = (file_idx, hunk_idx);
+        self.build_layout();
+        let cursor_hunk = match self.layout.rows.get(self.scroll) {
+            Some(RowKind::HunkHeader { file_idx, hunk_idx }) => Some((*file_idx, *hunk_idx)),
+            Some(RowKind::DiffLine {
+                file_idx, hunk_idx, ..
+            }) => Some((*file_idx, *hunk_idx)),
+            _ => None,
+        };
+        if cursor_hunk != Some(target_hunk)
+            && let Some(row) = self.layout.rows.iter().position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader { file_idx: f, hunk_idx: h }
+                        if (*f, *h) == target_hunk
+                )
+            })
+        {
+            self.scroll_to(row);
         }
     }
 
@@ -3282,9 +3337,14 @@ impl App {
 
     /// Commit the composed query: run [`find_matches`] against the
     /// current layout, install the resulting `SearchState`, and
-    /// jump the cursor to the first match (if any). Empty queries
-    /// close the composer without touching confirmed state so a
-    /// stray `/` + `Enter` does not wipe an existing search.
+    /// jump the cursor to the first match **after the current cursor
+    /// position** (vim-style). Wraps around to the global first match
+    /// when every hit is before the cursor, so the press always lands
+    /// somewhere as long as matches exist. `N` / `search_jump_prev`
+    /// is the way to step backward from there.
+    ///
+    /// Empty queries close the composer without touching confirmed
+    /// state so a stray `/` + `Enter` does not wipe an existing search.
     pub fn commit_search_input(&mut self) {
         let Some(input) = self.search_input.take() else {
             return;
@@ -3294,13 +3354,18 @@ impl App {
             return;
         }
         let matches = find_matches(&self.layout, &self.files, &query);
-        let first_row = matches.first().map(|m| m.row);
+        let cursor_row = self.scroll;
+        // Pick the first match whose row is strictly after the cursor.
+        // Falling back to index 0 gives wrap-around when the cursor
+        // sits past the last match.
+        let current = matches.iter().position(|m| m.row > cursor_row).unwrap_or(0);
+        let target_row = matches.get(current).map(|m| m.row);
         self.search = Some(SearchState {
             query,
             matches,
-            current: 0,
+            current,
         });
-        if let Some(row) = first_row {
+        if let Some(row) = target_row {
             self.follow_mode = false;
             self.scroll_to(row);
         }
@@ -3412,7 +3477,12 @@ impl App {
         let Some(hunk) = hunks.get(hunk_idx) else {
             return false;
         };
-        is_hunk_seen(&self.seen_hunks, &file.path, hunk.old_start)
+        is_hunk_seen(
+            &self.seen_hunks,
+            &file.path,
+            hunk.old_start,
+            hunk_fingerprint(hunk),
+        )
     }
 
     /// Resolve the cursor's current target (path + 1-indexed line)
@@ -3794,12 +3864,25 @@ impl App {
                             let row = layout.rows.len();
                             layout.rows.push(RowKind::HunkHeader { file_idx, hunk_idx });
                             layout.hunk_starts.push(row);
-                            for line_idx in 0..hunk.lines.len() {
-                                layout.rows.push(RowKind::DiffLine {
-                                    file_idx,
-                                    hunk_idx,
-                                    line_idx,
-                                });
+                            // v0.4: seen hunks collapse — omit their
+                            // DiffLine rows from the layout so only
+                            // the hunk header is visible. The mark
+                            // auto-clears (below, in the fingerprint
+                            // check) once the hunk content drifts.
+                            let is_seen = is_hunk_seen(
+                                &self.seen_hunks,
+                                &file.path,
+                                hunk.old_start,
+                                hunk_fingerprint(hunk),
+                            );
+                            if !is_seen {
+                                for line_idx in 0..hunk.lines.len() {
+                                    layout.rows.push(RowKind::DiffLine {
+                                        file_idx,
+                                        hunk_idx,
+                                        line_idx,
+                                    });
+                                }
                             }
                         }
                     }
@@ -4582,7 +4665,7 @@ mod tests {
             file_view: None,
             search_input: None,
             search: None,
-            seen_hunks: BTreeSet::new(),
+            seen_hunks: BTreeMap::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -4961,8 +5044,9 @@ mod tests {
         // Backward mirror of `lowercase_j_in_long_run_chunk_scrolls_through_body`.
         // A 20-line run with viewport = 15 gives chunk = 5. `k` from
         // the tail chunk-walks back until the cursor reaches the run
-        // start; subsequent `k` hands off to the prev-hunk pathway (no
-        // prev hunk here → stay put; no hunk-top dwell).
+        // start; the next `k` falls through to the hunk header
+        // (v0.4: hunk headers are landing targets). With no prev
+        // hunk, a further `k` stays put.
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
@@ -4971,6 +5055,7 @@ mod tests {
         let chunk = app.chunk_size();
         let (run_start, run_end) = app.layout.change_runs[0];
         let last = run_end - 1;
+        let hunk_top = app.layout.hunk_starts[0];
 
         app.scroll_to(last);
         app.handle_key(key(KeyCode::Char('k')));
@@ -4984,14 +5069,17 @@ mod tests {
             "keeps chunking back; magnet snaps to run_start once it's in range"
         );
 
-        // From run_start, `k` continues chunking back toward the hunk
-        // header (no magnet hit, no current-run re-snap).
-        // At run_start: no more runs in this hunk and no prev hunk →
-        // `prev_hunk_last_run_start` is a no-op, cursor stays put.
-        // (No chunk through the hunk header — that would be stopping
-        // on a non-reviewable row.)
+        // v0.4: from run_start, next `k` falls through to this
+        // hunk's HunkHeader first (header is now a landing target).
         app.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(app.scroll, run_start, "no prev hunk → stay put");
+        assert_eq!(
+            app.scroll, hunk_top,
+            "v0.4: `k` from run_start falls through to the hunk header"
+        );
+
+        // From the HunkHeader with no prev hunk, `k` is a no-op.
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.scroll, hunk_top, "no prev hunk → stay put");
     }
 
     #[test]
@@ -5087,11 +5175,11 @@ mod tests {
 
     #[test]
     fn lowercase_k_at_hunk_top_lands_on_prev_hunk_last_run_start() {
-        // `k` at the second hunk's header must jump into the previous
-        // hunk — landing on the **start of its last change run**, not
-        // its literal last row. In this fixture the first hunk's 3
-        // Added lines form a single run; the run's start is the first
-        // Added line ("a1"), so that's the landing.
+        // v0.4 unified navigation: from hunk2's header `k` lands on
+        // the nearest backward candidate (run start ∪ hunk header).
+        // In this fixture the prev hunk's only run starts at row 2
+        // (closer to HH1 than HH0 at row 1), so we land on the run
+        // start first. A second `k` then steps back to HH0.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![
@@ -5107,24 +5195,30 @@ mod tests {
             ],
             100,
         )]);
+        let first_hunk_top = app.layout.hunk_starts[0];
         let second_hunk_top = app.layout.hunk_starts[1];
-        // First hunk's sole run: its start row.
         let (first_hunk_last_run_start, _) = app.layout.change_runs[0];
 
         app.scroll_to(second_hunk_top);
         app.handle_key(key(KeyCode::Char('k')));
         assert_eq!(
             app.scroll, first_hunk_last_run_start,
-            "`k` crosses into prev hunk and lands on its last run's start"
+            "v0.4: first `k` lands on the nearest backward candidate (run start)"
+        );
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.scroll, first_hunk_top,
+            "v0.4: second `k` steps to the prev hunk's header"
         );
     }
 
     #[test]
     fn lowercase_k_skips_prev_hunk_trailing_context() {
-        // Prev hunk has a run followed by trailing context rows.
-        // Backward `k` must land on the RUN start, skipping the
-        // context that trails it — landing on the literal last row
-        // would park the cursor on unchanged code.
+        // v0.4: with hunk1's change followed by 5 trailing context
+        // rows, `k` from hunk2's header lands on the change (run
+        // start), then a second `k` steps onto hunk1's header. The
+        // trailing context is implicitly skipped because it never
+        // appears as a landing candidate.
         let mut lines_a: Vec<DiffLine> = vec![diff_line(LineKind::Added, "change")];
         for _ in 0..5 {
             lines_a.push(diff_line(LineKind::Context, "tail"));
@@ -5137,15 +5231,20 @@ mod tests {
             ],
             100,
         )]);
+        let first_hunk_top = app.layout.hunk_starts[0];
         let second_hunk_top = app.layout.hunk_starts[1];
-        // First hunk's sole run's start (the Added "change" row).
         let (first_run_start, _) = app.layout.change_runs[0];
 
         app.scroll_to(second_hunk_top);
         app.handle_key(key(KeyCode::Char('k')));
         assert_eq!(
             app.scroll, first_run_start,
-            "`k` skips trailing context and lands on the run's start"
+            "v0.4: first `k` lands on the prev hunk's run start"
+        );
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.scroll, first_hunk_top,
+            "v0.4: second `k` steps to the prev hunk's header"
         );
     }
 
@@ -5732,16 +5831,17 @@ mod tests {
 
     #[test]
     fn space_toggles_seen_mark_on_current_hunk() {
-        // M4 slice 6: Space flips the cursor's enclosing hunk
-        // into and out of the "seen" set. Pure TUI state — no
-        // file write, no cursor movement, no picker.
+        // M4 slice 6 + v0.4 collapse: Space flips the cursor's
+        // enclosing hunk into and out of the "seen" set. Pure TUI
+        // state — no file write, no picker. In v0.4 Space also
+        // collapses the DiffLine rows and snaps the cursor to the
+        // hunk header when its old row disappears from the layout.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
             100,
         )]);
         cursor_on_nth_diff_line(&mut app, 0);
-        let before_scroll = app.scroll;
 
         app.handle_key(key(KeyCode::Char(' ')));
 
@@ -5750,14 +5850,30 @@ mod tests {
             "Space must toggle the current hunk into the seen set"
         );
         assert!(app.picker.is_none(), "Space must not open the picker");
-        assert_eq!(app.scroll, before_scroll, "Space must not move cursor");
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 0
+                })
+            ),
+            "collapsing a seen hunk must land the cursor on its HunkHeader"
+        );
 
-        // Second press removes the mark.
+        // Second press removes the mark and re-expands the hunk.
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(
             !app.hunk_is_seen(0, 0),
             "a second Space must remove the seen mark"
         );
+        let diff_rows = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::DiffLine { .. }))
+            .count();
+        assert_eq!(diff_rows, 1, "unmarking must re-expand the hunk body");
     }
 
     #[test]
@@ -5784,11 +5900,484 @@ mod tests {
     }
 
     #[test]
-    fn seen_mark_persists_across_a_recompute_that_preserves_hunk_old_start() {
-        // seen_hunks is keyed by (path, hunk.old_start) so a
-        // watcher-driven recompute that rebuilds the FileDiff
-        // list without moving the hunk's pre-image anchor must
-        // leave the mark in place.
+    fn seen_mark_persists_when_hunk_fingerprint_unchanged() {
+        // v0.4: seen_hunks is keyed by (path, hunk.old_start) and
+        // valued by the hunk content fingerprint. A watcher-driven
+        // recompute that rebuilds the FileDiff list without moving
+        // the pre-image anchor **and** without altering the hunk's
+        // lines must leave the mark in place.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 0));
+
+        // Rebuild an identical diff: same old_start, same lines.
+        let fresh = vec![make_file(
+            "a.rs",
+            vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )];
+        app.apply_computed_files(fresh);
+
+        assert!(
+            app.hunk_is_seen(0, 0),
+            "recompute with identical hunk fingerprint must preserve the seen mark"
+        );
+    }
+
+    #[test]
+    fn rebuild_layout_hides_difflines_for_seen_hunk() {
+        // v0.4: marking a hunk as seen must collapse its DiffLine
+        // rows out of the layout so only the hunk header survives.
+        // The file header and spacer stay put.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "x1"),
+                    diff_line(LineKind::Added, "x2"),
+                    diff_line(LineKind::Added, "x3"),
+                ],
+            )],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        let diff_rows_before = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::DiffLine { .. }))
+            .count();
+        assert_eq!(
+            diff_rows_before, 3,
+            "precondition: fixture should layout 3 DiffLine rows"
+        );
+
+        app.handle_key(key(KeyCode::Char(' ')));
+
+        let diff_rows_after = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::DiffLine { .. }))
+            .count();
+        assert_eq!(
+            diff_rows_after, 0,
+            "DiffLine rows must be absent for seen hunk"
+        );
+
+        let header_rows = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::HunkHeader { .. }))
+            .count();
+        assert_eq!(
+            header_rows, 1,
+            "HunkHeader must remain present for the seen hunk"
+        );
+    }
+
+    #[test]
+    fn j_from_seen_hunk_header_lands_on_next_expanded_hunks_header() {
+        // v0.4 mirror of the `k` case: from hunk0 (seen) the `j`
+        // key must stop on hunk1's HunkHeader, not dive into
+        // hunk1's first change-run start.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "a1")]),
+                hunk(
+                    10,
+                    vec![
+                        diff_line(LineKind::Added, "b1"),
+                        diff_line(LineKind::Added, "b2"),
+                    ],
+                ),
+            ],
+            100,
+        )]);
+        let hh0 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 0
+                    }
+                )
+            })
+            .expect("hh0");
+        app.scroll_to(hh0);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 0));
+
+        let hh0 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 0
+                    }
+                )
+            })
+            .expect("hh0 after collapse");
+        app.scroll_to(hh0);
+
+        app.handle_key(key(KeyCode::Char('j')));
+
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 1
+                })
+            ),
+            "j must land on hunk 1's HunkHeader, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+    }
+
+    #[test]
+    fn k_from_seen_hunk_header_walks_through_prev_expanded_hunk() {
+        // v0.4 unified navigation: from hunk1 (seen) `k` first
+        // lands on hunk0's run start (nearest backward landing),
+        // then a second `k` steps onto hunk0's header. Both stops
+        // are reachable — earlier implementations that made `k`
+        // skip straight to the prev hunk's header meant the
+        // expanded hunk's content couldn't be visited on the way
+        // back.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Added, "a1"),
+                        diff_line(LineKind::Added, "a2"),
+                    ],
+                ),
+                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
+            ],
+            100,
+        )]);
+        let hh1 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 1
+                    }
+                )
+            })
+            .expect("hh1");
+        app.scroll_to(hh1);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 1));
+
+        let hh1 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 1
+                    }
+                )
+            })
+            .expect("hh1 after collapse");
+        app.scroll_to(hh1);
+
+        // First `k`: hunk0's run start (closer than HH0).
+        app.handle_key(key(KeyCode::Char('k')));
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::DiffLine {
+                    file_idx: 0,
+                    hunk_idx: 0,
+                    ..
+                })
+            ),
+            "k #1: expected hunk0 run start, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+
+        // Second `k`: hunk0's header.
+        app.handle_key(key(KeyCode::Char('k')));
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 0
+                })
+            ),
+            "k #2: expected hunk0 header, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+    }
+
+    #[test]
+    fn j_walks_through_multiple_seen_hunks_one_by_one() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "a")]),
+                hunk(10, vec![diff_line(LineKind::Added, "b")]),
+                hunk(20, vec![diff_line(LineKind::Added, "c")]),
+            ],
+            100,
+        )]);
+        for i in 0..3 {
+            let row = app
+                .layout
+                .rows
+                .iter()
+                .position(|r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i))
+                .expect("hh");
+            app.scroll_to(row);
+            app.handle_key(key(KeyCode::Char(' ')));
+        }
+
+        let hh0 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 0
+                    }
+                )
+            })
+            .expect("hh0");
+        app.scroll_to(hh0);
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 1)),
+            "j #1: must land on hunk 1, got {:?}",
+            app.current_hunk()
+        );
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 2)),
+            "j #2: must land on hunk 2, got {:?}",
+            app.current_hunk()
+        );
+    }
+
+    #[test]
+    fn k_walks_through_multiple_seen_hunks_one_by_one() {
+        // v0.4 investigation: 3 consecutive seen hunks — the user's
+        // report was "k doesn't stop on hunk headers". Press `k`
+        // repeatedly from the last hunk's header and expect to
+        // land on hunk1's header, then hunk0's header, then no-op.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "a")]),
+                hunk(10, vec![diff_line(LineKind::Added, "b")]),
+                hunk(20, vec![diff_line(LineKind::Added, "c")]),
+            ],
+            100,
+        )]);
+        // Seen all three.
+        for i in 0..3 {
+            let row = app
+                .layout
+                .rows
+                .iter()
+                .position(|r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i))
+                .expect("hh");
+            app.scroll_to(row);
+            app.handle_key(key(KeyCode::Char(' ')));
+        }
+        assert!(app.hunk_is_seen(0, 0) && app.hunk_is_seen(0, 1) && app.hunk_is_seen(0, 2));
+
+        // Cursor on hunk 2's HunkHeader.
+        let hh2 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 2
+                    }
+                )
+            })
+            .expect("hh2");
+        app.scroll_to(hh2);
+
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 1)),
+            "k #1: must land on hunk 1, got {:?}",
+            app.current_hunk()
+        );
+
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 0)),
+            "k #2: must land on hunk 0, got {:?}",
+            app.current_hunk()
+        );
+    }
+
+    #[test]
+    fn k_walks_seen_to_expanded_via_hunk_headers() {
+        // v0.4: with hunk0 seen and hunk1 expanded, `k` from hunk1's
+        // first DiffLine lands on hunk1's own HunkHeader first
+        // (header-as-landing), and the next `k` crosses to hunk0's
+        // HunkHeader.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "a1")]),
+                hunk(
+                    10,
+                    vec![
+                        diff_line(LineKind::Added, "b1"),
+                        diff_line(LineKind::Added, "b2"),
+                    ],
+                ),
+            ],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 0));
+
+        let hh1 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 1
+                    }
+                )
+            })
+            .expect("hh1");
+        app.scroll_to(hh1 + 1);
+        assert_eq!(app.current_hunk(), Some((0, 1)));
+
+        app.handle_key(key(KeyCode::Char('k')));
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 1
+                })
+            ),
+            "k #1: hunk1 HunkHeader first, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+
+        app.handle_key(key(KeyCode::Char('k')));
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 0
+                })
+            ),
+            "k #2: crosses to hunk0 HunkHeader, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+    }
+
+    #[test]
+    fn collapsing_hunk_keeps_cursor_on_that_hunks_header_not_a_neighbor() {
+        // v0.4 regression guard: when Space collapses a hunk with
+        // several DiffLine rows, the old scroll index can coincide
+        // with a *different* hunk's DiffLine once the layout
+        // shortens. Naïvely trusting "rows[scroll] is a DiffLine
+        // → cursor is fine" silently teleports the cursor to the
+        // neighbor. The collapsed hunk's HunkHeader must win.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Added, "a1"),
+                        diff_line(LineKind::Added, "a2"),
+                        diff_line(LineKind::Added, "a3"),
+                    ],
+                ),
+                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
+            ],
+            100,
+        )]);
+        // Park the cursor on the 2nd DiffLine of hunk 0 (a2).
+        cursor_on_nth_diff_line(&mut app, 1);
+        assert_eq!(app.current_hunk(), Some((0, 0)));
+
+        app.handle_key(key(KeyCode::Char(' ')));
+
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 0)),
+            "cursor must stay on the collapsed hunk, not drift into a neighbor"
+        );
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 0
+                })
+            ),
+            "cursor row must be hunk 0's HunkHeader, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+    }
+
+    #[test]
+    fn seen_mark_clears_when_hunk_content_changes() {
+        // v0.4: the seen mark is bound to the hunk's content
+        // fingerprint, not just its pre-image anchor. A recompute
+        // that keeps `old_start` fixed but alters any line's
+        // content must invalidate the mark so the reader is forced
+        // to re-read the new diff.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
@@ -5806,8 +6395,18 @@ mod tests {
         app.apply_computed_files(fresh);
 
         assert!(
-            app.hunk_is_seen(0, 0),
-            "recompute that preserves hunk.old_start must preserve the seen mark"
+            !app.hunk_is_seen(0, 0),
+            "content change must auto-clear the seen mark"
+        );
+        let diff_rows = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::DiffLine { .. }))
+            .count();
+        assert!(
+            diff_rows >= 1,
+            "DiffLine rows must be re-expanded when the mark clears"
         );
     }
 
@@ -8058,10 +8657,12 @@ mod tests {
             )],
             100,
         )]);
-        cursor_on_nth_diff_line(&mut app, 0);
+        // Park the cursor on the file header (row 0) so commit picks
+        // match 0 (the first match after the cursor in layout order).
+        app.scroll = 0;
         commit_search(&mut app, "foo");
 
-        // After commit, current = 0 (first foo row). Advance twice.
+        // After commit, current = 0. Advance twice: 0 → 1 → 2.
         app.handle_key(key(KeyCode::Char('n')));
         let mid = app.search.as_ref().unwrap().current;
         app.handle_key(key(KeyCode::Char('n')));
@@ -8083,7 +8684,7 @@ mod tests {
             )],
             100,
         )]);
-        cursor_on_nth_diff_line(&mut app, 0);
+        app.scroll = 0;
         commit_search(&mut app, "foo");
 
         // current=0 → n → 1 → n → 0 (wrap)
@@ -8106,7 +8707,7 @@ mod tests {
             )],
             100,
         )]);
-        cursor_on_nth_diff_line(&mut app, 0);
+        app.scroll = 0;
         commit_search(&mut app, "foo");
 
         // current=0 → N → 2 (wrap to tail)
@@ -8128,6 +8729,162 @@ mod tests {
 
         assert!(app.search.is_none());
         assert_eq!(app.scroll, before, "stray `n` must not move the cursor");
+    }
+
+    #[test]
+    fn search_matches_rehydrate_after_recompute_preserves_query() {
+        // A watcher-driven recompute rebuilds the layout (row indices
+        // change) so stale `MatchLocation.row` values would point at
+        // the wrong content. After `apply_computed_files`, the search
+        // must re-run `find_matches` against the fresh layout, and the
+        // confirmed query must survive so `n`/`N` still work.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
+            100,
+        )]);
+        let matches = find_matches(&app.layout, &app.files, "foo");
+        app.search = Some(SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 0,
+        });
+        let pre_row = app.search.as_ref().unwrap().matches[0].row;
+
+        // Simulate a watcher-driven recompute that prepends a new file
+        // so every layout row index downstream of it shifts.
+        app.apply_computed_files(vec![
+            make_file(
+                "b.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Context, "ctx")])],
+                50,
+            ),
+            make_file(
+                "a.rs",
+                vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
+                100,
+            ),
+        ]);
+
+        let state = app.search.as_ref().expect("search survives recompute");
+        assert_eq!(state.query, "foo");
+        assert_eq!(
+            state.matches.len(),
+            1,
+            "recomputed matches must point at the new layout",
+        );
+        let post_row = state.matches[0].row;
+        assert_ne!(
+            post_row, pre_row,
+            "layout rebuild should have shifted the match row; rehydrate must track",
+        );
+        assert!(
+            matches!(
+                app.layout.rows.get(post_row),
+                Some(RowKind::DiffLine { .. })
+            ),
+            "rehydrated match must index a DiffLine row in the new layout",
+        );
+    }
+
+    #[test]
+    fn search_commit_starts_from_first_match_after_cursor() {
+        // vim-style `/`: commit jumps to the first match strictly
+        // after the cursor position, not the global first match.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo one"),
+                    diff_line(LineKind::Added, "mid"),
+                    diff_line(LineKind::Added, "foo two"),
+                    diff_line(LineKind::Added, "foo three"),
+                ],
+            )],
+            100,
+        )]);
+        // Cursor on the middle diff line (between first and third foo).
+        cursor_on_nth_diff_line(&mut app, 1);
+        let cursor_row = app.scroll;
+
+        commit_search(&mut app, "foo");
+
+        let state = app.search.as_ref().expect("search installed");
+        assert_eq!(state.matches.len(), 3);
+        // `current` must point at the first match whose row > cursor_row.
+        assert!(
+            state.matches[state.current].row > cursor_row,
+            "expected current match after cursor row {}, got row {} (idx {})",
+            cursor_row,
+            state.matches[state.current].row,
+            state.current,
+        );
+        // Specifically: the middle cursor is between match 0 ("foo one")
+        // and match 1 ("foo two"). After-cursor = match 1.
+        assert_eq!(state.current, 1);
+    }
+
+    #[test]
+    fn search_commit_wraps_to_first_match_when_cursor_is_past_all_matches() {
+        // When no match lives after the cursor, wrap around to the
+        // global first match so `/foo<Enter>` always lands on SOMETHING
+        // (never a no-op with matches.len() > 0).
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo a"),
+                    diff_line(LineKind::Added, "foo b"),
+                    diff_line(LineKind::Added, "trailing"),
+                ],
+            )],
+            100,
+        )]);
+        // Cursor sits AFTER both matches.
+        cursor_on_nth_diff_line(&mut app, 2);
+
+        commit_search(&mut app, "foo");
+
+        let state = app.search.as_ref().expect("search installed");
+        assert_eq!(state.matches.len(), 2);
+        assert_eq!(state.current, 0, "wrap-around lands on first match");
+    }
+
+    #[test]
+    fn search_matches_rehydrate_clamps_current_when_matches_shrink() {
+        // Before recompute: 2 matches, current=1. After recompute the
+        // underlying file drops one match. `current` must clamp into
+        // range so `n`/`N` never panic.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo foo")])],
+            100,
+        )]);
+        let matches = find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(matches.len(), 2);
+        app.search = Some(SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 1,
+        });
+
+        // Recompute with only one `foo` remaining.
+        app.apply_computed_files(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
+            100,
+        )]);
+
+        let state = app.search.as_ref().unwrap();
+        assert_eq!(state.matches.len(), 1);
+        assert!(
+            state.current < state.matches.len(),
+            "current ({}) must be < matches.len ({})",
+            state.current,
+            state.matches.len(),
+        );
     }
 
     // ---- M4 slice 5: `e` external editor --------------------------

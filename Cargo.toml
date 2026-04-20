@@ -1,6 +1,6 @@
 [package]
 name = "kizu"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 description = "Realtime diff monitor + inline scar review TUI for AI coding agents (Claude Code, etc.)"
 license = "MIT"

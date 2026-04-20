@@ -319,8 +319,9 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             hl: Some(hl),
             bg_added: app.config.colors.bg_added_color(),
             bg_deleted: app.config.colors.bg_deleted_color(),
+            search: app.search.as_ref(),
         };
-        let row_lines = render_row(&app.layout.rows[row_idx], &ctx);
+        let row_lines = render_row(row_idx, &app.layout.rows[row_idx], &ctx);
         let mut take = row_lines.into_iter();
         // Discard any leading visual lines requested by the
         // placement layer (only the first logical row ever carries
@@ -421,6 +422,13 @@ fn apply_cursor_gutter_tint(
 /// Other color kinds (ANSI names) fall through to the same dim gray
 /// since scaling them precisely would require resolving terminal
 /// palette which we don't control.
+///
+/// `Color::Yellow` is preserved as-is: it is used exclusively as the
+/// `/`-search current-match bg, and the whole point of the highlight
+/// is to stand out. Without this carve-out, every `n`/`N` press
+/// (which parks the cursor on the match row) would collapse the
+/// Yellow reversal into `DEFAULT_DIM` and the user would perceive
+/// the highlight as "dark".
 fn darken_cursor_body_bg(existing: Option<Color>) -> Color {
     // `bg_added = Rgb(10, 50, 10)` (default) maps to Rgb(7, 37, 7) —
     // still clearly green, just slightly muted against the surrounding
@@ -428,6 +436,7 @@ fn darken_cursor_body_bg(existing: Option<Color>) -> Color {
     const FACTOR: f32 = 0.75;
     const DEFAULT_DIM: Color = Color::Rgb(30, 30, 36);
     match existing {
+        Some(Color::Yellow) => Color::Yellow,
         Some(Color::Rgb(r, g, b)) => Color::Rgb(
             (r as f32 * FACTOR) as u8,
             (g as f32 * FACTOR) as u8,
@@ -458,16 +467,33 @@ struct RowRenderCtx<'a> {
     cursor_sub: Option<usize>,
     wrap_body_width: Option<usize>,
     nowrap_body_width: usize,
-    seen_hunks: &'a std::collections::BTreeSet<(std::path::PathBuf, usize)>,
+    seen_hunks: &'a std::collections::BTreeMap<(std::path::PathBuf, usize), u64>,
     hl: Option<&'a crate::highlight::Highlighter>,
     bg_added: Color,
     bg_deleted: Color,
+    /// Confirmed `/` search state. When set, every DiffLine row paints
+    /// match byte ranges with the overlay (see `apply_search_overlay`).
+    /// `None` skips the overlay entirely.
+    search: Option<&'a crate::app::SearchState>,
+}
+
+/// Classification of a single character position against the active
+/// search matches. Drives the style overlay inside the renderer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchHl {
+    None,
+    Other,
+    Current,
 }
 
 /// Build the styled visual `Line`s for a single logical layout row.
 /// Most row types produce exactly one `Line`; a `DiffLine` in wrap
 /// mode (`wrap_body_width.is_some()`) can produce multiple lines
 /// when its content exceeds the body width.
+///
+/// `row_idx` is the logical row's position in `layout.rows`; passed
+/// so DiffLine rendering can filter `ctx.search.matches` down to the
+/// highlights that belong to this row.
 ///
 /// `selected_hunk` identifies the (file_idx, hunk_idx) the cursor is
 /// currently inside; rows belonging to that hunk render at full
@@ -482,7 +508,7 @@ struct RowRenderCtx<'a> {
 /// Rendering context is bundled into [`RowRenderCtx`] to keep the
 /// signature manageable as we add more per-frame state (seen marks,
 /// highlighter, etc.).
-fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
+fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
     let files = ctx.files;
     let selected_hunk = ctx.selected_hunk;
     let cursor_sub = ctx.cursor_sub;
@@ -507,6 +533,7 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                     seen_hunks,
                     &files[*file_idx].path,
                     hunks[*hunk_idx].old_start,
+                    crate::app::hunk_fingerprint(&hunks[*hunk_idx]),
                 ),
             )]
         }
@@ -521,6 +548,10 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
             let is_selected = selected_hunk == Some((*file_idx, *hunk_idx));
             let line = &hunks[*hunk_idx].lines[*line_idx];
             let is_cursor = cursor_sub.is_some();
+            // Collect this row's search matches as (byte_start, byte_end,
+            // is_current) tuples so the renderer doesn't need to walk
+            // SearchState.current for every span.
+            let search_matches = row_search_matches(ctx.search, row_idx);
             match wrap_body_width {
                 Some(width) => render_diff_line_wrapped(
                     line,
@@ -531,6 +562,7 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                     Some(&files[*file_idx].path),
                     ctx.bg_added,
                     ctx.bg_deleted,
+                    &search_matches,
                 ),
                 None => vec![render_diff_line(
                     line,
@@ -541,6 +573,7 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                     Some(&files[*file_idx].path),
                     ctx.bg_added,
                     ctx.bg_deleted,
+                    &search_matches,
                 )],
             }
         }
@@ -553,6 +586,82 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
             Style::default().fg(Color::DarkGray),
         ))],
         RowKind::Spacer => vec![Line::raw("")],
+    }
+}
+
+/// Project the global `SearchState.matches` onto a single layout row.
+/// Returns `(byte_start, byte_end, is_current)` tuples in source order.
+/// Empty vector when there's no confirmed search or this row has no hits.
+fn row_search_matches(
+    search: Option<&crate::app::SearchState>,
+    row_idx: usize,
+) -> Vec<(usize, usize, bool)> {
+    let Some(state) = search else {
+        return Vec::new();
+    };
+    state
+        .matches
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.row == row_idx)
+        .map(|(i, m)| (m.byte_start, m.byte_end, i == state.current))
+        .collect()
+}
+
+/// Classify every char in `content` against the match ranges. `matches`
+/// are `(byte_start, byte_end, is_current)` in source order; byte
+/// offsets are guaranteed to be UTF-8 char boundaries by `find_matches`.
+///
+/// Invariant: output length equals `content.chars().count()`. Chars
+/// whose byte position sits inside a match range get `Current` or
+/// `Other`; everything else stays `None`. A single char that straddles
+/// the current-match range and an overlapping other-match (can only
+/// happen if matches overlap, which `find_matches` doesn't produce
+/// because it advances `start` past each hit) would bias to Current —
+/// but the guard is defensive, not load-bearing.
+fn classify_chars_by_match(content: &str, matches: &[(usize, usize, bool)]) -> Vec<SearchHl> {
+    let n = content.chars().count();
+    let mut out = vec![SearchHl::None; n];
+    if matches.is_empty() {
+        return out;
+    }
+    for (char_idx, (byte_pos, _)) in content.char_indices().enumerate() {
+        for &(bs, be, is_current) in matches {
+            if byte_pos >= bs && byte_pos < be {
+                let new_kind = if is_current {
+                    SearchHl::Current
+                } else {
+                    SearchHl::Other
+                };
+                // Current wins over Other on overlap (defensive).
+                if out[char_idx] != SearchHl::Current || is_current {
+                    out[char_idx] = new_kind;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Compose a base diff-line style with the search-highlight overlay
+/// for one char. `Current` fully overrides the base with the
+/// yellow-reversal look; `Other` keeps the base bg/fg but adds a
+/// bold underline so the word stands out without swallowing the
+/// add/delete signal. `Other` explicitly strips `DIM` because matches
+/// that land in an unfocused hunk still need to pop — otherwise the
+/// whole point of a search highlight is lost on everything but the
+/// currently selected hunk.
+fn apply_search_overlay(base: Style, fg: Color, hl: SearchHl) -> Style {
+    match hl {
+        SearchHl::None => base.fg(fg),
+        SearchHl::Other => base
+            .fg(fg)
+            .remove_modifier(Modifier::DIM)
+            .add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
+        SearchHl::Current => Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -615,6 +724,7 @@ fn render_diff_line_wrapped(
     file_path: Option<&std::path::Path>,
     bg_added: Color,
     bg_deleted: Color,
+    search_matches: &[(usize, usize, bool)],
 ) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthStr;
     // ADR-0014: background-color diff rendering. Focused hunks keep
@@ -645,34 +755,11 @@ fn render_diff_line_wrapped(
             .add_modifier(Modifier::DIM),
     };
 
-    // Highlight the full line once, then distribute tokens across
-    // wrapped visual rows by tracking character positions.
-    let tokens: Option<Vec<crate::highlight::HlToken>> =
-        if let (Some(hl), Some(path)) = (hl, file_path) {
-            let toks = hl.highlight_line(&line.content, path);
-            if toks.len() > 1 || toks.first().is_some_and(|t| t.fg != Color::Reset) {
-                Some(toks)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-    // Pre-compute per-character fg colors from tokens (if available).
-    // This avoids complex token-boundary tracking when distributing
-    // across wrapped chunks.
-    let char_colors: Vec<Color> = if let Some(ref toks) = tokens {
-        let mut colors = Vec::with_capacity(line.content.len());
-        for tok in toks {
-            for _ in tok.text.chars() {
-                colors.push(tok.fg);
-            }
-        }
-        colors
-    } else {
-        Vec::new()
-    };
+    // Per-char fg + search highlight kind, built once for the whole
+    // line. Distributed across wrapped chunks below so a match that
+    // spans a wrap boundary still paints cleanly on both sides.
+    let char_fgs = per_char_fg(&line.content, hl, file_path);
+    let char_hls = classify_chars_by_match(&line.content, search_matches);
 
     let chunks = wrap_at_chars(&line.content, body_width.max(1));
     let last_idx = chunks.len().saturating_sub(1);
@@ -711,28 +798,22 @@ fn render_diff_line_wrapped(
 
             let mut spans = vec![bar];
 
-            if !char_colors.is_empty() {
-                // Build per-token spans for this wrapped chunk.
-                let chunk_colors = &char_colors[char_offset..char_offset + chunk_char_count];
-                let mut run_start = 0usize;
-                let chunk_chars: Vec<char> = chunk.chars().collect();
-                while run_start < chunk_chars.len() {
-                    let run_color = chunk_colors[run_start];
-                    let run_end = (run_start + 1..chunk_chars.len())
-                        .find(|&j| chunk_colors[j] != run_color)
-                        .unwrap_or(chunk_chars.len());
-                    let text: String = chunk_chars[run_start..run_end].iter().collect();
-                    spans.push(Span::styled(text, base_style.fg(run_color)));
-                    run_start = run_end;
-                }
-                if pad > 0 {
-                    spans.push(Span::styled(" ".repeat(pad), base_style));
-                }
-            } else {
-                // No highlighting: single span for the whole chunk.
-                let padded_body: String =
-                    chunk.chars().chain(std::iter::repeat_n(' ', pad)).collect();
-                spans.push(Span::styled(padded_body, base_style));
+            let chunk_fgs = &char_fgs[char_offset..char_offset + chunk_char_count];
+            let chunk_hls = &char_hls[char_offset..char_offset + chunk_char_count];
+            let chunk_chars: Vec<char> = chunk.chars().collect();
+            let mut run_start = 0usize;
+            while run_start < chunk_chars.len() {
+                let run_attr = (chunk_fgs[run_start], chunk_hls[run_start]);
+                let run_end = (run_start + 1..chunk_chars.len())
+                    .find(|&j| (chunk_fgs[j], chunk_hls[j]) != run_attr)
+                    .unwrap_or(chunk_chars.len());
+                let text: String = chunk_chars[run_start..run_end].iter().collect();
+                let style = apply_search_overlay(base_style, run_attr.0, run_attr.1);
+                spans.push(Span::styled(text, style));
+                run_start = run_end;
+            }
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), base_style));
             }
 
             if is_last && line.has_trailing_newline {
@@ -800,8 +881,11 @@ fn render_hunk_header(
     is_cursor: bool,
     is_seen: bool,
 ) -> Line<'static> {
-    let seen_mark = if is_seen { "• " } else { "  " };
-    let cursor_mark = if is_cursor { "  ▶  " } else { "     " };
+    // v0.4: the seen mark becomes a fold glyph (▸) since a marked
+    // hunk is collapsed. Distinct shape + smaller than the cursor
+    // `▶` so the two can coexist on the same row without being
+    // mistaken for each other.
+    let seen_mark = if is_seen { "▸ " } else { "  " };
 
     // Count added/deleted lines from the actual hunk content.
     let added: usize = hunk
@@ -828,16 +912,39 @@ fn render_hunk_header(
         format!("L{}", hunk.new_start)
     };
 
-    let body = match &hunk.context {
-        Some(ctx) => format!("{cursor_mark}{seen_mark}@@ {ctx}  {line_range} {counts}"),
-        None => format!("{cursor_mark}{seen_mark}@@ {line_range} {counts}"),
+    let label = match &hunk.context {
+        Some(ctx) => format!("{seen_mark}@@ {ctx}  {line_range} {counts}"),
+        None => format!("{seen_mark}@@ {line_range} {counts}"),
     };
 
-    let mut style = Style::default().fg(Color::Cyan);
+    let mut label_style = Style::default().fg(Color::Cyan);
     if !is_selected {
-        style = style.add_modifier(Modifier::DIM);
+        label_style = label_style.add_modifier(Modifier::DIM);
     }
-    Line::from(Span::styled(body, style))
+
+    // v0.4: split the left gutter into its own Yellow + Bold span
+    // when the cursor is on the header. Keeps the cursor arrow
+    // visually consistent with DiffLine rows (same color, same
+    // weight) so the eye can track the cursor across the
+    // expanded/collapsed boundary without losing it in the Cyan
+    // header body.
+    let gutter = if is_cursor {
+        Span::styled(
+            "  ▶  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if is_selected {
+        // Selected (but not cursor) hunk header — match the DiffLine
+        // ribbon color so the whole hunk reads as a single focused
+        // block.
+        Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
+    } else {
+        Span::raw("     ")
+    };
+
+    Line::from(vec![gutter, Span::styled(label, label_style)])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -850,6 +957,7 @@ fn render_diff_line(
     file_path: Option<&std::path::Path>,
     bg_added: Color,
     bg_deleted: Color,
+    search_matches: &[(usize, usize, bool)],
 ) -> Line<'static> {
     let bg = match line.kind {
         LineKind::Added => Some(bg_added),
@@ -877,55 +985,94 @@ fn render_diff_line(
             .add_modifier(Modifier::DIM),
     };
 
-    // Try syntax highlighting. If available, produce per-token spans
-    // with the token fg color + the diff bg style overlay.
-    //
-    // Widths are counted in display cells (via `unicode-width`), not
-    // chars — each kanji is 2 cells, and char-based truncation would
-    // push CJK rows past the viewport edge and smear the delta-style
-    // background color past the right margin.
-    if let (Some(hl), Some(path)) = (hl, file_path) {
-        let tokens = hl.highlight_line(&line.content, path);
-        if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
-            let mut spans = vec![bar];
-            let mut cells_emitted = 0usize;
-            for token in &tokens {
-                let remaining = body_width.saturating_sub(cells_emitted);
-                if remaining == 0 {
-                    break;
-                }
-                let (text, token_cells) = take_cells(&token.text, remaining);
-                if text.is_empty() {
-                    break;
-                }
-                spans.push(Span::styled(text, base_style.fg(token.fg)));
-                cells_emitted += token_cells;
+    // Derive a per-char foreground color from syntax tokens when
+    // available. Fallback: `Color::Reset` so non-highlighted content
+    // inherits the terminal default fg (same look as before the
+    // search-overlay refactor). Length matches `content.chars().count()`.
+    let char_fgs = per_char_fg(&line.content, hl, file_path);
+    let char_hls = classify_chars_by_match(&line.content, search_matches);
+
+    // Walk chars, respect `body_width` in display cells, and group
+    // consecutive chars with the same `(fg, hl)` into one span so
+    // ratatui doesn't pay span overhead per char.
+    use unicode_width::UnicodeWidthChar;
+    let mut spans = vec![bar];
+    let mut cells_emitted = 0usize;
+    let chars: Vec<char> = line.content.chars().collect();
+
+    let mut run_start = 0usize;
+    while run_start < chars.len() {
+        let run_attr = (char_fgs[run_start], char_hls[run_start]);
+        let mut run_end = run_start + 1;
+        let mut run_cells = chars[run_start].width().unwrap_or(0);
+        // Short-circuit: don't bother extending the run past the
+        // body_width budget.
+        if cells_emitted + run_cells > body_width {
+            break;
+        }
+        while run_end < chars.len() {
+            let candidate_attr = (char_fgs[run_end], char_hls[run_end]);
+            if candidate_attr != run_attr {
+                break;
             }
-            // Pad to body_width.
-            if cells_emitted < body_width {
-                spans.push(Span::styled(
-                    " ".repeat(body_width - cells_emitted),
-                    base_style,
-                ));
+            let w = chars[run_end].width().unwrap_or(0);
+            if cells_emitted + run_cells + w > body_width {
+                break;
             }
-            return Line::from(spans);
+            run_cells += w;
+            run_end += 1;
+        }
+        let text: String = chars[run_start..run_end].iter().collect();
+        let style = apply_search_overlay(base_style, run_attr.0, run_attr.1);
+        spans.push(Span::styled(text, style));
+        cells_emitted += run_cells;
+        run_start = run_end;
+        if cells_emitted >= body_width {
+            break;
         }
     }
 
-    // Fallback: single-span body (no highlighting or unknown extension).
-    use unicode_width::UnicodeWidthStr;
-    let content_cells = UnicodeWidthStr::width(line.content.as_str());
-    let padded_body: String = if content_cells >= body_width {
-        let (truncated, _) = take_cells(&line.content, body_width);
-        truncated
-    } else {
-        let pad = body_width - content_cells;
-        line.content
-            .chars()
-            .chain(std::iter::repeat_n(' ', pad))
-            .collect()
-    };
-    Line::from(vec![bar, Span::styled(padded_body, base_style)])
+    // Pad to body_width so the delta-style background extends to the
+    // viewport edge (ADR-0014). The padding keeps the base diff bg
+    // (no search overlay) so the gutter and trailing cells don't get
+    // falsely underlined.
+    if cells_emitted < body_width {
+        spans.push(Span::styled(
+            " ".repeat(body_width - cells_emitted),
+            base_style,
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Build a per-char foreground color vector for `content`. Falls back
+/// to `Color::Reset` for every char when no highlighter is available
+/// or the file extension is unknown — which preserves the pre-overlay
+/// terminal-default appearance for plain-text diffs.
+fn per_char_fg(
+    content: &str,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: Option<&std::path::Path>,
+) -> Vec<Color> {
+    let n = content.chars().count();
+    if let (Some(hl), Some(path)) = (hl, file_path) {
+        let tokens = hl.highlight_line(content, path);
+        if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
+            let mut out = Vec::with_capacity(n);
+            for tok in &tokens {
+                for _ in tok.text.chars() {
+                    out.push(tok.fg);
+                }
+            }
+            if out.len() == n {
+                return out;
+            }
+            // Token char count drift (shouldn't happen with syntect)
+            // — fall through to the flat-color fallback rather than
+            // panicking in the renderer.
+        }
+    }
+    vec![Color::Reset; n]
 }
 
 /// Take as many leading chars from `s` as fit into `max_cells` display
@@ -1391,6 +1538,26 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ));
         }
 
+        // Confirmed search status: echo the query and a `[i/n]`
+        // counter so the user always knows which hit `n`/`N` jumps to
+        // next. Only drawn when a search is installed (empty query
+        // never reaches this branch because `commit_search_input`
+        // bails on empty input).
+        if let Some(state) = app.search.as_ref() {
+            spans.push(sep());
+            spans.push(Span::styled(
+                format!("/{}", state.query),
+                Style::default().fg(Color::Yellow).add_modifier(bold),
+            ));
+            spans.push(Span::raw(" "));
+            let position = if state.matches.is_empty() {
+                "[0/0]".to_string()
+            } else {
+                format!("[{}/{}]", state.current + 1, state.matches.len())
+            };
+            spans.push(Span::styled(position, Style::default().fg(Color::DarkGray)));
+        }
+
         // Cursor placement indicator. `z` toggles Centered ↔ Top.
         spans.push(sep());
         spans.push(Span::styled("z", Style::default().fg(Color::Cyan)));
@@ -1683,7 +1850,7 @@ mod tests {
             file_view: None,
             search_input: None,
             search: None,
-            seen_hunks: std::collections::BTreeSet::new(),
+            seen_hunks: std::collections::BTreeMap::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -1942,6 +2109,7 @@ mod tests {
             None,
             Color::Rgb(10, 50, 10),
             Color::Rgb(60, 10, 10),
+            &[],
         );
         // Skip the 5-cell left bar; the remaining spans make up the body.
         let body_cells: usize = rendered
@@ -2591,6 +2759,66 @@ mod tests {
     }
 
     #[test]
+    fn hunk_header_cursor_arrow_is_yellow_and_bold() {
+        // v0.4: when a hunk collapses under the seen mark the only
+        // on-screen anchor the reader has is the hunk header row.
+        // Paint its `▶` with the same Yellow + Bold style DiffLine
+        // rows use so the cursor stays visible across the hand-off
+        // between expanded and collapsed hunks.
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
+            100,
+        )]);
+        app.scroll_to(app.layout.hunk_starts[0]);
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let mut found = false;
+        for y in 0..buffer.area().height {
+            for x in 0..buffer.area().width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "▶" {
+                    let st = cell.style();
+                    if st.fg == Some(Color::Yellow) && st.add_modifier.contains(Modifier::BOLD) {
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "cursor `▶` on a hunk header must be Yellow + Bold, not Cyan"
+        );
+    }
+
+    #[test]
+    fn seen_hunk_header_shows_fold_glyph() {
+        // v0.4: seen hunks render with a ▸ fold glyph in the hunk
+        // header so the reader can tell "this hunk is collapsed,
+        // not empty" at a glance. Unseen hunks have no such glyph.
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
+            100,
+        )]);
+        app.scroll_to(app.layout.hunk_starts[0] + 1); // onto the DiffLine
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        let view = render_to_string(&app, 80, 10);
+        assert!(
+            view.contains("▸"),
+            "seen hunk header must display a ▸ fold glyph:\n{view}"
+        );
+    }
+
+    #[test]
     fn file_header_cursor_displays_arrow_marker() {
         let app = populated_app(vec![make_file(
             "src/foo.rs",
@@ -2815,6 +3043,342 @@ mod tests {
             }]),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             header_prefix: None,
+        }
+    }
+
+    // ---- v0.4 slash-search in-body highlight ------------------------
+
+    /// Find the cells whose symbol matches `needle` in `buf` and return
+    /// the starting cell of each run plus its length in cells. Used by
+    /// the search-highlight tests to locate the rendered `foo` runs
+    /// without depending on concrete x offsets (which shift when the
+    /// left gutter evolves).
+    ///
+    /// Skips the last row — the footer echoes the confirmed `/query`
+    /// so a naive scan would double-count matches from the status bar.
+    fn find_text_runs(buf: &ratatui::buffer::Buffer, needle: &str) -> Vec<(u16, u16, usize)> {
+        let mut out = Vec::new();
+        let width = buf.area().width;
+        let height = buf.area().height;
+        let body_height = height.saturating_sub(1);
+        for y in 0..body_height {
+            let row: String = (0..width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            let mut search_from = 0;
+            while let Some(off) = row[search_from..].find(needle) {
+                let start_byte = search_from + off;
+                // Map byte offset to cell x index by walking symbols.
+                let mut x = 0u16;
+                let mut cum_bytes = 0usize;
+                for xi in 0..width {
+                    let sym = buf[(xi, y)].symbol();
+                    if cum_bytes == start_byte {
+                        x = xi;
+                        break;
+                    }
+                    cum_bytes += sym.len();
+                }
+                out.push((x, y, needle.chars().count()));
+                search_from = start_byte + needle.len();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn search_current_match_renders_with_yellow_background() {
+        // `/foo<Enter>` on a single Added line containing one `foo` must
+        // paint the 3 cells of `foo` with Yellow bg + Black fg + Bold.
+        // Before this slice the matched cells inherit the diff bg_added
+        // green, so the test fails loudly until the overlay lands.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "let foo = 1;")])],
+            100,
+        )]);
+        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(matches.len(), 1, "test fixture precondition");
+        app.search = Some(crate::app::SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 0,
+        });
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let runs = find_text_runs(&buffer, "foo");
+        assert_eq!(runs.len(), 1, "rendered buffer should contain one `foo`");
+        let (x, y, len) = runs[0];
+        for dx in 0..len as u16 {
+            let cell = &buffer[(x + dx, y)];
+            let style = cell.style();
+            assert_eq!(
+                style.bg,
+                Some(Color::Yellow),
+                "current-match cell at ({},{}) must carry Yellow bg, got {:?}",
+                x + dx,
+                y,
+                style,
+            );
+            assert_eq!(
+                style.fg,
+                Some(Color::Black),
+                "current-match cell at ({},{}) must carry Black fg, got {:?}",
+                x + dx,
+                y,
+                style,
+            );
+            assert!(
+                style.add_modifier.contains(Modifier::BOLD),
+                "current-match cell at ({},{}) must be bold, got {:?}",
+                x + dx,
+                y,
+                style,
+            );
+        }
+    }
+
+    #[test]
+    fn search_other_matches_render_with_underline_and_preserve_diff_bg() {
+        // Two `foo` matches on a single Added line. `current=0` (= first
+        // match) wears the Yellow reversal; the second one still gets a
+        // visual cue (UNDERLINED + BOLD) while keeping the diff bg_added
+        // green so the add/delete signal survives the overlay.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar foo")])],
+            100,
+        )]);
+        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(matches.len(), 2, "test fixture precondition");
+        app.search = Some(crate::app::SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 0,
+        });
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let runs = find_text_runs(&buffer, "foo");
+        assert_eq!(runs.len(), 2, "expected two `foo` runs in the buffer");
+
+        // First run = current. Yellow bg already asserted by the other
+        // test; here just sanity-check it is NOT underlined (it is
+        // reversed instead so underline would be redundant + distracting).
+        let (x0, y0, len0) = runs[0];
+        let first_cell = &buffer[(x0, y0)].style();
+        assert_eq!(first_cell.bg, Some(Color::Yellow));
+
+        // Second run = non-current. Must carry UNDERLINED + BOLD, and
+        // must keep the diff bg_added green (NOT Yellow).
+        let (x1, y1, len1) = runs[1];
+        for dx in 0..len1 as u16 {
+            let style = buffer[(x1 + dx, y1)].style();
+            assert_eq!(
+                style.bg,
+                Some(BG_ADDED),
+                "non-current match cell at ({},{}) must keep bg_added green, got {:?}",
+                x1 + dx,
+                y1,
+                style,
+            );
+            assert!(
+                style.add_modifier.contains(Modifier::UNDERLINED),
+                "non-current match cell at ({},{}) must be underlined, got {:?}",
+                x1 + dx,
+                y1,
+                style,
+            );
+            assert!(
+                style.add_modifier.contains(Modifier::BOLD),
+                "non-current match cell at ({},{}) must be bold, got {:?}",
+                x1 + dx,
+                y1,
+                style,
+            );
+        }
+
+        // Also assert that non-match cells in the same row keep bg_added
+        // and do NOT carry UNDERLINED (no accidental whole-line underline).
+        // The ` bar ` space between matches sits in (x0+len0 .. x1).
+        for xi in (x0 + len0 as u16)..x1 {
+            let style = buffer[(xi, y0)].style();
+            assert_eq!(
+                style.bg,
+                Some(BG_ADDED),
+                "inter-match cell at ({},{}) must keep bg_added green, got {:?}",
+                xi,
+                y0,
+                style,
+            );
+            assert!(
+                !style.add_modifier.contains(Modifier::UNDERLINED),
+                "inter-match cell at ({},{}) must NOT be underlined, got {:?}",
+                xi,
+                y0,
+                style,
+            );
+        }
+    }
+
+    #[test]
+    fn search_current_match_on_cursor_row_retains_yellow_background() {
+        // `commit_search_input` and `search_jump_next`/`_prev` both call
+        // `scroll_to(row)`, so the cursor almost always sits on top of
+        // the current match. `apply_cursor_gutter_tint` darkens every
+        // cell bg on the cursor row; without a carve-out for search
+        // colors, the Yellow reversal collapses into `DEFAULT_DIM`
+        // (Rgb(30,30,36)) and the user perceives the highlight as
+        // "dark". This test pins the carve-out.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "let foo = 1;")])],
+            100,
+        )]);
+        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
+        let match_row = matches[0].row;
+        app.search = Some(crate::app::SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 0,
+        });
+        // Force the cursor onto the match row (mirrors the
+        // post-`n`/`N` state where `scroll_to(match.row)` runs).
+        app.scroll = match_row;
+        app.follow_mode = false;
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let runs = find_text_runs(&buffer, "foo");
+        assert_eq!(runs.len(), 1, "rendered buffer should contain one `foo`");
+        let (x, y, len) = runs[0];
+        for dx in 0..len as u16 {
+            let cell = &buffer[(x + dx, y)];
+            let style = cell.style();
+            assert_eq!(
+                style.bg,
+                Some(Color::Yellow),
+                "current-match cell at ({},{}) must keep Yellow bg even on the cursor row, got {:?}",
+                x + dx,
+                y,
+                style,
+            );
+            assert_eq!(
+                style.fg,
+                Some(Color::Black),
+                "current-match cell at ({},{}) must keep Black fg on the cursor row, got {:?}",
+                x + dx,
+                y,
+                style,
+            );
+        }
+    }
+
+    #[test]
+    fn footer_shows_search_query_and_position() {
+        // With an active `SearchState`, the footer must echo the query
+        // and a `[current/total]` counter so the user can tell which
+        // hit `n`/`N` is about to jump to without counting visually.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "foo one"),
+                    diff_line(LineKind::Added, "foo two"),
+                    diff_line(LineKind::Added, "foo three"),
+                ],
+            )],
+            100,
+        )]);
+        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(matches.len(), 3);
+        app.search = Some(crate::app::SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 1, // 2/3
+        });
+        app.follow_mode = false;
+
+        let view = render_to_string(&app, 120, 8);
+        assert!(
+            view.contains("/foo"),
+            "footer must echo the confirmed search query, got:\n{view}"
+        );
+        assert!(
+            view.contains("[2/3]"),
+            "footer must show [current/total] position, got:\n{view}"
+        );
+    }
+
+    #[test]
+    fn search_other_match_in_unfocused_hunk_is_not_dimmed() {
+        // When matches land in a hunk that is NOT currently selected,
+        // `base_style` carries `Modifier::DIM` (the rest of the hunk
+        // body dims so the focused hunk stands out). The search
+        // overlay must strip DIM so matches stay loud regardless of
+        // which hunk the cursor is in — otherwise every non-focus
+        // match looks "dark" even though underline + bold are set.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "first foo")]),
+                hunk(50, vec![diff_line(LineKind::Added, "second foo")]),
+            ],
+            100,
+        )]);
+        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
+        assert_eq!(matches.len(), 2, "test fixture precondition");
+        // `current = 0` -> first hunk's `foo` is current; the cursor
+        // sits on the first match row so the second hunk is unfocused.
+        let first_row = matches[0].row;
+        app.search = Some(crate::app::SearchState {
+            query: "foo".to_string(),
+            matches,
+            current: 0,
+        });
+        app.follow_mode = false;
+        // Place the cursor explicitly on the first hunk's DiffLine so
+        // `current_hunk()` resolves to hunk 0 and hunk 1 is unfocused.
+        app.scroll = first_row;
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let runs = find_text_runs(&buffer, "foo");
+        assert_eq!(runs.len(), 2, "both `foo` runs must render in the viewport");
+        // The second run is in the unfocused hunk — `apply_search_overlay`
+        // must have stripped `DIM` from `base_style` so the highlight
+        // does not look washed out.
+        let (x1, y1, len1) = runs[1];
+        for dx in 0..len1 as u16 {
+            let style = buffer[(x1 + dx, y1)].style();
+            assert!(
+                !style.add_modifier.contains(Modifier::DIM),
+                "non-current match in unfocused hunk at ({},{}) must NOT carry DIM, got {:?}",
+                x1 + dx,
+                y1,
+                style,
+            );
+            assert!(
+                style.add_modifier.contains(Modifier::UNDERLINED),
+                "non-current match in unfocused hunk at ({},{}) must be underlined, got {:?}",
+                x1 + dx,
+                y1,
+                style,
+            );
         }
     }
 }
