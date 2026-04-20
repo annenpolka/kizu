@@ -2471,6 +2471,19 @@ impl App {
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
 
+        // v0.4: from a seen (collapsed) hunk header, `j` should
+        // jump straight to the next hunk header — not dive into
+        // the following expanded hunk's first change-run start.
+        // A seen hunk treats its header as a self-contained review
+        // unit, so hand-offs cross hunk boundaries at the header,
+        // not at run boundaries.
+        if let Some(RowKind::HunkHeader { file_idx, hunk_idx }) = self.layout.rows.get(cursor)
+            && self.hunk_is_seen(*file_idx, *hunk_idx)
+        {
+            self.next_hunk();
+            return;
+        }
+
         let Some((_, hunk_end)) = self.current_hunk_range() else {
             self.next_hunk();
             return;
@@ -2517,6 +2530,17 @@ impl App {
         let cursor = self.scroll;
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
+
+        // v0.4: from a seen (collapsed) hunk header, `k` should
+        // jump straight to the previous hunk header — not to the
+        // previous expanded hunk's last change-run start. See
+        // [`Self::next_change`] for the matching forward case.
+        if let Some(RowKind::HunkHeader { file_idx, hunk_idx }) = self.layout.rows.get(cursor)
+            && self.hunk_is_seen(*file_idx, *hunk_idx)
+        {
+            self.prev_hunk();
+            return;
+        }
 
         let Some((hunk_top, _)) = self.current_hunk_range() else {
             self.prev_hunk_last_run_start();
@@ -5980,6 +6004,328 @@ mod tests {
         assert_eq!(
             header_rows, 1,
             "HunkHeader must remain present for the seen hunk"
+        );
+    }
+
+    #[test]
+    fn j_from_seen_hunk_header_lands_on_next_expanded_hunks_header() {
+        // v0.4 mirror of the `k` case: from hunk0 (seen) the `j`
+        // key must stop on hunk1's HunkHeader, not dive into
+        // hunk1's first change-run start.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "a1")]),
+                hunk(
+                    10,
+                    vec![
+                        diff_line(LineKind::Added, "b1"),
+                        diff_line(LineKind::Added, "b2"),
+                    ],
+                ),
+            ],
+            100,
+        )]);
+        let hh0 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 0
+                    }
+                )
+            })
+            .expect("hh0");
+        app.scroll_to(hh0);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 0));
+
+        let hh0 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 0
+                    }
+                )
+            })
+            .expect("hh0 after collapse");
+        app.scroll_to(hh0);
+
+        app.handle_key(key(KeyCode::Char('j')));
+
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 1
+                })
+            ),
+            "j must land on hunk 1's HunkHeader, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+    }
+
+    #[test]
+    fn k_from_seen_hunk_header_lands_on_prev_expanded_hunks_header() {
+        // v0.4: with an expanded hunk0 followed by a seen hunk1,
+        // pressing `k` from hunk1's header should stop on hunk0's
+        // HunkHeader (reviewable content is a single unit in the
+        // seen/expanded boundary). The current prev_change path
+        // prefers the expanded hunk's last change-run start and
+        // silently skips the hunk header, which is the bug.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Added, "a1"),
+                        diff_line(LineKind::Added, "a2"),
+                    ],
+                ),
+                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
+            ],
+            100,
+        )]);
+        // Seen hunk 1 only.
+        let hh1 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 1
+                    }
+                )
+            })
+            .expect("hh1");
+        app.scroll_to(hh1);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 1));
+
+        // Cursor back on (now collapsed) hunk 1's HunkHeader.
+        let hh1 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 1
+                    }
+                )
+            })
+            .expect("hh1 after collapse");
+        app.scroll_to(hh1);
+
+        app.handle_key(key(KeyCode::Char('k')));
+
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 0
+                })
+            ),
+            "k must land on hunk 0's HunkHeader, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+    }
+
+    #[test]
+    fn j_walks_through_multiple_seen_hunks_one_by_one() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "a")]),
+                hunk(10, vec![diff_line(LineKind::Added, "b")]),
+                hunk(20, vec![diff_line(LineKind::Added, "c")]),
+            ],
+            100,
+        )]);
+        for i in 0..3 {
+            let row = app
+                .layout
+                .rows
+                .iter()
+                .position(|r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i))
+                .expect("hh");
+            app.scroll_to(row);
+            app.handle_key(key(KeyCode::Char(' ')));
+        }
+
+        let hh0 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 0
+                    }
+                )
+            })
+            .expect("hh0");
+        app.scroll_to(hh0);
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 1)),
+            "j #1: must land on hunk 1, got {:?}",
+            app.current_hunk()
+        );
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 2)),
+            "j #2: must land on hunk 2, got {:?}",
+            app.current_hunk()
+        );
+    }
+
+    #[test]
+    fn k_walks_through_multiple_seen_hunks_one_by_one() {
+        // v0.4 investigation: 3 consecutive seen hunks — the user's
+        // report was "k doesn't stop on hunk headers". Press `k`
+        // repeatedly from the last hunk's header and expect to
+        // land on hunk1's header, then hunk0's header, then no-op.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "a")]),
+                hunk(10, vec![diff_line(LineKind::Added, "b")]),
+                hunk(20, vec![diff_line(LineKind::Added, "c")]),
+            ],
+            100,
+        )]);
+        // Seen all three.
+        for i in 0..3 {
+            let row = app
+                .layout
+                .rows
+                .iter()
+                .position(|r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i))
+                .expect("hh");
+            app.scroll_to(row);
+            app.handle_key(key(KeyCode::Char(' ')));
+        }
+        assert!(app.hunk_is_seen(0, 0) && app.hunk_is_seen(0, 1) && app.hunk_is_seen(0, 2));
+
+        // Cursor on hunk 2's HunkHeader.
+        let hh2 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 2
+                    }
+                )
+            })
+            .expect("hh2");
+        app.scroll_to(hh2);
+
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 1)),
+            "k #1: must land on hunk 1, got {:?}",
+            app.current_hunk()
+        );
+
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 0)),
+            "k #2: must land on hunk 0, got {:?}",
+            app.current_hunk()
+        );
+    }
+
+    #[test]
+    fn k_stops_on_seen_hunk_header() {
+        // v0.4 investigation: with hunk0 seen (collapsed) and
+        // hunk1 expanded, pressing `k` from inside hunk1 must park
+        // the cursor on hunk0's HunkHeader — not skip past it to
+        // the FileHeader or land outside hunk0 entirely.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(1, vec![diff_line(LineKind::Added, "a1")]),
+                hunk(
+                    10,
+                    vec![
+                        diff_line(LineKind::Added, "b1"),
+                        diff_line(LineKind::Added, "b2"),
+                    ],
+                ),
+            ],
+            100,
+        )]);
+        // Seen hunk 0.
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 0));
+
+        // Cursor to hunk 1 first DiffLine.
+        let hh1 = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 1
+                    }
+                )
+            })
+            .expect("hh1");
+        app.scroll_to(hh1 + 1); // first DiffLine of hunk 1
+        assert_eq!(app.current_hunk(), Some((0, 1)));
+
+        // Press `k` once.
+        app.handle_key(key(KeyCode::Char('k')));
+
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 0)),
+            "k from hunk1 must land on hunk0 (the seen/collapsed one)"
+        );
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 0
+                })
+            ),
+            "k must park on hunk0's HunkHeader row, got {:?}",
+            app.layout.rows.get(app.scroll)
         );
     }
 
