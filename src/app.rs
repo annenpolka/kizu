@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -222,13 +222,18 @@ pub struct App {
     /// jump between hits.
     pub search: Option<SearchState>,
     /// "Seen" marks for hunks the user has visually reviewed and
-    /// wants to hide from the attention surface. Keyed by
-    /// `(relative file path, hunk.old_start)` so the mark survives
-    /// a watcher-driven `compute_diff` as long as the hunk's
-    /// pre-image anchor doesn't move — same fingerprint used by
-    /// [`HunkAnchor`]. Space toggles; nothing is written to disk
-    /// (see plans/v0.2.md M4).
-    pub seen_hunks: BTreeSet<(PathBuf, usize)>,
+    /// wants to collapse out of the attention surface (v0.4). Keyed
+    /// by `(relative file path, hunk.old_start)`; the value is the
+    /// hunk's content fingerprint at the moment Space was pressed.
+    ///
+    /// A watcher-driven recompute invalidates the mark when **either**
+    /// the pre-image anchor (`old_start`) moves **or** the content
+    /// fingerprint changes, so a mark only survives when the hunk is
+    /// bit-for-bit the one the user saw. Seen hunks have their
+    /// `DiffLine` rows omitted from the layout (only the `HunkHeader`
+    /// remains). Space toggles; nothing is written to disk
+    /// (see plans/v0.2.md M4, plans/v0.4.md).
+    pub seen_hunks: BTreeMap<(PathBuf, usize), u64>,
     pub follow_mode: bool,
     /// Set when the most recent `compute_diff` failed. Cleared on success.
     pub last_error: Option<String>,
@@ -489,12 +494,50 @@ fn uses_plus_line_format(basename: &str) -> bool {
 
 /// Linear membership probe for [`App::seen_hunks`] that takes the
 /// path by reference, so the renderer can check every visible hunk
-/// header without allocating a `PathBuf` per frame. The set size is
+/// header without allocating a `PathBuf` per frame. The map size is
 /// bounded by user toggles (typically tens of entries), so the scan
 /// is cheaper than the clone it replaces.
-pub fn is_hunk_seen(seen: &BTreeSet<(PathBuf, usize)>, path: &Path, old_start: usize) -> bool {
+///
+/// v0.4: the mark is bound to the hunk's content fingerprint (not
+/// just the `(path, old_start)` pre-image anchor). A key hit with a
+/// mismatched fingerprint means the hunk has been edited since it
+/// was marked seen — in that case the mark is considered stale and
+/// the hunk behaves as if it were unmarked (auto-expand).
+pub fn is_hunk_seen(
+    seen: &BTreeMap<(PathBuf, usize), u64>,
+    path: &Path,
+    old_start: usize,
+    current_fp: u64,
+) -> bool {
     seen.iter()
-        .any(|(p, o)| *o == old_start && p.as_path() == path)
+        .any(|((p, o), fp)| *o == old_start && *fp == current_fp && p.as_path() == path)
+}
+
+/// Hash the full `lines` vector of a hunk (kind + content + trailing
+/// newline flag) into a single u64 fingerprint. Used by the seen
+/// mark to detect content drift between the moment the user pressed
+/// Space and the current watcher-driven recompute (v0.4).
+///
+/// `DefaultHasher` is not guaranteed deterministic across process
+/// runs, but the fingerprint only needs to be stable within a single
+/// kizu session — the seen set is not persisted to disk.
+pub fn hunk_fingerprint(hunk: &crate::git::Hunk) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for line in &hunk.lines {
+        // Stable discriminator for LineKind — the enum itself is
+        // not `Hash`, so map to a small byte tag.
+        let tag: u8 = match line.kind {
+            crate::git::LineKind::Context => 0,
+            crate::git::LineKind::Added => 1,
+            crate::git::LineKind::Deleted => 2,
+        };
+        tag.hash(&mut h);
+        line.content.hash(&mut h);
+        line.has_trailing_newline.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Insert a single character at `cursor_pos` (char index) and advance
@@ -1172,7 +1215,7 @@ impl App {
             file_view: None,
             search_input: None,
             search: None,
-            seen_hunks: BTreeSet::new(),
+            seen_hunks: BTreeMap::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -2934,6 +2977,12 @@ impl App {
     /// binary notice, or any other row with no enclosing hunk.
     /// Pure state change — nothing is written to disk (the mark
     /// lives only for the session, see plans/v0.2.md M4).
+    ///
+    /// v0.4: the mark also stores the hunk's content fingerprint so
+    /// a later recompute can detect content drift and auto-expand.
+    /// After the toggle the layout is rebuilt so the DiffLine rows
+    /// of a newly-seen hunk collapse out (or reappear when the mark
+    /// is cleared) on the next frame.
     pub fn toggle_seen_current_hunk(&mut self) {
         let Some((file_idx, hunk_idx)) = self.current_hunk() else {
             return;
@@ -2948,8 +2997,39 @@ impl App {
             return;
         };
         let key = (file.path.clone(), hunk.old_start);
-        if !self.seen_hunks.remove(&key) {
-            self.seen_hunks.insert(key);
+        if self.seen_hunks.remove(&key).is_none() {
+            let fp = hunk_fingerprint(hunk);
+            self.seen_hunks.insert(key, fp);
+        }
+        // The set of visible rows just changed (collapsed or
+        // expanded). Rebuild so the next frame reflects it; also
+        // snap the cursor to the target hunk's HunkHeader whenever
+        // the old scroll index no longer points *at that same hunk*.
+        //
+        // A plain "is the row still a DiffLine/HunkHeader?" check
+        // isn't enough: collapsing a multi-line hunk shortens the
+        // layout, which can cause the old scroll index to coincide
+        // with a neighbor hunk's DiffLine. That would silently
+        // teleport the cursor out from under the user.
+        let target_hunk = (file_idx, hunk_idx);
+        self.build_layout();
+        let cursor_hunk = match self.layout.rows.get(self.scroll) {
+            Some(RowKind::HunkHeader { file_idx, hunk_idx }) => Some((*file_idx, *hunk_idx)),
+            Some(RowKind::DiffLine {
+                file_idx, hunk_idx, ..
+            }) => Some((*file_idx, *hunk_idx)),
+            _ => None,
+        };
+        if cursor_hunk != Some(target_hunk)
+            && let Some(row) = self.layout.rows.iter().position(|r| {
+                matches!(
+                    r,
+                    RowKind::HunkHeader { file_idx: f, hunk_idx: h }
+                        if (*f, *h) == target_hunk
+                )
+            })
+        {
+            self.scroll_to(row);
         }
     }
 
@@ -3412,7 +3492,12 @@ impl App {
         let Some(hunk) = hunks.get(hunk_idx) else {
             return false;
         };
-        is_hunk_seen(&self.seen_hunks, &file.path, hunk.old_start)
+        is_hunk_seen(
+            &self.seen_hunks,
+            &file.path,
+            hunk.old_start,
+            hunk_fingerprint(hunk),
+        )
     }
 
     /// Resolve the cursor's current target (path + 1-indexed line)
@@ -3794,12 +3879,25 @@ impl App {
                             let row = layout.rows.len();
                             layout.rows.push(RowKind::HunkHeader { file_idx, hunk_idx });
                             layout.hunk_starts.push(row);
-                            for line_idx in 0..hunk.lines.len() {
-                                layout.rows.push(RowKind::DiffLine {
-                                    file_idx,
-                                    hunk_idx,
-                                    line_idx,
-                                });
+                            // v0.4: seen hunks collapse — omit their
+                            // DiffLine rows from the layout so only
+                            // the hunk header is visible. The mark
+                            // auto-clears (below, in the fingerprint
+                            // check) once the hunk content drifts.
+                            let is_seen = is_hunk_seen(
+                                &self.seen_hunks,
+                                &file.path,
+                                hunk.old_start,
+                                hunk_fingerprint(hunk),
+                            );
+                            if !is_seen {
+                                for line_idx in 0..hunk.lines.len() {
+                                    layout.rows.push(RowKind::DiffLine {
+                                        file_idx,
+                                        hunk_idx,
+                                        line_idx,
+                                    });
+                                }
                             }
                         }
                     }
@@ -4582,7 +4680,7 @@ mod tests {
             file_view: None,
             search_input: None,
             search: None,
-            seen_hunks: BTreeSet::new(),
+            seen_hunks: BTreeMap::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -5732,16 +5830,17 @@ mod tests {
 
     #[test]
     fn space_toggles_seen_mark_on_current_hunk() {
-        // M4 slice 6: Space flips the cursor's enclosing hunk
-        // into and out of the "seen" set. Pure TUI state — no
-        // file write, no cursor movement, no picker.
+        // M4 slice 6 + v0.4 collapse: Space flips the cursor's
+        // enclosing hunk into and out of the "seen" set. Pure TUI
+        // state — no file write, no picker. In v0.4 Space also
+        // collapses the DiffLine rows and snaps the cursor to the
+        // hunk header when its old row disappears from the layout.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
             100,
         )]);
         cursor_on_nth_diff_line(&mut app, 0);
-        let before_scroll = app.scroll;
 
         app.handle_key(key(KeyCode::Char(' ')));
 
@@ -5750,14 +5849,30 @@ mod tests {
             "Space must toggle the current hunk into the seen set"
         );
         assert!(app.picker.is_none(), "Space must not open the picker");
-        assert_eq!(app.scroll, before_scroll, "Space must not move cursor");
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 0
+                })
+            ),
+            "collapsing a seen hunk must land the cursor on its HunkHeader"
+        );
 
-        // Second press removes the mark.
+        // Second press removes the mark and re-expands the hunk.
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(
             !app.hunk_is_seen(0, 0),
             "a second Space must remove the seen mark"
         );
+        let diff_rows = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::DiffLine { .. }))
+            .count();
+        assert_eq!(diff_rows, 1, "unmarking must re-expand the hunk body");
     }
 
     #[test]
@@ -5784,11 +5899,144 @@ mod tests {
     }
 
     #[test]
-    fn seen_mark_persists_across_a_recompute_that_preserves_hunk_old_start() {
-        // seen_hunks is keyed by (path, hunk.old_start) so a
-        // watcher-driven recompute that rebuilds the FileDiff
-        // list without moving the hunk's pre-image anchor must
-        // leave the mark in place.
+    fn seen_mark_persists_when_hunk_fingerprint_unchanged() {
+        // v0.4: seen_hunks is keyed by (path, hunk.old_start) and
+        // valued by the hunk content fingerprint. A watcher-driven
+        // recompute that rebuilds the FileDiff list without moving
+        // the pre-image anchor **and** without altering the hunk's
+        // lines must leave the mark in place.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.hunk_is_seen(0, 0));
+
+        // Rebuild an identical diff: same old_start, same lines.
+        let fresh = vec![make_file(
+            "a.rs",
+            vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )];
+        app.apply_computed_files(fresh);
+
+        assert!(
+            app.hunk_is_seen(0, 0),
+            "recompute with identical hunk fingerprint must preserve the seen mark"
+        );
+    }
+
+    #[test]
+    fn rebuild_layout_hides_difflines_for_seen_hunk() {
+        // v0.4: marking a hunk as seen must collapse its DiffLine
+        // rows out of the layout so only the hunk header survives.
+        // The file header and spacer stay put.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(
+                1,
+                vec![
+                    diff_line(LineKind::Added, "x1"),
+                    diff_line(LineKind::Added, "x2"),
+                    diff_line(LineKind::Added, "x3"),
+                ],
+            )],
+            100,
+        )]);
+        cursor_on_nth_diff_line(&mut app, 0);
+
+        let diff_rows_before = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::DiffLine { .. }))
+            .count();
+        assert_eq!(
+            diff_rows_before, 3,
+            "precondition: fixture should layout 3 DiffLine rows"
+        );
+
+        app.handle_key(key(KeyCode::Char(' ')));
+
+        let diff_rows_after = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::DiffLine { .. }))
+            .count();
+        assert_eq!(
+            diff_rows_after, 0,
+            "DiffLine rows must be absent for seen hunk"
+        );
+
+        let header_rows = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::HunkHeader { .. }))
+            .count();
+        assert_eq!(
+            header_rows, 1,
+            "HunkHeader must remain present for the seen hunk"
+        );
+    }
+
+    #[test]
+    fn collapsing_hunk_keeps_cursor_on_that_hunks_header_not_a_neighbor() {
+        // v0.4 regression guard: when Space collapses a hunk with
+        // several DiffLine rows, the old scroll index can coincide
+        // with a *different* hunk's DiffLine once the layout
+        // shortens. Naïvely trusting "rows[scroll] is a DiffLine
+        // → cursor is fine" silently teleports the cursor to the
+        // neighbor. The collapsed hunk's HunkHeader must win.
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![
+                hunk(
+                    1,
+                    vec![
+                        diff_line(LineKind::Added, "a1"),
+                        diff_line(LineKind::Added, "a2"),
+                        diff_line(LineKind::Added, "a3"),
+                    ],
+                ),
+                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
+            ],
+            100,
+        )]);
+        // Park the cursor on the 2nd DiffLine of hunk 0 (a2).
+        cursor_on_nth_diff_line(&mut app, 1);
+        assert_eq!(app.current_hunk(), Some((0, 0)));
+
+        app.handle_key(key(KeyCode::Char(' ')));
+
+        assert_eq!(
+            app.current_hunk(),
+            Some((0, 0)),
+            "cursor must stay on the collapsed hunk, not drift into a neighbor"
+        );
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader {
+                    file_idx: 0,
+                    hunk_idx: 0
+                })
+            ),
+            "cursor row must be hunk 0's HunkHeader, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+    }
+
+    #[test]
+    fn seen_mark_clears_when_hunk_content_changes() {
+        // v0.4: the seen mark is bound to the hunk's content
+        // fingerprint, not just its pre-image anchor. A recompute
+        // that keeps `old_start` fixed but alters any line's
+        // content must invalidate the mark so the reader is forced
+        // to re-read the new diff.
         let mut app = fake_app(vec![make_file(
             "a.rs",
             vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
@@ -5806,8 +6054,18 @@ mod tests {
         app.apply_computed_files(fresh);
 
         assert!(
-            app.hunk_is_seen(0, 0),
-            "recompute that preserves hunk.old_start must preserve the seen mark"
+            !app.hunk_is_seen(0, 0),
+            "content change must auto-clear the seen mark"
+        );
+        let diff_rows = app
+            .layout
+            .rows
+            .iter()
+            .filter(|r| matches!(r, RowKind::DiffLine { .. }))
+            .count();
+        assert!(
+            diff_rows >= 1,
+            "DiffLine rows must be re-expanded when the mark clears"
         );
     }
 

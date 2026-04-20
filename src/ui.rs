@@ -458,7 +458,7 @@ struct RowRenderCtx<'a> {
     cursor_sub: Option<usize>,
     wrap_body_width: Option<usize>,
     nowrap_body_width: usize,
-    seen_hunks: &'a std::collections::BTreeSet<(std::path::PathBuf, usize)>,
+    seen_hunks: &'a std::collections::BTreeMap<(std::path::PathBuf, usize), u64>,
     hl: Option<&'a crate::highlight::Highlighter>,
     bg_added: Color,
     bg_deleted: Color,
@@ -507,6 +507,7 @@ fn render_row(row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line<'static>> {
                     seen_hunks,
                     &files[*file_idx].path,
                     hunks[*hunk_idx].old_start,
+                    crate::app::hunk_fingerprint(&hunks[*hunk_idx]),
                 ),
             )]
         }
@@ -800,8 +801,11 @@ fn render_hunk_header(
     is_cursor: bool,
     is_seen: bool,
 ) -> Line<'static> {
-    let seen_mark = if is_seen { "• " } else { "  " };
-    let cursor_mark = if is_cursor { "  ▶  " } else { "     " };
+    // v0.4: the seen mark becomes a fold glyph (▸) since a marked
+    // hunk is collapsed. Distinct shape + smaller than the cursor
+    // `▶` so the two can coexist on the same row without being
+    // mistaken for each other.
+    let seen_mark = if is_seen { "▸ " } else { "  " };
 
     // Count added/deleted lines from the actual hunk content.
     let added: usize = hunk
@@ -828,16 +832,39 @@ fn render_hunk_header(
         format!("L{}", hunk.new_start)
     };
 
-    let body = match &hunk.context {
-        Some(ctx) => format!("{cursor_mark}{seen_mark}@@ {ctx}  {line_range} {counts}"),
-        None => format!("{cursor_mark}{seen_mark}@@ {line_range} {counts}"),
+    let label = match &hunk.context {
+        Some(ctx) => format!("{seen_mark}@@ {ctx}  {line_range} {counts}"),
+        None => format!("{seen_mark}@@ {line_range} {counts}"),
     };
 
-    let mut style = Style::default().fg(Color::Cyan);
+    let mut label_style = Style::default().fg(Color::Cyan);
     if !is_selected {
-        style = style.add_modifier(Modifier::DIM);
+        label_style = label_style.add_modifier(Modifier::DIM);
     }
-    Line::from(Span::styled(body, style))
+
+    // v0.4: split the left gutter into its own Yellow + Bold span
+    // when the cursor is on the header. Keeps the cursor arrow
+    // visually consistent with DiffLine rows (same color, same
+    // weight) so the eye can track the cursor across the
+    // expanded/collapsed boundary without losing it in the Cyan
+    // header body.
+    let gutter = if is_cursor {
+        Span::styled(
+            "  ▶  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if is_selected {
+        // Selected (but not cursor) hunk header — match the DiffLine
+        // ribbon color so the whole hunk reads as a single focused
+        // block.
+        Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
+    } else {
+        Span::raw("     ")
+    };
+
+    Line::from(vec![gutter, Span::styled(label, label_style)])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1683,7 +1710,7 @@ mod tests {
             file_view: None,
             search_input: None,
             search: None,
-            seen_hunks: std::collections::BTreeSet::new(),
+            seen_hunks: std::collections::BTreeMap::new(),
             follow_mode: true,
             last_error: None,
             input_health: None,
@@ -2587,6 +2614,66 @@ mod tests {
         assert!(
             view.contains("▶"),
             "cursor parked on a hunk header must still be visible:\n{view}"
+        );
+    }
+
+    #[test]
+    fn hunk_header_cursor_arrow_is_yellow_and_bold() {
+        // v0.4: when a hunk collapses under the seen mark the only
+        // on-screen anchor the reader has is the hunk header row.
+        // Paint its `▶` with the same Yellow + Bold style DiffLine
+        // rows use so the cursor stays visible across the hand-off
+        // between expanded and collapsed hunks.
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
+            100,
+        )]);
+        app.scroll_to(app.layout.hunk_starts[0]);
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let mut found = false;
+        for y in 0..buffer.area().height {
+            for x in 0..buffer.area().width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "▶" {
+                    let st = cell.style();
+                    if st.fg == Some(Color::Yellow) && st.add_modifier.contains(Modifier::BOLD) {
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "cursor `▶` on a hunk header must be Yellow + Bold, not Cyan"
+        );
+    }
+
+    #[test]
+    fn seen_hunk_header_shows_fold_glyph() {
+        // v0.4: seen hunks render with a ▸ fold glyph in the hunk
+        // header so the reader can tell "this hunk is collapsed,
+        // not empty" at a glance. Unseen hunks have no such glyph.
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
+            100,
+        )]);
+        app.scroll_to(app.layout.hunk_starts[0] + 1); // onto the DiffLine
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        let view = render_to_string(&app, 80, 10);
+        assert!(
+            view.contains("▸"),
+            "seen hunk header must display a ▸ fold glyph:\n{view}"
         );
     }
 

@@ -210,7 +210,7 @@ r       reject — `revert this change` を reject scar として挿入
 c       comment — ミニ入力欄→任意のコメントを free scar として挿入
 x       revert — hunkをgit checkoutで元に戻す（scarなし）
 e       editor — $EDITOR +<line> <file> で外部エディタを起動
-space   見たマーク（TUI内部のみ、ファイルに何も書かない）
+space   既読マーク（v0.4: hunk本体を折りたたみ。内容変化で自動展開。TUI内部のみ、ファイルに何も書かない）
 ```
 
 全キーバインドは`~/.config/kizu/config.toml`でリマップ可能。
