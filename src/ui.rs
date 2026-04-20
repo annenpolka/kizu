@@ -66,6 +66,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     let footer = chunks[2];
 
     if let Some(fv) = app.file_view.as_ref() {
+        app.last_body_height.set(main.height as usize);
         let hl = app
             .highlighter
             .get_or_init(crate::highlight::Highlighter::new);
@@ -76,7 +77,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         } else {
             fv.scroll_top
         };
-        render_file_view(frame, main, fv, Some(hl), effective_top);
+        render_file_view(frame, main, fv, app.wrap_lines, Some(hl), effective_top);
     } else if app.files.is_empty() {
         render_empty(frame, main, app);
     } else {
@@ -991,82 +992,221 @@ fn render_file_view(
     frame: &mut Frame<'_>,
     area: Rect,
     fv: &crate::app::FileViewState,
+    wrap_lines: bool,
     hl: Option<&crate::highlight::Highlighter>,
     effective_top: usize,
 ) {
     let height = area.height as usize;
     let width = area.width as usize;
+    let body_width = width.saturating_sub(5).max(1);
+    fv.last_body_width.set(body_width);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
 
-    for i in 0..height {
-        let line_idx = effective_top + i;
-        if line_idx >= fv.lines.len() {
-            lines.push(Line::from(Span::styled(
-                "~",
-                Style::default().fg(Color::DarkGray),
-            )));
-            continue;
-        }
-        let is_cursor = line_idx == fv.cursor;
-        let bar = if is_cursor {
-            Span::styled(
-                "  ▶  ",
+    if wrap_lines {
+        let vi = crate::app::FileViewVisualIndex::build(&fv.lines, Some(body_width));
+        let (mut line_idx, mut skip_remaining) = vi.logical_at(effective_top);
+        while line_idx < fv.lines.len() && lines.len() < height {
+            let base_style = if let Some(&bg) = fv.line_bg.get(&line_idx) {
+                Style::default().bg(bg)
+            } else {
                 Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw("     ")
-        };
-
-        let content = &fv.lines[line_idx];
-        let body_width = width.saturating_sub(5).max(1);
-        let char_len = content.chars().count();
-        let padded: String = if char_len >= body_width {
-            content.chars().take(body_width).collect()
-        } else {
-            content
-                .chars()
-                .chain(std::iter::repeat_n(' ', body_width - char_len))
-                .collect()
-        };
-
-        let base_style = if let Some(&bg) = fv.line_bg.get(&line_idx) {
-            Style::default().bg(bg)
-        } else {
-            Style::default()
-        };
-
-        if let Some(hl) = hl {
-            let tokens = hl.highlight_line(content, &fv.path);
-            if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
-                let mut spans = vec![bar];
-                let mut chars_emitted = 0;
-                for token in &tokens {
-                    let remaining = body_width.saturating_sub(chars_emitted);
-                    if remaining == 0 {
-                        break;
-                    }
-                    let take = token.text.chars().count().min(remaining);
-                    let text: String = token.text.chars().take(take).collect();
-                    spans.push(Span::styled(text, base_style.fg(token.fg)));
-                    chars_emitted += take;
+            };
+            let rendered = render_file_view_line_wrapped(
+                &fv.lines[line_idx],
+                (line_idx == fv.cursor).then_some(fv.cursor_sub_row),
+                body_width,
+                base_style,
+                hl,
+                &fv.path,
+            );
+            let mut take = rendered.into_iter();
+            for _ in 0..skip_remaining {
+                if take.next().is_none() {
+                    break;
                 }
-                if chars_emitted < body_width {
-                    spans.push(Span::styled(
-                        " ".repeat(body_width - chars_emitted),
-                        base_style,
-                    ));
-                }
-                lines.push(Line::from(spans));
-                continue;
             }
+            skip_remaining = 0;
+            for line in take {
+                if lines.len() >= height {
+                    break;
+                }
+                lines.push(line);
+            }
+            line_idx += 1;
         }
+    } else {
+        for i in 0..height {
+            let line_idx = effective_top + i;
+            if line_idx >= fv.lines.len() {
+                break;
+            }
+            let base_style = if let Some(&bg) = fv.line_bg.get(&line_idx) {
+                Style::default().bg(bg)
+            } else {
+                Style::default()
+            };
+            lines.push(render_file_view_line(
+                &fv.lines[line_idx],
+                line_idx == fv.cursor,
+                body_width,
+                base_style,
+                hl,
+                &fv.path,
+            ));
+        }
+    }
 
-        lines.push(Line::from(vec![bar, Span::styled(padded, base_style)]));
+    while lines.len() < height {
+        lines.push(Line::from(Span::styled(
+            "~",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_file_view_line(
+    content: &str,
+    is_cursor: bool,
+    body_width: usize,
+    base_style: Style,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: &std::path::Path,
+) -> Line<'static> {
+    let bar = if is_cursor {
+        Span::styled(
+            "  ▶  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("     ")
+    };
+
+    if let Some(hl) = hl {
+        let tokens = hl.highlight_line(content, file_path);
+        if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
+            let mut spans = vec![bar];
+            let mut cells_emitted = 0usize;
+            for token in &tokens {
+                let remaining = body_width.saturating_sub(cells_emitted);
+                if remaining == 0 {
+                    break;
+                }
+                let (text, token_cells) = take_cells(&token.text, remaining);
+                if text.is_empty() {
+                    break;
+                }
+                spans.push(Span::styled(text, base_style.fg(token.fg)));
+                cells_emitted += token_cells;
+            }
+            if cells_emitted < body_width {
+                spans.push(Span::styled(
+                    " ".repeat(body_width - cells_emitted),
+                    base_style,
+                ));
+            }
+            return Line::from(spans);
+        }
+    }
+
+    use unicode_width::UnicodeWidthStr;
+    let content_cells = UnicodeWidthStr::width(content);
+    let padded_body = if content_cells >= body_width {
+        let (truncated, _) = take_cells(content, body_width);
+        truncated
+    } else {
+        let pad = body_width - content_cells;
+        content
+            .chars()
+            .chain(std::iter::repeat_n(' ', pad))
+            .collect()
+    };
+    Line::from(vec![bar, Span::styled(padded_body, base_style)])
+}
+
+fn render_file_view_line_wrapped(
+    content: &str,
+    cursor_sub: Option<usize>,
+    body_width: usize,
+    base_style: Style,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: &std::path::Path,
+) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+
+    let tokens: Option<Vec<crate::highlight::HlToken>> = hl.and_then(|hl| {
+        let toks = hl.highlight_line(content, file_path);
+        (toks.len() > 1 || toks.first().is_some_and(|t| t.fg != Color::Reset)).then_some(toks)
+    });
+
+    let char_colors: Vec<Color> = if let Some(ref toks) = tokens {
+        let mut colors = Vec::with_capacity(content.len());
+        for tok in toks {
+            for _ in tok.text.chars() {
+                colors.push(tok.fg);
+            }
+        }
+        colors
+    } else {
+        Vec::new()
+    };
+
+    let chunks = wrap_at_chars(content, body_width.max(1));
+    let last_idx = chunks.len().saturating_sub(1);
+    let cursor_line = cursor_sub.map(|s| s.min(last_idx));
+    let mut char_offset = 0usize;
+
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let bar = if cursor_line == Some(i) {
+                Span::styled(
+                    "  ▶  ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if cursor_line.is_some() {
+                Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
+            } else {
+                Span::raw("     ")
+            };
+
+            let chunk_char_count = chunk.chars().count();
+            let chunk_cell_count = UnicodeWidthStr::width(chunk);
+            let pad = body_width.saturating_sub(chunk_cell_count);
+            let mut spans = vec![bar];
+
+            if !char_colors.is_empty() {
+                let chunk_colors = &char_colors[char_offset..char_offset + chunk_char_count];
+                let mut run_start = 0usize;
+                let chunk_chars: Vec<char> = chunk.chars().collect();
+                while run_start < chunk_chars.len() {
+                    let run_color = chunk_colors[run_start];
+                    let run_end = (run_start + 1..chunk_chars.len())
+                        .find(|&j| chunk_colors[j] != run_color)
+                        .unwrap_or(chunk_chars.len());
+                    let text: String = chunk_chars[run_start..run_end].iter().collect();
+                    spans.push(Span::styled(text, base_style.fg(run_color)));
+                    run_start = run_end;
+                }
+                if pad > 0 {
+                    spans.push(Span::styled(" ".repeat(pad), base_style));
+                }
+            } else {
+                let padded_body: String =
+                    chunk.chars().chain(std::iter::repeat_n(' ', pad)).collect();
+                spans.push(Span::styled(padded_body, base_style));
+            }
+
+            char_offset += chunk_char_count;
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Convert a Unix epoch millisecond timestamp to a local-time
@@ -1146,6 +1286,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("cancel", dim));
     } else if let Some(fv) = app.file_view.as_ref() {
+        spans.push(sep());
+        spans.push(Span::styled("w", Style::default().fg(Color::Cyan)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            if app.wrap_lines { "wrap" } else { "nowrap" },
+            Style::default().fg(Color::Cyan).add_modifier(bold),
+        ));
         spans.push(sep());
         spans.push(Span::styled(
             fv.path.display().to_string(),
@@ -1909,6 +2056,36 @@ mod tests {
         let wrap_view = render_to_string(&app, 80, 8);
         assert!(wrap_view.contains("wrap"));
         assert!(!wrap_view.contains("nowrap"));
+    }
+
+    #[test]
+    fn file_view_wrap_mode_renders_late_content_and_footer_indicator() {
+        let long = format!("const DATA: &str = {:?};", "0123456789".repeat(12));
+        let mut app = fake_app();
+        app.file_view = Some(crate::app::FileViewState {
+            path: PathBuf::from("src/demo.rs"),
+            return_scroll: 0,
+            lines: vec![long.clone()],
+            line_bg: std::collections::HashMap::new(),
+            cursor: 0,
+            cursor_sub_row: 0,
+            scroll_top: 0,
+            anim: None,
+            visual_top: 0.0,
+            last_body_width: std::cell::Cell::new(1),
+        });
+        app.wrap_lines = true;
+
+        let view = render_to_string(&app, 40, 8);
+        assert!(
+            view.contains(&long[45..65]),
+            "wrapped file view must surface a later slice of the long line:\n{view}"
+        );
+        assert!(
+            view.contains("[file view]"),
+            "file view footer missing:\n{view}"
+        );
+        assert!(view.contains("w wrap"), "wrap indicator missing:\n{view}");
     }
 
     #[test]

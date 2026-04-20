@@ -71,3 +71,33 @@ test("footer mode indicators switch on toggle keys", async () => {
   expect(view).toContain("z top");
   expect(view).toContain("w wrap");
 });
+
+test("file view wrap toggle reveals long-line continuation", async () => {
+  repo = createTempRepo();
+  const long = Array.from({ length: 20 }, (_, i) =>
+    `segment${i.toString().padStart(2, "0")}`
+  ).join("-");
+  const lateSlice = "segment17";
+  repo.write("src/app.rs", "fn main() {}\n");
+  repo.git("add", ".");
+  repo.git("commit", "-q", "-m", "seed");
+  repo.write("src/app.rs", `const DATA: &str = "${long}";\n`);
+
+  session = await launchKizu({ cwd: repo.path, cols: 50, rows: 20 });
+  await session.waitForText("const DATA", { timeout: 10_000 });
+
+  await session.press("j");
+  await session.press("enter");
+  await session.waitForText("[file view]", { timeout: 5_000 });
+
+  let view = await session.text({ trimEnd: true });
+  expect(view).toContain("w nowrap");
+  expect(view).not.toContain(lateSlice);
+
+  await session.press("w");
+  await session.waitForText("w wrap", { timeout: 5_000 });
+
+  view = await session.text({ trimEnd: true });
+  expect(view).toContain("w wrap");
+  expect(view).toContain(lateSlice);
+});

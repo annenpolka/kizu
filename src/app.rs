@@ -940,6 +940,14 @@ pub struct FileViewState {
     pub lines: Vec<String>,
     pub line_bg: std::collections::HashMap<usize, ratatui::style::Color>,
     pub cursor: usize,
+    /// Intra-line visual offset of the cursor. **Always 0 in nowrap
+    /// mode.** In wrap mode this is how many wrapped visual rows into
+    /// `lines[cursor]` the user has walked via `J` / `K` / Ctrl-d /
+    /// Ctrl-u.
+    pub cursor_sub_row: usize,
+    /// Top of the file-view viewport in **visual-row** coordinates.
+    /// In nowrap mode this is identical to the top logical line
+    /// index; in wrap mode it can land in the middle of a long line.
     pub scroll_top: usize,
     /// Easing tween for the file view's scroll_top, matching the
     /// main diff view's 150ms ease-out cubic animation.
@@ -947,6 +955,96 @@ pub struct FileViewState {
     /// Last rendered scroll position (in row units). Used as the
     /// tween's start point when a new animation begins.
     pub visual_top: f32,
+    /// Last rendered file-view body width in cells (left gutter
+    /// excluded). The wrap toggle and visual-row navigation reuse it
+    /// so key handling can stay in sync with the renderer.
+    pub last_body_width: Cell<usize>,
+}
+
+/// File-view counterpart to [`VisualIndex`]. Maps logical file lines
+/// to visual y offsets under the current wrap width so file-view
+/// navigation can move inside a single long line instead of jumping
+/// straight to the next logical line.
+#[derive(Debug, Clone)]
+pub struct FileViewVisualIndex {
+    prefix: Vec<usize>,
+    #[allow(dead_code)]
+    pub body_width: Option<usize>,
+}
+
+impl FileViewVisualIndex {
+    pub fn build(lines: &[String], body_width: Option<usize>) -> Self {
+        let mut prefix = Vec::with_capacity(lines.len() + 1);
+        prefix.push(0);
+        let mut acc = 0usize;
+        for line in lines {
+            let h = Self::line_visual_height(line, body_width);
+            acc += h;
+            prefix.push(acc);
+        }
+        Self { prefix, body_width }
+    }
+
+    pub fn visual_y(&self, line_idx: usize) -> usize {
+        self.prefix.get(line_idx).copied().unwrap_or(0)
+    }
+
+    pub fn visual_height(&self, line_idx: usize) -> usize {
+        match (self.prefix.get(line_idx), self.prefix.get(line_idx + 1)) {
+            (Some(&a), Some(&b)) => b - a,
+            _ => 1,
+        }
+    }
+
+    pub fn total_visual(&self) -> usize {
+        self.prefix.last().copied().unwrap_or(0)
+    }
+
+    pub fn logical_at(&self, y: usize) -> (usize, usize) {
+        if self.prefix.len() < 2 {
+            return (0, 0);
+        }
+        let total = self.total_visual();
+        if y >= total {
+            let last = self.prefix.len() - 2;
+            return (last, self.visual_height(last).saturating_sub(1));
+        }
+        let mut lo = 0usize;
+        let mut hi = self.prefix.len() - 1;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.prefix[mid + 1] > y {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let within = y - self.prefix[lo];
+        (lo, within)
+    }
+
+    fn line_visual_height(line: &str, body_width: Option<usize>) -> usize {
+        let Some(width) = body_width else {
+            return 1;
+        };
+        use unicode_width::UnicodeWidthChar;
+
+        if line.is_empty() {
+            return 1;
+        }
+
+        let mut rows = 1usize;
+        let mut chunk_cells = 0usize;
+        for ch in line.chars() {
+            let ch_cells = ch.width().unwrap_or(0);
+            if chunk_cells > 0 && chunk_cells + ch_cells > width {
+                rows += 1;
+                chunk_cells = 0;
+            }
+            chunk_cells += ch_cells;
+        }
+        rows
+    }
 }
 
 /// Confirmation overlay for hunk revert (`x` key). Holds the
@@ -1155,6 +1253,7 @@ impl App {
         // lands cleanly on the row's first visual line under the
         // new coordinate system.
         self.cursor_sub_row = 0;
+        self.reflow_file_view_after_wrap_toggle();
     }
 
     /// Toggle between Diff and Stream view modes. Rebuilds `files`
@@ -2927,16 +3026,25 @@ impl App {
             .saturating_sub(1)
             .min(lines.len().saturating_sub(1));
 
-        let scroll_top = initial_cursor.saturating_sub(self.last_body_height.get() / 2);
+        let guessed_body_width = self.last_body_width.get().unwrap_or(1).max(1);
+        let scroll_top = if self.wrap_lines {
+            let vi = FileViewVisualIndex::build(&lines, Some(guessed_body_width));
+            vi.visual_y(initial_cursor)
+                .saturating_sub(self.last_body_height.get() / 2)
+        } else {
+            initial_cursor.saturating_sub(self.last_body_height.get() / 2)
+        };
         self.file_view = Some(FileViewState {
             path: file.path.clone(),
             return_scroll: self.scroll,
             lines,
             line_bg,
             cursor: initial_cursor,
+            cursor_sub_row: 0,
             scroll_top,
             anim: None,
             visual_top: scroll_top as f32,
+            last_body_width: Cell::new(guessed_body_width),
         });
     }
 
@@ -3030,6 +3138,8 @@ impl App {
                     self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
                 } else if ch == k.comment {
                     self.open_scar_comment();
+                } else if ch == k.wrap_toggle {
+                    self.toggle_wrap_lines();
                 } else if ch == k.undo {
                     self.undo_scar();
                 }
@@ -3039,19 +3149,69 @@ impl App {
         KeyEffect::None
     }
 
-    fn file_view_scroll_by(&mut self, delta: isize, animate: bool) {
+    /// Wrap toggle changes the file-view coordinate system from
+    /// logical lines to visual rows (or back). Re-center the viewport
+    /// around the current cursor, drop any stale intra-line offset,
+    /// and clear the animation so the next frame snaps cleanly onto
+    /// the new scale.
+    fn reflow_file_view_after_wrap_toggle(&mut self) {
+        let viewport_height = self.last_body_height.get().max(1);
+        let wrap_lines = self.wrap_lines;
         let Some(fv) = self.file_view.as_mut() else {
             return;
         };
+        fv.cursor_sub_row = 0;
+        let body_width = wrap_lines.then_some(fv.last_body_width.get().max(1));
+        let vi = FileViewVisualIndex::build(&fv.lines, body_width);
+        let cursor_y = vi.visual_y(fv.cursor);
+        let max_top = vi.total_visual().saturating_sub(1);
+        fv.scroll_top = cursor_y.saturating_sub(viewport_height / 2).min(max_top);
+        fv.anim = None;
+        fv.visual_top = fv.scroll_top as f32;
+    }
+
+    fn file_view_scroll_by(&mut self, delta: isize, animate: bool) {
+        let viewport_height = self.last_body_height.get().max(1);
+        let wrap_lines = self.wrap_lines;
+        let Some(fv) = self.file_view.as_mut() else {
+            return;
+        };
+        if wrap_lines {
+            let vi = FileViewVisualIndex::build(&fv.lines, Some(fv.last_body_width.get().max(1)));
+            let cur_y = vi.visual_y(fv.cursor) + fv.cursor_sub_row;
+            let new_y = (cur_y as isize + delta).max(0) as usize;
+            let clamped = new_y.min(vi.total_visual().saturating_sub(1));
+            let (new_cursor, new_sub) = vi.logical_at(clamped);
+            fv.cursor = new_cursor;
+            fv.cursor_sub_row = new_sub;
+            let old_top = fv.scroll_top;
+            if clamped < fv.scroll_top {
+                fv.scroll_top = clamped;
+            } else if clamped >= fv.scroll_top + viewport_height {
+                fv.scroll_top = clamped.saturating_sub(viewport_height - 1);
+            }
+            if animate && fv.scroll_top != old_top {
+                fv.anim = Some(ScrollAnim {
+                    from: fv.visual_top,
+                    start: Instant::now(),
+                    dur: SCROLL_ANIM_DURATION,
+                });
+            } else if !animate {
+                fv.anim = None;
+                fv.visual_top = fv.scroll_top as f32;
+            }
+            return;
+        }
+
         let max = fv.lines.len().saturating_sub(1);
         let new = (fv.cursor as isize + delta).clamp(0, max as isize) as usize;
         fv.cursor = new;
-        let vh = self.last_body_height.get();
+        fv.cursor_sub_row = 0;
         let old_top = fv.scroll_top;
         if fv.cursor < fv.scroll_top {
             fv.scroll_top = fv.cursor;
-        } else if fv.cursor >= fv.scroll_top + vh {
-            fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
+        } else if fv.cursor >= fv.scroll_top + viewport_height {
+            fv.scroll_top = fv.cursor.saturating_sub(viewport_height - 1);
         }
         if animate && fv.scroll_top != old_top {
             fv.anim = Some(ScrollAnim {
@@ -3083,16 +3243,24 @@ impl App {
     }
 
     fn file_view_goto(&mut self, line: usize) {
+        let viewport_height = self.last_body_height.get().max(1);
+        let wrap_lines = self.wrap_lines;
         let Some(fv) = self.file_view.as_mut() else {
             return;
         };
         let max = fv.lines.len().saturating_sub(1);
         fv.cursor = line.min(max);
-        let vh = self.last_body_height.get();
-        if fv.cursor < fv.scroll_top {
-            fv.scroll_top = fv.cursor;
-        } else if fv.cursor >= fv.scroll_top + vh {
-            fv.scroll_top = fv.cursor.saturating_sub(vh - 1);
+        fv.cursor_sub_row = 0;
+        let cursor_y = if wrap_lines {
+            let vi = FileViewVisualIndex::build(&fv.lines, Some(fv.last_body_width.get().max(1)));
+            vi.visual_y(fv.cursor)
+        } else {
+            fv.cursor
+        };
+        if cursor_y < fv.scroll_top {
+            fv.scroll_top = cursor_y;
+        } else if cursor_y >= fv.scroll_top + viewport_height {
+            fv.scroll_top = cursor_y.saturating_sub(viewport_height - 1);
         }
         // g/G are instant jumps — no animation.
         fv.anim = None;
@@ -7628,6 +7796,35 @@ mod tests {
     }
 
     #[test]
+    fn file_view_wrap_mode_walks_visual_rows_inside_long_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let long = format!("const DATA: &str = {:?};", "0123456789".repeat(12));
+        let after = format!("{long}\n");
+        let (mut app, _abs) = revert_app_with_real_repo(&tmp, "foo.rs", "", &after);
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter));
+        app.last_body_height.set(5);
+        app.file_view
+            .as_ref()
+            .expect("file view")
+            .last_body_width
+            .set(20);
+
+        app.handle_key(key(KeyCode::Char('w')));
+        app.handle_key(key(KeyCode::Char('J')));
+
+        let fv = app.file_view.as_ref().expect("file view still open");
+        assert_eq!(
+            fv.cursor, 0,
+            "wrap-mode J should stay on the same logical line when only the visual sub-row changes",
+        );
+        assert_eq!(
+            fv.cursor_sub_row, 1,
+            "wrap-mode J should advance to the next visual row inside the long file-view line",
+        );
+    }
+
+    #[test]
     #[allow(non_snake_case)]
     fn file_view_g_goes_to_top_and_G_to_bottom() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -8458,9 +8655,11 @@ mod tests {
             ],
             line_bg: std::collections::HashMap::new(),
             cursor: 2, // 0-indexed → 1-indexed line 3
+            cursor_sub_row: 0,
             scroll_top: 0,
             anim: None,
             visual_top: 0.0,
+            last_body_width: Cell::new(1),
         });
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
         assert!(
@@ -8585,9 +8784,11 @@ mod tests {
             lines: vec!["line1".into(), "line2".into(), "line3".into()],
             line_bg: std::collections::HashMap::new(),
             cursor: 1,
+            cursor_sub_row: 0,
             scroll_top: 0,
             anim: None,
             visual_top: 0.0,
+            last_body_width: Cell::new(1),
         });
         let (path, line) = app.scar_target_line().expect("target");
         assert_eq!(line, 2);
@@ -8615,9 +8816,11 @@ mod tests {
             lines: vec!["line1".into(), "line2".into(), "line3".into()],
             line_bg: std::collections::HashMap::new(),
             cursor: 1,
+            cursor_sub_row: 0,
             scroll_top: 0,
             anim: None,
             visual_top: 0.0,
+            last_body_width: Cell::new(1),
         });
 
         // `a` in file view must route to insert_canned_scar via
