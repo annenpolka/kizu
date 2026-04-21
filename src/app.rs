@@ -1046,6 +1046,13 @@ pub struct FileViewState {
     /// excluded). The wrap toggle and visual-row navigation reuse it
     /// so key handling can stay in sync with the renderer.
     pub last_body_width: Cell<usize>,
+    /// v0.5 M2: whether the on-disk file ends with an LF. When false
+    /// the renderer draws a Yellow `∅` at the end of the last line
+    /// so the user sees the git `\ No newline at end of file` signal.
+    /// Determined from the raw file bytes at `open_file_view` time so
+    /// `lines: Vec<String>` (which discards the terminal delimiter)
+    /// still carries the information.
+    pub last_line_has_trailing_newline: bool,
 }
 
 /// File-view counterpart to [`VisualIndex`]. Maps logical file lines
@@ -3101,6 +3108,12 @@ impl App {
             }
         };
         let lines: Vec<String> = content.lines().map(String::from).collect();
+        // v0.5 M2: `content.lines()` discards the trailing delimiter,
+        // so interrogate the raw string to decide whether to draw the
+        // EOF-no-newline marker. Empty files are treated as
+        // "no newline" only if they are non-empty without trailing LF;
+        // a literally empty file has no last line to mark.
+        let last_line_has_trailing_newline = content.is_empty() || content.ends_with('\n');
 
         let mut line_bg: HashMap<usize, Color> = HashMap::new();
         for hunk in hunks {
@@ -3162,6 +3175,7 @@ impl App {
             anim: None,
             visual_top: scroll_top as f32,
             last_body_width: Cell::new(guessed_body_width),
+            last_line_has_trailing_newline,
         });
     }
 
@@ -9738,6 +9752,7 @@ mod tests {
             anim: None,
             visual_top: 0.0,
             last_body_width: Cell::new(1),
+            last_line_has_trailing_newline: true,
         });
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
         assert!(
@@ -9867,6 +9882,7 @@ mod tests {
             anim: None,
             visual_top: 0.0,
             last_body_width: Cell::new(1),
+            last_line_has_trailing_newline: true,
         });
         let (path, line) = app.scar_target_line().expect("target");
         assert_eq!(line, 2);
@@ -9899,6 +9915,7 @@ mod tests {
             anim: None,
             visual_top: 0.0,
             last_body_width: Cell::new(1),
+            last_line_has_trailing_newline: true,
         });
 
         // `a` in file view must route to insert_canned_scar via

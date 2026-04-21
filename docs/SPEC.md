@@ -48,9 +48,11 @@ scar機能追加（a/r/c/xキーバインド、言語判定、ファイル書き
 
 Spaceで既読化したhunkはDiffLineが折りたたまれ、hunk headerだけが残る。内容が変わると自動展開（fingerprint方式）。
 
-### v0.5 — 行数表示モード
+### v0.5 — 行数表示モード + 改行マーカー意味反転
 
-`#`キーでdiff viewとfile viewの左ガターに行番号を表示する。どちらも**worktree側（new）の行番号を1列表示**。Deleted行は現在のファイルに存在しないので空白。wrap時は継続行の行番号を空白にする。**Stream modeでは常時無効**（合成されたold_start/new_startは実ファイル行番号ではないため）。設定ファイル（`[line_numbers].enabled`、`[keys].line_numbers_toggle`）でデフォルト状態とキーをリマップ可能。
+**行数表示モード**: `#`キーでdiff viewとfile viewの左ガターに行番号を表示する。どちらも**worktree側（new）の行番号を1列表示**。Deleted行は現在のファイルに存在しないので空白。wrap時は継続行の行番号を空白にする。**Stream modeでは常時無効**（合成されたold_start/new_startは実ファイル行番号ではないため）。設定ファイル（`[line_numbers].enabled`、`[keys].line_numbers_toggle`）でデフォルト状態とキーをリマップ可能。
+
+**改行マーカー**: 通常の改行ありの行では末尾に記号を出さない。gitの`\ No newline at end of file`に相当する**EOF改行なし**の稀ケースでのみ末尾に`∅`をYellow boldで描画（diff view / file view / wrap / nowrap 共通）。旧`¶`（論理段落記号、改行ありの全行に常駐）は廃止。wrap時の右端 1-cell 予約も廃止（通常行は body 全幅まで背景色を伸ばす）。
 
 ---
 

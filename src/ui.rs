@@ -220,13 +220,17 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         LineNumberGutter::single(0)
     };
 
-    // In wrap mode we reserve 6 cells per row: 5 for the left bar,
-    // 1 for the `¶` newline marker (ADR-0014 dropped the `+`/`-`
-    // prefix column). Compute this *before* calling
-    // `viewport_placement` because the placement math needs the wrap
-    // body width to produce a correct `VisualIndex`.
+    // v0.5 M2: wrap mode reserves 5 cells for the left bar only. The
+    // legacy `¶` marker column took another cell on every row, but
+    // under the new semantics the end-of-line marker is drawn solely
+    // on EOF-no-newline rows (rare), so keeping the cell reserved on
+    // every row left a permanent one-cell blank band at the right
+    // edge. On the rare EOF row the renderer overlaps its `∅` with
+    // the trailing pad — if the chunk fills the full body width the
+    // last glyph is overwritten by the marker, which is acceptable
+    // for the `\ No newline at end of file` edge case.
     let wrap_body_width: Option<usize> = if app.wrap_lines {
-        Some(aw.saturating_sub(6 + ln_gutter_width).max(1))
+        Some(aw.saturating_sub(5 + ln_gutter_width).max(1))
     } else {
         None
     };
@@ -873,10 +877,26 @@ fn wrap_at_chars(content: &str, width: usize) -> Vec<&str> {
     chunks
 }
 
+/// v0.5 M2: EOF-no-newline marker (`∅`) span. Drawn at the end of
+/// the *last* visual row of a DiffLine whose `has_trailing_newline`
+/// is false — the git `\ No newline at end of file` case. Yellow +
+/// Bold so the rare event is visually loud; legacy `¶` on every
+/// normal row was too chatty.
+fn eof_no_newline_span(bg: Option<Color>) -> Span<'static> {
+    let mut style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    if let Some(b) = bg {
+        style = style.bg(b);
+    }
+    Span::styled("∅", style)
+}
+
 /// Wrap-mode variant of [`render_diff_line`]. Splits `line.content`
 /// at `body_width` chars and paints every visual row with the delta-style
-/// background color (ADR-0014). The last visual row gets a `¶` newline
-/// marker so the reader can tell real newlines from wrap boundaries.
+/// background color (ADR-0014). Only the last visual row of a DiffLine
+/// whose `has_trailing_newline = false` gets the `∅` EOF-no-newline
+/// marker (v0.5 M2, was previously `¶` on every newline-terminated row).
 ///
 /// Each visual row is padded out to `body_width` with trailing spaces
 /// so the background color extends uniformly to the right margin
@@ -911,17 +931,6 @@ fn render_diff_line_wrapped(
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
     };
-    let marker_style = match bg {
-        // Keep the marker legible on top of the colored bg.
-        Some(b) => Style::default()
-            .bg(b)
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-        None => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    };
-
     // Per-char fg + search highlight kind, built once for the whole
     // line. Distributed across wrapped chunks below so a match that
     // spans a wrap boundary still paints cleanly on both sides.
@@ -950,7 +959,11 @@ fn render_diff_line_wrapped(
             } else {
                 Span::raw("     ")
             };
-            let marker_reserve = if is_last && line.has_trailing_newline {
+            // v0.5 M2: reserve 1 cell only when this is the last
+            // visual row AND the DiffLine is EOF-no-newline (the `∅`
+            // marker case). Normal newline-terminated rows get no
+            // marker and no reservation.
+            let marker_reserve = if is_last && !line.has_trailing_newline {
                 1
             } else {
                 0
@@ -983,8 +996,8 @@ fn render_diff_line_wrapped(
                 spans.push(Span::styled(" ".repeat(pad), base_style));
             }
 
-            if is_last && line.has_trailing_newline {
-                spans.push(Span::styled("¶", marker_style));
+            if is_last && !line.has_trailing_newline {
+                spans.push(eof_no_newline_span(bg));
             }
             char_offset += chunk_char_count;
             Line::from(spans)
@@ -1225,8 +1238,17 @@ fn render_file_view_line_numbered(
     file_path: &std::path::Path,
     line_number: usize,
     gutter: &LineNumberGutter,
+    show_eof_marker: bool,
 ) -> Line<'static> {
-    let base = render_file_view_line(content, is_cursor, body_width, base_style, hl, file_path);
+    let base = render_file_view_line(
+        content,
+        is_cursor,
+        body_width,
+        base_style,
+        hl,
+        file_path,
+        show_eof_marker,
+    );
     let mut spans = base.spans;
     let bar = if spans.is_empty() {
         Span::raw("     ")
@@ -1252,9 +1274,17 @@ fn render_file_view_line_wrapped_numbered(
     file_path: &std::path::Path,
     line_number: usize,
     gutter: &LineNumberGutter,
+    show_eof_marker: bool,
 ) -> Vec<Line<'static>> {
-    let base =
-        render_file_view_line_wrapped(content, cursor_sub, body_width, base_style, hl, file_path);
+    let base = render_file_view_line_wrapped(
+        content,
+        cursor_sub,
+        body_width,
+        base_style,
+        hl,
+        file_path,
+        show_eof_marker,
+    );
     base.into_iter()
         .enumerate()
         .map(|(i, line)| {
@@ -1417,6 +1447,17 @@ fn render_diff_line(
     // Walk chars, respect `body_width` in display cells, and group
     // consecutive chars with the same `(fg, hl)` into one span so
     // ratatui doesn't pay span overhead per char.
+    //
+    // v0.5 M2: reserve the last cell for the EOF-no-newline marker
+    // (`∅`) when the DiffLine lacks a trailing newline. The cell is
+    // only reserved in the EOF case so normal rows still have the
+    // full body width for content + pad.
+    let eof_marker = !line.has_trailing_newline;
+    let body_budget = if eof_marker {
+        body_width.saturating_sub(1)
+    } else {
+        body_width
+    };
     use unicode_width::UnicodeWidthChar;
     let mut spans = vec![bar];
     let mut cells_emitted = 0usize;
@@ -1428,8 +1469,8 @@ fn render_diff_line(
         let mut run_end = run_start + 1;
         let mut run_cells = chars[run_start].width().unwrap_or(0);
         // Short-circuit: don't bother extending the run past the
-        // body_width budget.
-        if cells_emitted + run_cells > body_width {
+        // body budget (body_width minus the EOF marker reserve).
+        if cells_emitted + run_cells > body_budget {
             break;
         }
         while run_end < chars.len() {
@@ -1438,7 +1479,7 @@ fn render_diff_line(
                 break;
             }
             let w = chars[run_end].width().unwrap_or(0);
-            if cells_emitted + run_cells + w > body_width {
+            if cells_emitted + run_cells + w > body_budget {
                 break;
             }
             run_cells += w;
@@ -1449,20 +1490,23 @@ fn render_diff_line(
         spans.push(Span::styled(text, style));
         cells_emitted += run_cells;
         run_start = run_end;
-        if cells_emitted >= body_width {
+        if cells_emitted >= body_budget {
             break;
         }
     }
 
-    // Pad to body_width so the delta-style background extends to the
+    // Pad to body_budget so the delta-style background extends to the
     // viewport edge (ADR-0014). The padding keeps the base diff bg
     // (no search overlay) so the gutter and trailing cells don't get
     // falsely underlined.
-    if cells_emitted < body_width {
+    if cells_emitted < body_budget {
         spans.push(Span::styled(
-            " ".repeat(body_width - cells_emitted),
+            " ".repeat(body_budget - cells_emitted),
             base_style,
         ));
+    }
+    if eof_marker {
+        spans.push(eof_no_newline_span(bg));
     }
     Line::from(spans)
 }
@@ -1591,6 +1635,10 @@ fn render_file_view(
     fv.last_body_width.set(body_width);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
 
+    // v0.5 M2: draw `∅` on the last line only when the on-disk file
+    // is missing a trailing newline. Mid-file rows never get the marker.
+    let last_line_idx = fv.lines.len().saturating_sub(1);
+    let mark_last_no_newline = !fv.last_line_has_trailing_newline;
     if wrap_lines {
         let vi = crate::app::FileViewVisualIndex::build(&fv.lines, Some(body_width));
         let (mut line_idx, mut skip_remaining) = vi.logical_at(effective_top);
@@ -1601,6 +1649,7 @@ fn render_file_view(
                 Style::default()
             };
             let cursor_sub = (line_idx == fv.cursor).then_some(fv.cursor_sub_row);
+            let show_eof_marker = mark_last_no_newline && line_idx == last_line_idx;
             let rendered = if effective_show_ln {
                 render_file_view_line_wrapped_numbered(
                     &fv.lines[line_idx],
@@ -1611,6 +1660,7 @@ fn render_file_view(
                     &fv.path,
                     line_idx + 1,
                     &ln_gutter,
+                    show_eof_marker,
                 )
             } else {
                 render_file_view_line_wrapped(
@@ -1620,6 +1670,7 @@ fn render_file_view(
                     base_style,
                     hl,
                     &fv.path,
+                    show_eof_marker,
                 )
             };
             let mut take = rendered.into_iter();
@@ -1648,6 +1699,7 @@ fn render_file_view(
             } else {
                 Style::default()
             };
+            let show_eof_marker = mark_last_no_newline && line_idx == last_line_idx;
             let rendered = if effective_show_ln {
                 render_file_view_line_numbered(
                     &fv.lines[line_idx],
@@ -1658,6 +1710,7 @@ fn render_file_view(
                     &fv.path,
                     line_idx + 1,
                     &ln_gutter,
+                    show_eof_marker,
                 )
             } else {
                 render_file_view_line(
@@ -1667,6 +1720,7 @@ fn render_file_view(
                     base_style,
                     hl,
                     &fv.path,
+                    show_eof_marker,
                 )
             };
             lines.push(rendered);
@@ -1690,6 +1744,7 @@ fn render_file_view_line(
     base_style: Style,
     hl: Option<&crate::highlight::Highlighter>,
     file_path: &std::path::Path,
+    show_eof_marker: bool,
 ) -> Line<'static> {
     let bar = if is_cursor {
         Span::styled(
@@ -1701,6 +1756,14 @@ fn render_file_view_line(
     } else {
         Span::raw("     ")
     };
+    // v0.5 M2: reserve 1 cell at the end when we need to paint the
+    // EOF-no-newline marker. body_budget governs both content fit
+    // and pad so the `∅` lands inside body_width (never overflows).
+    let body_budget = if show_eof_marker {
+        body_width.saturating_sub(1)
+    } else {
+        body_width
+    };
 
     if let Some(hl) = hl {
         let tokens = hl.highlight_line(content, file_path);
@@ -1708,7 +1771,7 @@ fn render_file_view_line(
             let mut spans = vec![bar];
             let mut cells_emitted = 0usize;
             for token in &tokens {
-                let remaining = body_width.saturating_sub(cells_emitted);
+                let remaining = body_budget.saturating_sub(cells_emitted);
                 if remaining == 0 {
                     break;
                 }
@@ -1719,11 +1782,14 @@ fn render_file_view_line(
                 spans.push(Span::styled(text, base_style.fg(token.fg)));
                 cells_emitted += token_cells;
             }
-            if cells_emitted < body_width {
+            if cells_emitted < body_budget {
                 spans.push(Span::styled(
-                    " ".repeat(body_width - cells_emitted),
+                    " ".repeat(body_budget - cells_emitted),
                     base_style,
                 ));
+            }
+            if show_eof_marker {
+                spans.push(eof_no_newline_span(base_style.bg));
             }
             return Line::from(spans);
         }
@@ -1731,19 +1797,24 @@ fn render_file_view_line(
 
     use unicode_width::UnicodeWidthStr;
     let content_cells = UnicodeWidthStr::width(content);
-    let padded_body = if content_cells >= body_width {
-        let (truncated, _) = take_cells(content, body_width);
+    let padded_body: String = if content_cells >= body_budget {
+        let (truncated, _) = take_cells(content, body_budget);
         truncated
     } else {
-        let pad = body_width - content_cells;
+        let pad = body_budget - content_cells;
         content
             .chars()
             .chain(std::iter::repeat_n(' ', pad))
             .collect()
     };
-    Line::from(vec![bar, Span::styled(padded_body, base_style)])
+    let mut spans = vec![bar, Span::styled(padded_body, base_style)];
+    if show_eof_marker {
+        spans.push(eof_no_newline_span(base_style.bg));
+    }
+    Line::from(spans)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_file_view_line_wrapped(
     content: &str,
     cursor_sub: Option<usize>,
@@ -1751,6 +1822,7 @@ fn render_file_view_line_wrapped(
     base_style: Style,
     hl: Option<&crate::highlight::Highlighter>,
     file_path: &std::path::Path,
+    show_eof_marker: bool,
 ) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthStr;
 
@@ -1793,9 +1865,16 @@ fn render_file_view_line_wrapped(
                 Span::raw("     ")
             };
 
+            let is_last = i == last_idx;
+            let emit_marker = show_eof_marker && is_last;
+            let body_budget = if emit_marker {
+                body_width.saturating_sub(1)
+            } else {
+                body_width
+            };
             let chunk_char_count = chunk.chars().count();
-            let chunk_cell_count = UnicodeWidthStr::width(chunk);
-            let pad = body_width.saturating_sub(chunk_cell_count);
+            let chunk_cell_count = UnicodeWidthStr::width(chunk).min(body_budget);
+            let pad = body_budget.saturating_sub(chunk_cell_count);
             let mut spans = vec![bar];
 
             if !char_colors.is_empty() {
@@ -1818,6 +1897,10 @@ fn render_file_view_line_wrapped(
                 let padded_body: String =
                     chunk.chars().chain(std::iter::repeat_n(' ', pad)).collect();
                 spans.push(Span::styled(padded_body, base_style));
+            }
+
+            if emit_marker {
+                spans.push(eof_no_newline_span(base_style.bg));
             }
 
             char_offset += chunk_char_count;
@@ -2555,6 +2638,7 @@ mod tests {
             std::path::Path::new("foo.rs"),
             42,
             &gutter,
+            false,
         );
         assert!(rendered.spans.len() >= 3);
         let ln = rendered.spans[1].content.as_ref();
@@ -2574,6 +2658,7 @@ mod tests {
             std::path::Path::new("foo.rs"),
             42,
             &gutter,
+            false,
         );
         assert!(rendered.len() >= 2);
         let cont_ln = rendered[1].spans[1].content.as_ref();
@@ -2948,10 +3033,12 @@ mod tests {
     }
 
     #[test]
-    fn wrap_mode_renders_newline_marker_and_wraps_long_line() {
-        // 120-char diff line inside an 80-col terminal. In wrap mode
-        // the line should wrap to at least two visual rows and the
-        // last visible segment should end with a `¶` newline marker.
+    fn wrap_mode_does_not_show_any_marker_when_terminal_newline_present() {
+        // v0.5 M2 (plan v0.5-newline-marker.md): the former `¶` marker
+        // drew on every row with has_trailing_newline=true, which is
+        // ~99% of rows. Now common rows carry no marker at all; only
+        // EOF-no-newline rows get a Yellow `∅`. Pin the new default:
+        // normal rows must be glyph-free.
         let long_content: String = (0..120u8).map(|i| (b'a' + (i % 26)) as char).collect();
         let mut app = populated_app(vec![make_file(
             "a.rs",
@@ -2962,12 +3049,14 @@ mod tests {
 
         let view = render_to_string(&app, 80, 14);
         assert!(
-            view.contains("¶"),
-            "wrap mode should draw a ¶ newline marker:\n{view}"
+            !view.contains("¶"),
+            "v0.5 M2: `¶` must no longer appear on normal wrap rows:\n{view}"
         );
-        // The second half of the content must be visible — i.e. the
-        // line wrapped onto another visual row instead of being
-        // truncated at the viewport edge.
+        assert!(
+            !view.contains("∅"),
+            "no EOF marker when has_trailing_newline=true:\n{view}"
+        );
+        // The second half of the content must still be visible.
         assert!(
             view.contains(&long_content[90..110]),
             "expected wrapped continuation to be visible:\n{view}"
@@ -3056,7 +3145,10 @@ mod tests {
     }
 
     #[test]
-    fn wrap_mode_omits_newline_marker_when_diff_line_has_no_terminal_newline() {
+    fn wrap_mode_shows_eof_marker_when_no_terminal_newline() {
+        // v0.5 M2: has_trailing_newline=false is the git `\ No newline
+        // at end of file` case. The new EOF marker is `∅` in Yellow.
+        // Pin the *presence* of `∅` and the *absence* of the legacy `¶`.
         let long_content: String = (0..40u8).map(|i| (b'a' + (i % 26)) as char).collect();
         let mut file = make_file(
             "a.rs",
@@ -3072,13 +3164,39 @@ mod tests {
         app.wrap_lines = true;
         let view = render_to_string(&app, 40, 10);
         assert!(
-            !view.contains("¶"),
-            "wrap mode must not invent a newline marker for EOF-no-newline lines:\n{view}"
+            view.contains("∅"),
+            "EOF-no-newline must render a `∅` marker in wrap mode:\n{view}"
+        );
+        assert!(!view.contains("¶"), "legacy `¶` must be gone:\n{view}");
+    }
+
+    #[test]
+    fn nowrap_mode_shows_eof_marker_when_no_terminal_newline() {
+        // v0.5 M2: EOF-no-newline information is independent of wrap
+        // mode. The marker must appear in nowrap as well.
+        let mut file = make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "short")])],
+            100,
+        );
+        let DiffContent::Text(hunks) = &mut file.content else {
+            panic!("expected text diff");
+        };
+        hunks[0].lines[0].has_trailing_newline = false;
+
+        let mut app = populated_app(vec![file]);
+        app.wrap_lines = false;
+        let view = render_to_string(&app, 80, 10);
+        assert!(
+            view.contains("∅"),
+            "EOF-no-newline must render a `∅` marker in nowrap mode:\n{view}"
         );
     }
 
     #[test]
-    fn nowrap_mode_has_no_newline_marker() {
+    fn nowrap_mode_omits_marker_for_normal_line() {
+        // Symmetric to the wrap "normal row" test: no marker on a
+        // has_trailing_newline=true nowrap row.
         let mut app = populated_app(vec![make_file(
             "a.rs",
             vec![hunk(1, vec![diff_line(LineKind::Added, "short")])],
@@ -3087,8 +3205,8 @@ mod tests {
         app.wrap_lines = false;
         let view = render_to_string(&app, 80, 10);
         assert!(
-            !view.contains("¶"),
-            "nowrap mode should not draw newline markers:\n{view}"
+            !view.contains("¶") && !view.contains("∅"),
+            "normal nowrap row must carry no end-of-line marker:\n{view}"
         );
     }
 
@@ -3153,6 +3271,58 @@ mod tests {
     }
 
     #[test]
+    fn file_view_marks_eof_no_newline_on_last_line_nowrap() {
+        // v0.5 M2: when the on-disk file lacks a trailing LF, the
+        // file view must draw `∅` at the end of the final line.
+        // Non-last lines never get the marker, regardless of
+        // `last_line_has_trailing_newline`.
+        let mut app = fake_app();
+        app.file_view = Some(crate::app::FileViewState {
+            path: PathBuf::from("foo.rs"),
+            return_scroll: 0,
+            lines: vec!["first".into(), "tail-no-newline".into()],
+            line_bg: std::collections::HashMap::new(),
+            cursor: 1,
+            cursor_sub_row: 0,
+            scroll_top: 0,
+            anim: None,
+            visual_top: 0.0,
+            last_body_width: std::cell::Cell::new(1),
+            last_line_has_trailing_newline: false,
+        });
+        app.wrap_lines = false;
+        let view = render_to_string(&app, 40, 8);
+        assert!(
+            view.contains("∅"),
+            "file view must mark EOF-no-newline on the last line:\n{view}"
+        );
+    }
+
+    #[test]
+    fn file_view_omits_marker_when_last_line_has_newline() {
+        let mut app = fake_app();
+        app.file_view = Some(crate::app::FileViewState {
+            path: PathBuf::from("foo.rs"),
+            return_scroll: 0,
+            lines: vec!["first".into(), "last".into()],
+            line_bg: std::collections::HashMap::new(),
+            cursor: 1,
+            cursor_sub_row: 0,
+            scroll_top: 0,
+            anim: None,
+            visual_top: 0.0,
+            last_body_width: std::cell::Cell::new(1),
+            last_line_has_trailing_newline: true,
+        });
+        app.wrap_lines = false;
+        let view = render_to_string(&app, 40, 8);
+        assert!(
+            !view.contains("∅") && !view.contains("¶"),
+            "normal file must carry no EOF marker:\n{view}"
+        );
+    }
+
+    #[test]
     fn file_view_wrap_mode_renders_late_content_and_footer_indicator() {
         let long = format!("const DATA: &str = {:?};", "0123456789".repeat(12));
         let mut app = fake_app();
@@ -3167,6 +3337,7 @@ mod tests {
             anim: None,
             visual_top: 0.0,
             last_body_width: std::cell::Cell::new(1),
+            last_line_has_trailing_newline: true,
         });
         app.wrap_lines = true;
 
