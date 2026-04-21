@@ -4,6 +4,8 @@
 [![License: MIT](https://img.shields.io/crates/l/kizu.svg)](LICENSE)
 [![CI](https://github.com/annenpolka/kizu/actions/workflows/ci.yml/badge.svg)](https://github.com/annenpolka/kizu/actions/workflows/ci.yml)
 
+[English](README.md) | [日本語](README.ja.md)
+
 > Realtime diff monitor + inline scar review TUI for AI coding agents — Claude Code, Cursor, Codex, Qwen Code, Cline, Gemini.
 
 ![kizu demo](docs/media/demo.gif)
@@ -59,7 +61,7 @@ That alone solves the first friction: you stop losing the "wait, what?" moments.
 
 ### Three views
 
-kizu is a single TUI with three modes. `Tab` toggles between Main and Stream; `Enter` zooms into File. The _session baseline_ referenced below is the `HEAD` SHA at the moment you launched kizu (or the last `R` press), so "what changed" always means "what's changed since you started reviewing."
+kizu is a single TUI with three modes. `Tab` toggles between Main and Stream; `Enter` zooms into File. Press `?` at any time to open a help overlay with the full keybind list. The _session baseline_ referenced below is the `HEAD` SHA at the moment you launched kizu (or the last `R` press), so "what changed" always means "what's changed since you started reviewing."
 
 | Key | View | What you see |
 |-----|------|--------------|
@@ -99,12 +101,17 @@ The feedback path back to the agent has two channels:
 ### More
 
 - **`--attach`** — run `kizu --attach` from inside an agent pane to auto-split the terminal (tmux / zellij / kitty / Ghostty) and launch kizu in the new pane. Detection falls back to `$TMUX` → `$ZELLIJ` → `$KITTY_LISTEN_ON` → `$TERM_PROGRAM=ghostty`; override with `[attach].terminal` in the config.
-- **Search (`/` `n` `N`)** — smart-case search across the current view, `n` / `N` jump between matches with wrap-around.
+- **Seen / fold (`Space`)** — marks the current hunk as reviewed and collapses its body to just the header. If the hunk's content changes later, kizu fingerprints the previous body and auto-expands it so you never miss a follow-up edit. Purely TUI-local — nothing is written to the file.
+- **Search (`/` `n` `N`)** — smart-case search across the current view, with matches highlighted in the body. `n` / `N` jump between matches with wrap-around and show a position indicator.
+- **Line numbers (`#`)** — toggles a worktree-side line-number gutter in the Main and File views. Stream mode suppresses line numbers because its synthetic per-operation diffs don't correspond to real file line numbers. Default state and key are configurable (`[line_numbers].enabled`, `[keys].line_numbers_toggle`).
 - **Scar undo (`u`)** — a session-local stack that reverses just the most recent scar write, matching text-editor undo ergonomics.
 - **Baseline reset (`R`)** — rebinds the diff baseline to the current `HEAD`. Useful after you commit mid-session and want kizu to forget the already-reviewed changes.
 - **Follow (`f`)** — toggles whether kizu auto-scrolls to the newest change vs. keeps the cursor pinned.
+- **Help overlay (`?`)** — opens a two-column keybind reference. `?` / `Esc` / `q` closes it. The footer itself is responsive — on narrow terminals it collapses to status only, so the help overlay is the canonical key reference.
 
 ## Keybinds
+
+Press `?` inside kizu for the live two-column reference; the tables below mirror it.
 
 ### Scar
 | Key | Action |
@@ -114,7 +121,7 @@ The feedback path back to the agent has two channels:
 | `c` | Open comment input and insert a freeform `@kizu[free]:` scar |
 | `x` | Revert the current hunk (`git checkout -- <file>` at hunk scope) |
 | `e` | Open `$EDITOR` at the current hunk |
-| `Space` | Mark the current hunk as "seen" (dim it without writing a scar) |
+| `Space` | Mark the current hunk as seen — collapses the body to the header; auto-expands if the hunk changes later |
 | `u` | Undo the most recent scar insertion |
 
 ### Navigation
@@ -124,6 +131,8 @@ The feedback path back to the agent has two channels:
 | `k` / `↑` | Previous line |
 | `J` | Down one line (fine-grained) |
 | `K` | Up one line |
+| `Ctrl-d` | Half page down |
+| `Ctrl-u` | Half page up |
 | `g` | Top of diff |
 | `G` | Bottom of diff |
 | `h` | Previous file |
@@ -146,6 +155,8 @@ The feedback path back to the agent has two channels:
 | `w` | Toggle line wrap |
 | `z` | Toggle cursor placement style |
 | `f` | Toggle follow (auto-scroll) |
+| `#` | Toggle line-number gutter (Main + File view) |
+| `?` | Open help overlay |
 
 ### Session
 | Key | Action |
@@ -161,21 +172,22 @@ kizu reads `~/.config/kizu/config.toml` (override with `$KIZU_CONFIG`). Every fi
 # ~/.config/kizu/config.toml — all defaults shown
 
 [keys]
-ask              = "a"
-reject           = "r"
-comment          = "c"
-revert           = "x"
-editor           = "e"
-seen             = " "
-follow           = "f"
-search           = "/"
-search_next      = "n"
-search_prev      = "N"
-picker           = "s"
-reset_baseline   = "R"
-cursor_placement = "z"
-wrap_toggle      = "w"
-undo             = "u"
+ask                 = "a"
+reject              = "r"
+comment             = "c"
+revert              = "x"
+editor              = "e"
+seen                = " "
+follow              = "f"
+search              = "/"
+search_next         = "n"
+search_prev         = "N"
+picker              = "s"
+reset_baseline      = "R"
+cursor_placement    = "z"
+wrap_toggle         = "w"
+undo                = "u"
+line_numbers_toggle = "#"
 
 [colors]
 bg_added   = [10, 50, 10]    # dark green, delta-style
@@ -190,9 +202,12 @@ command = ""                  # empty = use $EDITOR
 
 [attach]
 terminal = ""                 # empty = auto-detect; "tmux" | "zellij" | "kitty" | "ghostty"
+
+[line_numbers]
+enabled = false               # start with the gutter off; `#` toggles at runtime
 ```
 
-Non-character keys (`Enter`, `Tab`, arrows) are not remappable.
+Non-character keys (`Enter`, `Tab`, arrows, `Ctrl-*`) are not remappable.
 
 ## AI agent integration
 
