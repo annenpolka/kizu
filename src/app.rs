@@ -270,6 +270,13 @@ pub struct App {
     /// each logical line so real newlines can be distinguished from
     /// wrap boundaries. Toggled by the `w` key.
     pub wrap_lines: bool,
+    /// Line-number gutter (v0.5). When `true`, the renderer prepends a
+    /// right-aligned `old | new` (diff view) or single-column (file
+    /// view) gutter next to the existing cursor bar. Stream mode
+    /// always suppresses this regardless of the flag because synthetic
+    /// `old_start`/`new_start` values are not real file line numbers.
+    /// Toggled by `#` (configurable via `keys.line_numbers_toggle`).
+    pub show_line_numbers: bool,
     /// Watcher backend health, tracked **separately** from
     /// `last_error` so that a successful one-off `git diff` recompute
     /// does not silently clear a live filesystem-watcher failure
@@ -667,6 +674,19 @@ pub struct ScrollLayout {
     /// press flows into the next run even when that run lives in a
     /// different file.
     pub change_runs: Vec<(usize, usize)>,
+    /// v0.5: parallel Vec to `rows`. For every `RowKind::DiffLine`, the
+    /// corresponding slot holds `Some((old_line_number, new_line_number))`
+    /// as computed by [`crate::git::line_numbers_for`]. All other row
+    /// kinds carry `None`. `build_layout` fills this in the same pass
+    /// that pushes rows so renderer cost stays O(viewport) regardless
+    /// of hunk size.
+    pub diff_line_numbers: Vec<Option<(Option<usize>, Option<usize>)>>,
+    /// v0.5: largest line number (either `old` or `new`) among all
+    /// **visible** DiffLine rows. Seen (collapsed) hunks are excluded
+    /// because their rows are not in `rows`. Clamped to a lower bound
+    /// of 10 so the gutter stays at a minimum of 2 digits and doesn't
+    /// flicker between 1- and 2-digit widths for tiny files.
+    pub max_line_number: usize,
 }
 
 /// Default body height assumed before the first render has had a chance
@@ -1250,6 +1270,7 @@ impl App {
             visual_top: Cell::new(0.0),
             anim: None,
             wrap_lines: false,
+            show_line_numbers: config.line_numbers.enabled,
             watcher_health: WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
             config,
@@ -1321,6 +1342,45 @@ impl App {
         // new coordinate system.
         self.cursor_sub_row = 0;
         self.reflow_file_view_after_wrap_toggle();
+    }
+
+    /// Toggle the line-number gutter (v0.5). `#` calls this (or
+    /// whatever `keys.line_numbers_toggle` is mapped to). Only affects
+    /// diff view and file view — Stream mode always suppresses the
+    /// gutter regardless of the flag.
+    ///
+    /// Rebuilds the layout (to refresh `diff_line_numbers` / `max_line_number`)
+    /// and reflows the file view (so `FileViewVisualIndex` matches the
+    /// new body_width). Codex adversarial review §Important-2 flagged
+    /// that skipping either step leaves stale derived state.
+    pub fn toggle_line_numbers(&mut self) {
+        self.show_line_numbers = !self.show_line_numbers;
+        self.build_layout();
+        self.reflow_file_view_after_width_change();
+    }
+
+    /// Reflow the file view after the effective body width changed
+    /// (line-number toggle, Stream mode switch, future window resize).
+    /// Mirrors [`Self::reflow_file_view_after_wrap_toggle`] but keys
+    /// off width instead of the wrap flag. The gutter width is
+    /// computed fresh each frame by the renderer from
+    /// [`Self::show_line_numbers`] + `fv.lines.len()`, so here we only
+    /// need to drop stale intra-row offsets and re-center the
+    /// viewport against the current visual index.
+    fn reflow_file_view_after_width_change(&mut self) {
+        let viewport_height = self.last_body_height.get().max(1);
+        let wrap_lines = self.wrap_lines;
+        let Some(fv) = self.file_view.as_mut() else {
+            return;
+        };
+        fv.cursor_sub_row = 0;
+        let body_width = wrap_lines.then_some(fv.last_body_width.get().max(1));
+        let vi = FileViewVisualIndex::build(&fv.lines, body_width);
+        let cursor_y = vi.visual_y(fv.cursor);
+        let max_top = vi.total_visual().saturating_sub(1);
+        fv.scroll_top = cursor_y.saturating_sub(viewport_height / 2).min(max_top);
+        fv.anim = None;
+        fv.visual_top = fv.scroll_top as f32;
     }
 
     /// Toggle between Diff and Stream view modes. Rebuilds `files`
@@ -2063,6 +2123,8 @@ impl App {
                     self.toggle_cursor_placement();
                 } else if ch == k.wrap_toggle {
                     self.toggle_wrap_lines();
+                } else if ch == k.line_numbers_toggle {
+                    self.toggle_line_numbers();
                 } else if ch == k.undo {
                     self.undo_scar();
                 }
@@ -3195,6 +3257,8 @@ impl App {
                     self.open_scar_comment();
                 } else if ch == k.wrap_toggle {
                     self.toggle_wrap_lines();
+                } else if ch == k.line_numbers_toggle {
+                    self.toggle_line_numbers();
                 } else if ch == k.undo {
                     self.undo_scar();
                 }
@@ -3840,15 +3904,18 @@ impl App {
             file_first_hunk: vec![None; self.files.len()],
             ..ScrollLayout::default()
         };
+        let mut max_line_number: usize = 0;
 
         for (file_idx, file) in self.files.iter().enumerate() {
             let header_row = layout.rows.len();
             layout.rows.push(RowKind::FileHeader { file_idx });
+            layout.diff_line_numbers.push(None);
 
             match &file.content {
                 DiffContent::Binary => {
                     let notice_row = layout.rows.len();
                     layout.rows.push(RowKind::BinaryNotice { file_idx });
+                    layout.diff_line_numbers.push(None);
                     layout.file_first_hunk[file_idx] = Some(notice_row);
                 }
                 DiffContent::Text(hunks) => {
@@ -3863,6 +3930,7 @@ impl App {
                         for (hunk_idx, hunk) in hunks.iter().enumerate() {
                             let row = layout.rows.len();
                             layout.rows.push(RowKind::HunkHeader { file_idx, hunk_idx });
+                            layout.diff_line_numbers.push(None);
                             layout.hunk_starts.push(row);
                             // v0.4: seen hunks collapse — omit their
                             // DiffLine rows from the layout so only
@@ -3876,12 +3944,49 @@ impl App {
                                 hunk_fingerprint(hunk),
                             );
                             if !is_seen {
-                                for line_idx in 0..hunk.lines.len() {
+                                // v0.5: inline the old/new counter walk
+                                // so the whole hunk is O(n). Calling
+                                // `line_numbers_for` per line is
+                                // O(line_idx) each, which compounds to
+                                // O(n²) for large hunks (Codex 3rd-round
+                                // Important-4).
+                                let mut old = hunk.old_start;
+                                let mut new = hunk.new_start;
+                                for (line_idx, line) in hunk.lines.iter().enumerate() {
                                     layout.rows.push(RowKind::DiffLine {
                                         file_idx,
                                         hunk_idx,
                                         line_idx,
                                     });
+                                    let pair = match line.kind {
+                                        crate::git::LineKind::Context => {
+                                            let p = (Some(old), Some(new));
+                                            old += 1;
+                                            new += 1;
+                                            p
+                                        }
+                                        crate::git::LineKind::Added => {
+                                            let p = (None, Some(new));
+                                            new += 1;
+                                            p
+                                        }
+                                        crate::git::LineKind::Deleted => {
+                                            let p = (Some(old), None);
+                                            old += 1;
+                                            p
+                                        }
+                                    };
+                                    if let Some(n) = pair.0
+                                        && n > max_line_number
+                                    {
+                                        max_line_number = n;
+                                    }
+                                    if let Some(n) = pair.1
+                                        && n > max_line_number
+                                    {
+                                        max_line_number = n;
+                                    }
+                                    layout.diff_line_numbers.push(Some(pair));
                                 }
                             }
                         }
@@ -3890,7 +3995,13 @@ impl App {
             }
 
             layout.rows.push(RowKind::Spacer);
+            layout.diff_line_numbers.push(None);
         }
+
+        // Lower bound of 10 keeps the gutter at a stable minimum of
+        // 2 digits so tiny files don't flicker between 1- and 2-digit
+        // widths as hunks get added.
+        layout.max_line_number = max_line_number.max(10);
 
         // Fill the file_of_row map by walking rows once.
         layout.file_of_row = layout
@@ -4676,6 +4787,7 @@ mod tests {
             visual_top: Cell::new(0.0),
             anim: None,
             wrap_lines: false,
+            show_line_numbers: false,
             watcher_health: WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
             config: crate::config::KizuConfig::default(),
@@ -5689,6 +5801,215 @@ mod tests {
         assert!(app.wrap_lines);
         app.handle_key(key(KeyCode::Char('w')));
         assert!(!app.wrap_lines);
+    }
+
+    // ---- line numbers toggle (v0.5) -----------------------------------
+
+    #[test]
+    fn toggle_line_numbers_defaults_off_and_round_trips() {
+        // v0.5 plan: default is OFF so v0.4 layout stays stable for
+        // users who don't opt in.
+        let mut app = fake_app(vec![]);
+        assert!(!app.show_line_numbers);
+        app.toggle_line_numbers();
+        assert!(app.show_line_numbers);
+        app.toggle_line_numbers();
+        assert!(!app.show_line_numbers);
+    }
+
+    #[test]
+    fn pound_key_toggles_line_numbers_in_diff_view() {
+        let mut app = fake_app(vec![]);
+        app.handle_key(key(KeyCode::Char('#')));
+        assert!(app.show_line_numbers);
+        app.handle_key(key(KeyCode::Char('#')));
+        assert!(!app.show_line_numbers);
+    }
+
+    #[test]
+    fn build_layout_populates_diff_line_numbers_parallel_to_rows() {
+        // v0.5 plan Decision Log: diff_line_numbers is a Vec parallel
+        // to `rows`. RowKind::DiffLine positions carry Some((old, new));
+        // all other rows (FileHeader, HunkHeader, Spacer, BinaryNotice)
+        // carry None.
+        let mut app = fake_app(vec![make_file(
+            "foo.rs",
+            vec![hunk(
+                10,
+                vec![
+                    diff_line(LineKind::Added, "a"),
+                    diff_line(LineKind::Added, "b"),
+                ],
+            )],
+            100,
+        )]);
+        app.build_layout();
+        let ln = &app.layout.diff_line_numbers;
+        assert_eq!(
+            ln.len(),
+            app.layout.rows.len(),
+            "diff_line_numbers must run parallel to rows"
+        );
+        for (i, row) in app.layout.rows.iter().enumerate() {
+            match row {
+                RowKind::DiffLine { .. } => assert!(
+                    ln[i].is_some(),
+                    "DiffLine row {i} must have a cached line-number pair"
+                ),
+                _ => assert!(ln[i].is_none(), "non-DiffLine row {i} must have None"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_layout_caches_correct_line_numbers_for_added_rows() {
+        // hunk(10, [Added a, Added b]) under the fixture above uses
+        // old_start=10, new_start=10, old_count=0, new_count=2.
+        // Added #1 → (None, Some(10)); Added #2 → (None, Some(11)).
+        let mut app = fake_app(vec![make_file(
+            "foo.rs",
+            vec![hunk(
+                10,
+                vec![
+                    diff_line(LineKind::Added, "a"),
+                    diff_line(LineKind::Added, "b"),
+                ],
+            )],
+            100,
+        )]);
+        app.build_layout();
+        let diff_rows: Vec<_> = app
+            .layout
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| matches!(row, RowKind::DiffLine { .. }).then_some(i))
+            .collect();
+        assert_eq!(diff_rows.len(), 2);
+        assert_eq!(
+            app.layout.diff_line_numbers[diff_rows[0]],
+            Some((None, Some(10)))
+        );
+        assert_eq!(
+            app.layout.diff_line_numbers[diff_rows[1]],
+            Some((None, Some(11)))
+        );
+    }
+
+    #[test]
+    fn build_layout_max_line_number_covers_visible_rows() {
+        // Single hunk with 3 rows starting at new_start=100 →
+        // max_line_number must be >= 102.
+        let mut app = fake_app(vec![make_file(
+            "foo.rs",
+            vec![hunk(
+                100,
+                vec![
+                    diff_line(LineKind::Added, "a"),
+                    diff_line(LineKind::Added, "b"),
+                    diff_line(LineKind::Added, "c"),
+                ],
+            )],
+            100,
+        )]);
+        app.build_layout();
+        assert_eq!(
+            app.layout.max_line_number, 102,
+            "max should be the largest line number actually rendered"
+        );
+    }
+
+    #[test]
+    fn build_layout_max_line_number_has_lower_bound_of_10() {
+        // Tiny file with line numbers 1-3 should still clamp to 10 so
+        // the gutter width stays at a stable minimum of 2 digits.
+        let mut app = fake_app(vec![make_file(
+            "foo.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
+            100,
+        )]);
+        app.build_layout();
+        assert!(
+            app.layout.max_line_number >= 10,
+            "got {}, expected lower bound 10",
+            app.layout.max_line_number
+        );
+    }
+
+    #[test]
+    fn build_layout_max_line_number_excludes_seen_hunks() {
+        // v0.5 plan §Important-1 (Codex review): a seen (collapsed)
+        // hunk contributes no DiffLine rows, so its line numbers must
+        // not widen the gutter. Put the big-number hunk behind a seen
+        // mark and assert max stays bounded by the visible hunk.
+        let hunk1 = hunk(
+            10,
+            vec![
+                diff_line(LineKind::Added, "a"),
+                diff_line(LineKind::Added, "b"),
+            ],
+        );
+        let hunk2 = hunk(5000, vec![diff_line(LineKind::Added, "z")]);
+        let mut app = fake_app(vec![make_file("foo.rs", vec![hunk1, hunk2.clone()], 100)]);
+        // Mark hunk2 seen so it collapses out of the layout.
+        let path = app.files[0].path.clone();
+        let fp = hunk_fingerprint(&hunk2);
+        app.seen_hunks.insert((path, 5000), fp);
+
+        app.build_layout();
+        assert!(
+            app.layout.max_line_number < 1000,
+            "seen hunk must not contribute to max; got {}",
+            app.layout.max_line_number
+        );
+    }
+
+    #[test]
+    fn toggle_line_numbers_triggers_layout_rebuild() {
+        // v0.5 plan Decision Log: `toggle_line_numbers` must rebuild
+        // the layout so max_line_number and the parallel number cache
+        // stay coherent with `show_line_numbers` (Phase CD).
+        let mut app = fake_app(vec![make_file(
+            "foo.rs",
+            vec![hunk(10, vec![diff_line(LineKind::Added, "a")])],
+            100,
+        )]);
+        // Baseline: build_layout populated the cache.
+        assert!(!app.layout.diff_line_numbers.is_empty());
+        // Corrupt the layout so we can detect a rebuild on toggle.
+        app.layout.diff_line_numbers.clear();
+        app.layout.max_line_number = 0;
+        app.toggle_line_numbers();
+        assert!(
+            !app.layout.diff_line_numbers.is_empty(),
+            "toggle must rebuild the parallel number cache"
+        );
+        assert!(
+            app.layout.max_line_number >= 10,
+            "toggle must recompute max_line_number"
+        );
+    }
+
+    #[test]
+    fn pound_key_toggles_line_numbers_in_file_view() {
+        // v0.5 plan §Step 4. `#` must also work inside the file view
+        // (which has its own KeyCode::Char dispatch block).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (mut app, _abs) = revert_app_with_real_repo(
+            &tmp,
+            "foo.rs",
+            "fn one() {}\n",
+            "fn one() {}\nfn two() {}\n",
+        );
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.file_view.is_some(), "precondition: in file view");
+        assert!(!app.show_line_numbers);
+        app.handle_key(key(KeyCode::Char('#')));
+        assert!(
+            app.show_line_numbers,
+            "# must toggle line numbers from the file-view dispatch"
+        );
     }
 
     #[test]

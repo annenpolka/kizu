@@ -77,7 +77,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         } else {
             fv.scroll_top
         };
-        render_file_view(frame, main, fv, app.wrap_lines, Some(hl), effective_top);
+        render_file_view(
+            frame,
+            main,
+            fv,
+            app.wrap_lines,
+            app.show_line_numbers,
+            Some(hl),
+            effective_top,
+        );
     } else if app.files.is_empty() {
         render_empty(frame, main, app);
     } else {
@@ -182,20 +190,50 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cursor_row = app.scroll;
     let now = std::time::Instant::now();
 
+    // v0.5: determine the effective line-number gutter width and
+    // decide whether we can actually draw it given the viewport size.
+    // Single-source-of-truth body_width calc (Codex review §Critical-1):
+    // every downstream consumer — `VisualIndex`, `wrap_at_chars`, the
+    // numbered renderers — receives the exact same width this block
+    // computes.
+    let aw = area.width as usize;
+    let mut effective_show_ln =
+        app.show_line_numbers && app.view_mode != crate::app::ViewMode::Stream;
+    let digits = line_number_digits(app.layout.max_line_number);
+    // Single-column gutter for both diff and file view (2026-04-21
+    // feedback: two columns read as "duplicated").
+    let mut ln_gutter_width = if effective_show_ln {
+        LineNumberGutter::single(digits).total_width
+    } else {
+        0
+    };
+    // Extreme-narrow fallback: if the viewport can't even fit the
+    // gutter + 4 body cells, drop the gutter so the user still gets
+    // diff content instead of an empty body strip.
+    if effective_show_ln && aw < 5 + ln_gutter_width + 4 {
+        effective_show_ln = false;
+        ln_gutter_width = 0;
+    }
+    let ln_gutter = if effective_show_ln {
+        LineNumberGutter::single(digits)
+    } else {
+        LineNumberGutter::single(0)
+    };
+
     // In wrap mode we reserve 6 cells per row: 5 for the left bar,
     // 1 for the `¶` newline marker (ADR-0014 dropped the `+`/`-`
     // prefix column). Compute this *before* calling
     // `viewport_placement` because the placement math needs the wrap
     // body width to produce a correct `VisualIndex`.
     let wrap_body_width: Option<usize> = if app.wrap_lines {
-        Some((area.width as usize).saturating_sub(6).max(1))
+        Some(aw.saturating_sub(6 + ln_gutter_width).max(1))
     } else {
         None
     };
     // Nowrap mode still needs a body width so the diff row
     // background color can extend to the viewport edge. 5 cells for
     // the left bar, the rest is body.
-    let nowrap_body_width: usize = (area.width as usize).saturating_sub(5).max(1);
+    let nowrap_body_width: usize = aw.saturating_sub(5 + ln_gutter_width).max(1);
 
     // Sticky header decision (ADR-0009 fix):
     //
@@ -320,6 +358,9 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             bg_added: app.config.colors.bg_added_color(),
             bg_deleted: app.config.colors.bg_deleted_color(),
             search: app.search.as_ref(),
+            effective_show_ln,
+            diff_line_numbers: &app.layout.diff_line_numbers,
+            ln_gutter,
         };
         let row_lines = render_row(row_idx, &app.layout.rows[row_idx], &ctx);
         let mut take = row_lines.into_iter();
@@ -380,6 +421,14 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             false,
             app.hunk_is_seen(file_idx, hunk_idx),
         );
+        // v0.5: sticky header also needs the blank gutter so its body
+        // lines up with the scrolling DiffLine bodies underneath
+        // (Codex 3rd-round Important-1).
+        let line = if effective_show_ln {
+            insert_blank_gutter(line, &ln_gutter)
+        } else {
+            line
+        };
         frame.render_widget(Paragraph::new(line), header_rect);
     }
 }
@@ -475,6 +524,18 @@ struct RowRenderCtx<'a> {
     /// match byte ranges with the overlay (see `apply_search_overlay`).
     /// `None` skips the overlay entirely.
     search: Option<&'a crate::app::SearchState>,
+    /// v0.5: effective line-number state. `true` only when
+    /// `app.show_line_numbers` is on AND the current view mode is not
+    /// Stream (Stream suppresses the gutter because its synthetic
+    /// `old_start`/`new_start` are not real file line numbers).
+    effective_show_ln: bool,
+    /// Per-row cached `(old, new)` line numbers. Parallel to
+    /// `app.layout.rows`; `None` for non-DiffLine rows.
+    diff_line_numbers: &'a [Option<(Option<usize>, Option<usize>)>],
+    /// Gutter geometry. Fields are all zero when `effective_show_ln`
+    /// is false (either because the flag is off or because the
+    /// viewport is too narrow to reserve a gutter).
+    ln_gutter: LineNumberGutter,
 }
 
 /// Classification of a single character position against the active
@@ -518,14 +579,19 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
     let hl = ctx.hl;
     match row {
         RowKind::FileHeader { file_idx } => {
-            vec![render_file_header(&files[*file_idx], cursor_sub.is_some())]
+            let line = render_file_header(&files[*file_idx], cursor_sub.is_some());
+            if ctx.effective_show_ln {
+                vec![insert_blank_gutter(line, &ctx.ln_gutter)]
+            } else {
+                vec![line]
+            }
         }
         RowKind::HunkHeader { file_idx, hunk_idx } => {
             let DiffContent::Text(hunks) = &files[*file_idx].content else {
                 return vec![Line::raw("")];
             };
             let is_selected = selected_hunk == Some((*file_idx, *hunk_idx));
-            vec![render_hunk_header(
+            let line = render_hunk_header(
                 &hunks[*hunk_idx],
                 is_selected,
                 cursor_sub.is_some(),
@@ -535,7 +601,12 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
                     hunks[*hunk_idx].old_start,
                     crate::app::hunk_fingerprint(&hunks[*hunk_idx]),
                 ),
-            )]
+            );
+            if ctx.effective_show_ln {
+                vec![insert_blank_gutter(line, &ctx.ln_gutter)]
+            } else {
+                vec![line]
+            }
         }
         RowKind::DiffLine {
             file_idx,
@@ -552,41 +623,137 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
             // is_current) tuples so the renderer doesn't need to walk
             // SearchState.current for every span.
             let search_matches = row_search_matches(ctx.search, row_idx);
-            match wrap_body_width {
-                Some(width) => render_diff_line_wrapped(
-                    line,
-                    is_selected,
-                    cursor_sub,
-                    width,
-                    hl,
-                    Some(&files[*file_idx].path),
-                    ctx.bg_added,
-                    ctx.bg_deleted,
-                    &search_matches,
-                ),
-                None => vec![render_diff_line(
-                    line,
-                    is_selected,
-                    is_cursor,
-                    nowrap_body_width,
-                    hl,
-                    Some(&files[*file_idx].path),
-                    ctx.bg_added,
-                    ctx.bg_deleted,
-                    &search_matches,
-                )],
+            // v0.5: route through the *_numbered variants when the
+            // line-number gutter is on. The cache built by
+            // build_layout (`diff_line_numbers[row_idx]`) is Some for
+            // every DiffLine row so the unwrap_or fallback is just
+            // defensive.
+            if ctx.effective_show_ln {
+                let pair = ctx
+                    .diff_line_numbers
+                    .get(row_idx)
+                    .copied()
+                    .flatten()
+                    .unwrap_or((None, None));
+                match wrap_body_width {
+                    Some(width) => render_diff_line_wrapped_numbered(
+                        line,
+                        is_selected,
+                        cursor_sub,
+                        width,
+                        hl,
+                        Some(&files[*file_idx].path),
+                        ctx.bg_added,
+                        ctx.bg_deleted,
+                        &search_matches,
+                        pair,
+                        &ctx.ln_gutter,
+                    ),
+                    None => vec![render_diff_line_numbered(
+                        line,
+                        is_selected,
+                        is_cursor,
+                        nowrap_body_width,
+                        hl,
+                        Some(&files[*file_idx].path),
+                        ctx.bg_added,
+                        ctx.bg_deleted,
+                        &search_matches,
+                        pair,
+                        &ctx.ln_gutter,
+                    )],
+                }
+            } else {
+                match wrap_body_width {
+                    Some(width) => render_diff_line_wrapped(
+                        line,
+                        is_selected,
+                        cursor_sub,
+                        width,
+                        hl,
+                        Some(&files[*file_idx].path),
+                        ctx.bg_added,
+                        ctx.bg_deleted,
+                        &search_matches,
+                    ),
+                    None => vec![render_diff_line(
+                        line,
+                        is_selected,
+                        is_cursor,
+                        nowrap_body_width,
+                        hl,
+                        Some(&files[*file_idx].path),
+                        ctx.bg_added,
+                        ctx.bg_deleted,
+                        &search_matches,
+                    )],
+                }
             }
         }
-        RowKind::BinaryNotice { .. } => vec![Line::from(Span::styled(
-            if cursor_sub.is_some() {
-                "  ▶    [binary file - diff suppressed]"
+        RowKind::BinaryNotice { .. } => {
+            let line = Line::from(Span::styled(
+                if cursor_sub.is_some() {
+                    "  ▶    [binary file - diff suppressed]"
+                } else {
+                    "       [binary file - diff suppressed]"
+                },
+                Style::default().fg(Color::DarkGray),
+            ));
+            if ctx.effective_show_ln {
+                // BinaryNotice builds its own 5-cell bar + 2-cell pad
+                // inline, so the gutter slot has to be spliced in by
+                // splitting the single span at x=5.
+                vec![insert_blank_gutter_at(line, &ctx.ln_gutter, 5)]
             } else {
-                "       [binary file - diff suppressed]"
-            },
-            Style::default().fg(Color::DarkGray),
-        ))],
+                vec![line]
+            }
+        }
         RowKind::Spacer => vec![Line::raw("")],
     }
+}
+
+/// Insert a blank line-number gutter span directly after the first
+/// span of `line` (which is the 5-cell cursor bar for DiffLine /
+/// HunkHeader rows, or the 2-cell bar for FileHeader rows). Keeps
+/// the non-DiffLine row bodies horizontally aligned with DiffLine
+/// bodies when the gutter is on.
+fn insert_blank_gutter(line: Line<'static>, gutter: &LineNumberGutter) -> Line<'static> {
+    let mut spans = line.spans;
+    let head = if spans.is_empty() {
+        Span::raw("")
+    } else {
+        spans.remove(0)
+    };
+    let mut new_spans = Vec::with_capacity(spans.len() + 2);
+    new_spans.push(head);
+    new_spans.push(gutter.blank_span());
+    new_spans.extend(spans);
+    Line::from(new_spans)
+}
+
+/// Splice a blank gutter span after the first `split_at` cells of
+/// `line`'s single-span content. Used for BinaryNotice which packs
+/// its bar + pad + body into one `Span` literal.
+fn insert_blank_gutter_at(
+    line: Line<'static>,
+    gutter: &LineNumberGutter,
+    split_at: usize,
+) -> Line<'static> {
+    let mut spans = line.spans;
+    if spans.is_empty() {
+        return Line::from(vec![gutter.blank_span()]);
+    }
+    let first = spans.remove(0);
+    let text = first.content.as_ref();
+    let (head, tail) = text.split_at(split_at.min(text.len()));
+    let head_span = Span::styled(head.to_string(), first.style);
+    let tail_span = Span::styled(tail.to_string(), first.style);
+    let mut new_spans = Vec::with_capacity(spans.len() + 3);
+    new_spans.push(head_span);
+    new_spans.push(gutter.blank_span());
+    new_spans.push(tail_span);
+    new_spans.extend(spans);
+    Line::from(new_spans)
 }
 
 /// Project the global `SearchState.matches` onto a single layout row.
@@ -875,6 +1042,248 @@ fn render_file_header(file: &FileDiff, is_cursor: bool) -> Line<'static> {
     Line::from(spans)
 }
 
+// ---- v0.5 line-number gutter ----------------------------------------
+
+/// Width configuration for the line-number gutter (v0.5).
+///
+/// Single-column format for both diff view and file view: `" N "` —
+/// 1-cell leading pad, right-aligned number column, 1-cell trailing
+/// pad. Earlier revisions used a two-column `OLD|NEW` layout, but
+/// user feedback (2026-04-21) was that the doubled numbers on every
+/// Context row ("13 13", "14 14", …) looked like a bug ("二重表示").
+/// The single column shows only the worktree (new) line number
+/// (Context/Added), and Deleted rows get a blank gutter because the
+/// line no longer exists in the worktree — mixing `old` baseline
+/// numbers in the same column broke monotonicity when earlier hunks
+/// shifted subsequent hunks by N lines.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LineNumberGutter {
+    pub total_width: usize,
+    pub col_width: usize,
+}
+
+impl LineNumberGutter {
+    /// Single-column gutter with the given column width.
+    pub fn single(col_width: usize) -> Self {
+        Self {
+            total_width: 1 + col_width + 1,
+            col_width,
+        }
+    }
+
+    /// Return a blank span of the full gutter width. Used for wrap
+    /// continuation rows and for non-DiffLine rows (HunkHeader,
+    /// BinaryNotice, Spacer) that still need the gutter column
+    /// reserved so downstream body rendering lines up.
+    fn blank_span(&self) -> Span<'static> {
+        Span::raw(" ".repeat(self.total_width))
+    }
+}
+
+/// Diff-view line-number gutter span. Shows the worktree (new-side)
+/// line number only:
+///
+/// - Context → new (the line exists in the current worktree)
+/// - Added   → new (same)
+/// - Deleted → blank (the line no longer exists in the worktree, so
+///   there is no "current" line number to show)
+///
+/// Earlier revisions mixed `old` and `new` values in the same column
+/// so Deleted rows would still render a number. User feedback
+/// (2026-04-21) pointed out that when *earlier* hunks in the same
+/// file shift N lines, the old-side baseline number on a Deleted row
+/// and the new-side worktree number on an adjacent Added row diverge
+/// by N, breaking the intuition that "the gutter tracks the file I'm
+/// looking at". Showing only the worktree side keeps the column
+/// monotonic.
+fn diff_ln_span(pair: (Option<usize>, Option<usize>), gutter: &LineNumberGutter) -> Span<'static> {
+    let num = match pair.1 {
+        Some(v) => format!("{v:>w$}", w = gutter.col_width),
+        None => " ".repeat(gutter.col_width),
+    };
+    Span::styled(
+        format!(" {num} "),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )
+}
+
+/// File-view single-column line-number gutter span.
+fn file_ln_span(line_number: usize, gutter: &LineNumberGutter) -> Span<'static> {
+    Span::styled(
+        format!(" {n:>w$} ", n = line_number, w = gutter.col_width),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )
+}
+
+/// Wrap an existing diff-line render with a line-number gutter span
+/// inserted directly after the 5-cell cursor bar. Keeps the existing
+/// [`render_diff_line`] as the single source of truth for body
+/// rendering (ADR-style rule: no code duplication for syntax / search
+/// overlay / background padding).
+#[allow(clippy::too_many_arguments)]
+fn render_diff_line_numbered(
+    line: &crate::git::DiffLine,
+    is_selected: bool,
+    is_cursor: bool,
+    body_width: usize,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: Option<&std::path::Path>,
+    bg_added: Color,
+    bg_deleted: Color,
+    search_matches: &[(usize, usize, bool)],
+    line_numbers: (Option<usize>, Option<usize>),
+    gutter: &LineNumberGutter,
+) -> Line<'static> {
+    let base = render_diff_line(
+        line,
+        is_selected,
+        is_cursor,
+        body_width,
+        hl,
+        file_path,
+        bg_added,
+        bg_deleted,
+        search_matches,
+    );
+    let mut spans = base.spans;
+    let bar = if spans.is_empty() {
+        Span::raw("     ")
+    } else {
+        spans.remove(0)
+    };
+    let ln = diff_ln_span(line_numbers, gutter);
+    let mut new_spans = Vec::with_capacity(spans.len() + 2);
+    new_spans.push(bar);
+    new_spans.push(ln);
+    new_spans.extend(spans);
+    Line::from(new_spans)
+}
+
+/// Wrap-mode variant. Continuation rows (`i > 0`) get a blank gutter
+/// so the number isn't repeated on every visual sub-row (plan
+/// Decision Log: Codex review alignment with delta / bat).
+#[allow(clippy::too_many_arguments)]
+fn render_diff_line_wrapped_numbered(
+    line: &crate::git::DiffLine,
+    is_selected: bool,
+    cursor_sub: Option<usize>,
+    body_width: usize,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: Option<&std::path::Path>,
+    bg_added: Color,
+    bg_deleted: Color,
+    search_matches: &[(usize, usize, bool)],
+    line_numbers: (Option<usize>, Option<usize>),
+    gutter: &LineNumberGutter,
+) -> Vec<Line<'static>> {
+    let base = render_diff_line_wrapped(
+        line,
+        is_selected,
+        cursor_sub,
+        body_width,
+        hl,
+        file_path,
+        bg_added,
+        bg_deleted,
+        search_matches,
+    );
+    base.into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let mut spans = line.spans;
+            let bar = if spans.is_empty() {
+                Span::raw("     ")
+            } else {
+                spans.remove(0)
+            };
+            let ln = if i == 0 {
+                diff_ln_span(line_numbers, gutter)
+            } else {
+                gutter.blank_span()
+            };
+            let mut new_spans = Vec::with_capacity(spans.len() + 2);
+            new_spans.push(bar);
+            new_spans.push(ln);
+            new_spans.extend(spans);
+            Line::from(new_spans)
+        })
+        .collect()
+}
+
+/// File-view line with a single-column line-number gutter.
+#[allow(clippy::too_many_arguments)]
+fn render_file_view_line_numbered(
+    content: &str,
+    is_cursor: bool,
+    body_width: usize,
+    base_style: Style,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: &std::path::Path,
+    line_number: usize,
+    gutter: &LineNumberGutter,
+) -> Line<'static> {
+    let base = render_file_view_line(content, is_cursor, body_width, base_style, hl, file_path);
+    let mut spans = base.spans;
+    let bar = if spans.is_empty() {
+        Span::raw("     ")
+    } else {
+        spans.remove(0)
+    };
+    let ln = file_ln_span(line_number, gutter);
+    let mut new_spans = Vec::with_capacity(spans.len() + 2);
+    new_spans.push(bar);
+    new_spans.push(ln);
+    new_spans.extend(spans);
+    Line::from(new_spans)
+}
+
+/// Wrap-mode file-view variant. Continuation rows get a blank gutter.
+#[allow(clippy::too_many_arguments)]
+fn render_file_view_line_wrapped_numbered(
+    content: &str,
+    cursor_sub: Option<usize>,
+    body_width: usize,
+    base_style: Style,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: &std::path::Path,
+    line_number: usize,
+    gutter: &LineNumberGutter,
+) -> Vec<Line<'static>> {
+    let base =
+        render_file_view_line_wrapped(content, cursor_sub, body_width, base_style, hl, file_path);
+    base.into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let mut spans = line.spans;
+            let bar = if spans.is_empty() {
+                Span::raw("     ")
+            } else {
+                spans.remove(0)
+            };
+            let ln = if i == 0 {
+                file_ln_span(line_number, gutter)
+            } else {
+                gutter.blank_span()
+            };
+            let mut new_spans = Vec::with_capacity(spans.len() + 2);
+            new_spans.push(bar);
+            new_spans.push(ln);
+            new_spans.extend(spans);
+            Line::from(new_spans)
+        })
+        .collect()
+}
+
+/// Compute the line-number gutter width for a given max line number.
+/// 10 is the lower bound so tiny files stay at a stable 2 digits.
+pub(crate) fn line_number_digits(max: usize) -> usize {
+    max.max(10).to_string().len()
+}
+
 fn render_hunk_header(
     hunk: &Hunk,
     is_selected: bool,
@@ -901,8 +1310,21 @@ fn render_hunk_header(
     let counts = format!("+{added}/-{deleted}");
 
     // Line range: show new_start (where the change lands in the
-    // current file). For multi-line hunks, show the range end.
-    let line_range = if hunk.new_count > 1 {
+    // current file). For pure deletion (new_count == 0) the new side
+    // has no range, so fall back to the baseline (old) range so the
+    // header stays a useful positional signal — especially since v0.5
+    // Deleted rows have a blank gutter (Codex 3rd-round Important-3).
+    let line_range = if hunk.new_count == 0 {
+        if hunk.old_count > 1 {
+            format!(
+                "L{}-{}",
+                hunk.old_start,
+                hunk.old_start + hunk.old_count - 1
+            )
+        } else {
+            format!("L{}", hunk.old_start)
+        }
+    } else if hunk.new_count > 1 {
         format!(
             "L{}-{}",
             hunk.new_start,
@@ -1140,12 +1562,32 @@ fn render_file_view(
     area: Rect,
     fv: &crate::app::FileViewState,
     wrap_lines: bool,
+    show_line_numbers: bool,
     hl: Option<&crate::highlight::Highlighter>,
     effective_top: usize,
 ) {
     let height = area.height as usize;
     let width = area.width as usize;
-    let body_width = width.saturating_sub(5).max(1);
+    // v0.5: mirror render_scroll's single-source body_width calc so
+    // FileViewVisualIndex and the numbered renderer see the same value
+    // (Codex review §Critical-1).
+    let mut effective_show_ln = show_line_numbers;
+    let digits = line_number_digits(fv.lines.len());
+    let mut ln_gutter_width = if effective_show_ln {
+        LineNumberGutter::single(digits).total_width
+    } else {
+        0
+    };
+    if effective_show_ln && width < 5 + ln_gutter_width + 4 {
+        effective_show_ln = false;
+        ln_gutter_width = 0;
+    }
+    let ln_gutter = if effective_show_ln {
+        LineNumberGutter::single(digits)
+    } else {
+        LineNumberGutter::single(0)
+    };
+    let body_width = width.saturating_sub(5 + ln_gutter_width).max(1);
     fv.last_body_width.set(body_width);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
 
@@ -1158,14 +1600,28 @@ fn render_file_view(
             } else {
                 Style::default()
             };
-            let rendered = render_file_view_line_wrapped(
-                &fv.lines[line_idx],
-                (line_idx == fv.cursor).then_some(fv.cursor_sub_row),
-                body_width,
-                base_style,
-                hl,
-                &fv.path,
-            );
+            let cursor_sub = (line_idx == fv.cursor).then_some(fv.cursor_sub_row);
+            let rendered = if effective_show_ln {
+                render_file_view_line_wrapped_numbered(
+                    &fv.lines[line_idx],
+                    cursor_sub,
+                    body_width,
+                    base_style,
+                    hl,
+                    &fv.path,
+                    line_idx + 1,
+                    &ln_gutter,
+                )
+            } else {
+                render_file_view_line_wrapped(
+                    &fv.lines[line_idx],
+                    cursor_sub,
+                    body_width,
+                    base_style,
+                    hl,
+                    &fv.path,
+                )
+            };
             let mut take = rendered.into_iter();
             for _ in 0..skip_remaining {
                 if take.next().is_none() {
@@ -1192,14 +1648,28 @@ fn render_file_view(
             } else {
                 Style::default()
             };
-            lines.push(render_file_view_line(
-                &fv.lines[line_idx],
-                line_idx == fv.cursor,
-                body_width,
-                base_style,
-                hl,
-                &fv.path,
-            ));
+            let rendered = if effective_show_ln {
+                render_file_view_line_numbered(
+                    &fv.lines[line_idx],
+                    line_idx == fv.cursor,
+                    body_width,
+                    base_style,
+                    hl,
+                    &fv.path,
+                    line_idx + 1,
+                    &ln_gutter,
+                )
+            } else {
+                render_file_view_line(
+                    &fv.lines[line_idx],
+                    line_idx == fv.cursor,
+                    body_width,
+                    base_style,
+                    hl,
+                    &fv.path,
+                )
+            };
+            lines.push(rendered);
         }
     }
 
@@ -1380,6 +1850,33 @@ pub fn format_local_time(timestamp_ms: u64) -> String {
     }
 }
 
+/// v0.5: append the `#` line-number gutter hint to a footer span list.
+/// Shared by the diff-view branch and the file-view branch so both
+/// places render the hint identically (Codex review §Important-4).
+fn append_line_numbers_hint(
+    spans: &mut Vec<Span<'static>>,
+    app: &App,
+    sep: &dyn Fn() -> Span<'static>,
+    dim: Style,
+    bold: Modifier,
+) {
+    spans.push(sep());
+    spans.push(Span::styled("#", Style::default().fg(Color::Cyan)));
+    spans.push(Span::raw(" "));
+    if app.view_mode == crate::app::ViewMode::Stream {
+        // Stream mode: gutter is forcibly suppressed; label it as
+        // such so the user can see why `#` does nothing here.
+        spans.push(Span::styled("nums (off)", dim));
+    } else if app.show_line_numbers {
+        spans.push(Span::styled(
+            "nums",
+            Style::default().fg(Color::Cyan).add_modifier(bold),
+        ));
+    } else {
+        spans.push(Span::styled("nums", Style::default().fg(Color::Cyan)));
+    }
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Pre-styled spans for the four "static" pieces of the status bar.
     let dim = Style::default().fg(Color::DarkGray);
@@ -1440,6 +1937,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             if app.wrap_lines { "wrap" } else { "nowrap" },
             Style::default().fg(Color::Cyan).add_modifier(bold),
         ));
+        append_line_numbers_hint(&mut spans, app, &sep, dim, bold);
         spans.push(sep());
         spans.push(Span::styled(
             fv.path.display().to_string(),
@@ -1575,6 +2073,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             if app.wrap_lines { "wrap" } else { "nowrap" },
             Style::default().fg(Color::Cyan).add_modifier(bold),
         ));
+
+        // v0.5: Line-number gutter indicator. `#` toggles on/off.
+        // Stream mode permanently suppresses the gutter (synthetic
+        // old_start/new_start are not real file line numbers), so the
+        // label flips to `(off)` in dim when the user is looking at
+        // the stream so the disabled state is visible.
+        append_line_numbers_hint(&mut spans, app, &sep, dim, bold);
 
         spans.push(sep());
         spans.push(Span::styled("s", Style::default().fg(Color::Magenta)));
@@ -1861,6 +2366,7 @@ mod tests {
             visual_top: std::cell::Cell::new(0.0),
             anim: None,
             wrap_lines: false,
+            show_line_numbers: false,
             watcher_health: crate::app::WatcherHealth::default(),
             highlighter: std::cell::OnceCell::new(),
             config: crate::config::KizuConfig::default(),
@@ -1913,6 +2419,382 @@ mod tests {
             "expected empty state with short SHA, got:\n{view}"
         );
         assert!(view.contains("[follow]"));
+    }
+
+    // ---- v0.5 line-number gutter -------------------------------------
+
+    #[test]
+    fn render_diff_line_numbered_inserts_line_number_span_after_bar() {
+        let line = diff_line(LineKind::Context, "hello");
+        let gutter = LineNumberGutter::single(2);
+        let rendered = render_diff_line_numbered(
+            &line,
+            /*is_selected*/ false,
+            /*is_cursor*/ false,
+            /*body_width*/ 40,
+            None,
+            None,
+            Color::Reset,
+            Color::Reset,
+            &[],
+            (Some(10), Some(10)),
+            &gutter,
+        );
+        // span 0: 5-cell cursor bar
+        // span 1: " 10 " single-column line-number gutter
+        // span 2..: body
+        assert!(
+            rendered.spans.len() >= 3,
+            "expected at least 3 spans, got {}",
+            rendered.spans.len()
+        );
+        let ln = rendered.spans[1].content.as_ref();
+        assert!(ln.contains("10"), "line-number gutter text: {ln:?}");
+        assert!(
+            ln.starts_with(' ') && ln.ends_with(' '),
+            "gutter must be padded with 1 leading / 1 trailing space: {ln:?}"
+        );
+        assert_eq!(ln.len(), gutter.total_width);
+    }
+
+    #[test]
+    fn render_diff_line_numbered_added_row_shows_new_side() {
+        let line = diff_line(LineKind::Added, "x");
+        let gutter = LineNumberGutter::single(2);
+        let rendered = render_diff_line_numbered(
+            &line,
+            false,
+            false,
+            40,
+            None,
+            None,
+            Color::Reset,
+            Color::Reset,
+            &[],
+            (None, Some(11)),
+            &gutter,
+        );
+        let ln = rendered.spans[1].content.as_ref();
+        // Single column shows the new-side line number.
+        assert!(ln.contains("11"), "Added row must show new number: {ln:?}");
+        assert_eq!(ln.len(), gutter.total_width);
+    }
+
+    #[test]
+    fn render_diff_line_numbered_deleted_row_leaves_gutter_blank() {
+        // Deleted rows no longer exist in the worktree, so there is no
+        // "current" line number to print. The gutter must be blank.
+        // See `diff_ln_span` docstring for the intuition / reasoning.
+        let line = diff_line(LineKind::Deleted, "y");
+        let gutter = LineNumberGutter::single(2);
+        let rendered = render_diff_line_numbered(
+            &line,
+            false,
+            false,
+            40,
+            None,
+            None,
+            Color::Reset,
+            Color::Reset,
+            &[],
+            (Some(12), None),
+            &gutter,
+        );
+        let ln = rendered.spans[1].content.as_ref();
+        assert!(
+            ln.chars().all(|c| c == ' '),
+            "Deleted row gutter must be blank: {ln:?}"
+        );
+        assert_eq!(ln.len(), gutter.total_width);
+    }
+
+    #[test]
+    fn render_diff_line_wrapped_numbered_continuation_rows_blank_the_gutter() {
+        // Long content that will wrap into at least 2 visual rows at
+        // body_width=4. Continuation rows must not repeat the number.
+        let line = diff_line(LineKind::Context, "aaaaaaaaaa");
+        let gutter = LineNumberGutter::single(2);
+        let rendered = render_diff_line_wrapped_numbered(
+            &line,
+            false,
+            Some(0),
+            /*body_width*/ 4,
+            None,
+            None,
+            Color::Reset,
+            Color::Reset,
+            &[],
+            (Some(10), Some(10)),
+            &gutter,
+        );
+        assert!(rendered.len() >= 2, "content must wrap into 2+ rows");
+        // First row has numbers.
+        let first_ln = rendered[0].spans[1].content.as_ref();
+        assert!(
+            first_ln.contains("10"),
+            "first row must show 10: {first_ln:?}"
+        );
+        // Continuation row has blank gutter.
+        let cont_ln = rendered[1].spans[1].content.as_ref();
+        assert!(
+            cont_ln.chars().all(|c| c == ' '),
+            "continuation row must be all spaces: {cont_ln:?}"
+        );
+        assert_eq!(cont_ln.len(), gutter.total_width);
+    }
+
+    #[test]
+    fn render_file_view_line_numbered_shows_single_column() {
+        let gutter = LineNumberGutter::single(3);
+        let rendered = render_file_view_line_numbered(
+            "hello world",
+            false,
+            40,
+            Style::default(),
+            None,
+            std::path::Path::new("foo.rs"),
+            42,
+            &gutter,
+        );
+        assert!(rendered.spans.len() >= 3);
+        let ln = rendered.spans[1].content.as_ref();
+        assert!(ln.contains("42"), "file-view gutter: {ln:?}");
+        assert_eq!(ln.len(), gutter.total_width);
+    }
+
+    #[test]
+    fn render_file_view_line_wrapped_numbered_blanks_continuation() {
+        let gutter = LineNumberGutter::single(3);
+        let rendered = render_file_view_line_wrapped_numbered(
+            "aaaaaaaaaa",
+            Some(0),
+            /*body_width*/ 4,
+            Style::default(),
+            None,
+            std::path::Path::new("foo.rs"),
+            42,
+            &gutter,
+        );
+        assert!(rendered.len() >= 2);
+        let cont_ln = rendered[1].spans[1].content.as_ref();
+        assert!(
+            cont_ln.chars().all(|c| c == ' '),
+            "continuation row must be blank: {cont_ln:?}"
+        );
+    }
+
+    #[test]
+    fn sticky_hunk_header_also_reserves_ln_gutter() {
+        // Codex 3rd-round Important-1: the sticky header is drawn
+        // directly by render_scroll with render_hunk_header(),
+        // bypassing render_row's insert_blank_gutter branch. Without
+        // an explicit fix the pinned header sits 4 cells left of the
+        // scrolling DiffLine bodies whenever LN is on and the cursor
+        // is deep enough inside a hunk to activate stickiness.
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(
+                10,
+                // Enough DiffLines that the cursor will scroll past
+                // the hunk header and stickiness kicks in.
+                (0..30)
+                    .map(|i| diff_line(LineKind::Context, &format!("line {i}")))
+                    .collect(),
+            )],
+            100,
+        )]);
+        app.show_line_numbers = true;
+        app.build_layout();
+        // Move cursor deep into the hunk so the header becomes sticky.
+        app.scroll = 20;
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        // Sticky header lives at y=0. Its `@@` must share its x with
+        // the DiffLine `line` bodies below.
+        let top_row: String = (0..buffer.area().width)
+            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            top_row.contains("@@"),
+            "top row must hold the sticky header: {top_row:?}"
+        );
+        let header_x = top_row.find("@@").unwrap();
+        let mut body_x: Option<usize> = None;
+        for y in 1..buffer.area().height {
+            let row: String = (0..buffer.area().width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            if let Some(col) = row.find("line ") {
+                body_x = Some(col);
+                break;
+            }
+        }
+        let bx = body_x.expect("at least one DiffLine body must be visible");
+        // `@@` sits 2 cells to the right of the DiffLine body because
+        // render_hunk_header prefixes the label with a 2-cell seen_mark
+        // pad ("  " for unseen hunks). Pin the relative offset so the
+        // sticky-header alignment can't silently regress.
+        assert_eq!(
+            (header_x as isize) - (bx as isize),
+            2,
+            "sticky header '@@' must sit 2 cells right of DiffLine body (header_x={header_x}, body_x={bx})"
+        );
+    }
+
+    #[test]
+    fn ln_gutter_preserves_hunk_header_vs_diff_body_alignment() {
+        // Bug (user-reported 2026-04-21): HunkHeader / BinaryNotice
+        // must reserve the gutter column when LN is on, otherwise
+        // their bodies slide left relative to DiffLine bodies. Pin
+        // the invariant: the relative offset between `@@` and the
+        // first body glyph must match between LN OFF and LN ON —
+        // turning the gutter on shifts *both* by the same amount.
+        let make_app = |show_ln: bool| {
+            let mut app = populated_app(vec![make_file(
+                "src/foo.rs",
+                vec![hunk(
+                    10,
+                    vec![
+                        diff_line(LineKind::Context, "fn ok()"),
+                        diff_line(LineKind::Added, "x"),
+                    ],
+                )],
+                100,
+            )]);
+            app.show_line_numbers = show_ln;
+            app.build_layout();
+            app
+        };
+        let probe = |app: &App| -> (usize, usize) {
+            let backend = TestBackend::new(80, 12);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal.draw(|f| render(f, app)).expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            let mut header_x: Option<usize> = None;
+            let mut body_x: Option<usize> = None;
+            for y in 0..buffer.area().height {
+                let row: String = (0..buffer.area().width)
+                    .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect();
+                if header_x.is_none()
+                    && let Some(col) = row.find("@@")
+                {
+                    header_x = Some(col);
+                }
+                if body_x.is_none()
+                    && let Some(col) = row.find("fn ok()")
+                {
+                    body_x = Some(col);
+                }
+            }
+            (header_x.expect("@@"), body_x.expect("fn ok()"))
+        };
+        let (off_h, off_b) = probe(&make_app(false));
+        let (on_h, on_b) = probe(&make_app(true));
+        // Both rows must shift by the same gutter width — the relative
+        // offset between `@@` and `fn` is invariant under the toggle.
+        assert_eq!(
+            (on_h as isize - off_h as isize),
+            (on_b as isize - off_b as isize),
+            "gutter toggle must shift hunk header and diff body by the same amount (off: @@={off_h}, fn={off_b}; on: @@={on_h}, fn={on_b})"
+        );
+        // Sanity: LN ON actually adds width (otherwise the invariant
+        // holds trivially).
+        assert!(on_b > off_b, "LN ON must widen the left gutter");
+    }
+
+    #[test]
+    fn render_scroll_shows_line_numbers_when_enabled() {
+        // v0.5 end-to-end: `show_line_numbers=true` must put a
+        // right-aligned worktree line number in the gutter of every
+        // Context / Added row.
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(
+                10,
+                vec![
+                    diff_line(LineKind::Context, "fn ok()"),
+                    diff_line(LineKind::Added, "let x = 1;"),
+                ],
+            )],
+            100,
+        )]);
+        app.show_line_numbers = true;
+        app.build_layout();
+        let view = render_to_string(&app, 80, 12);
+        // Context row: new=10 → " 10 " in the gutter.
+        // Added row: new=10 as well (new_count starts at new_start for
+        // the first Added when old_count=0 → see git.rs:line_numbers_for).
+        assert!(
+            view.contains(" 10 "),
+            "Context/Added row must show the worktree line number:\n{view}"
+        );
+    }
+
+    #[test]
+    fn render_scroll_omits_line_numbers_in_stream_mode_even_when_enabled() {
+        // Codex review §Critical-2: Stream mode FileDiffs carry
+        // synthetic old_start/new_start values that are not real file
+        // line numbers. The renderer must suppress the gutter.
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(
+                100, // new_start=100 so any LN artifact would be visible
+                vec![diff_line(LineKind::Added, "x")],
+            )],
+            100,
+        )]);
+        app.show_line_numbers = true;
+        app.view_mode = crate::app::ViewMode::Stream;
+        app.build_layout();
+        let view = render_to_string(&app, 80, 12);
+        // No "100" glyph should appear as a line-number gutter (it
+        // might still appear in the hunk header `L100` — let's pin
+        // something more specific: no `"100"` as a right-aligned
+        // gutter value with a trailing separator).
+        assert!(
+            !view.contains(" 100 "),
+            "Stream mode must not render line-number gutter:\n{view}"
+        );
+    }
+
+    #[test]
+    fn render_scroll_drops_gutter_when_viewport_is_extremely_narrow() {
+        // Codex review §Critical-2: at widths where 5 (cursor bar)
+        // + gutter + 4 (min body) cannot fit, the renderer must
+        // silently fall back to the no-gutter layout so the user
+        // still sees diff content.
+        let mut app = populated_app(vec![make_file(
+            "src/foo.rs",
+            vec![hunk(10, vec![diff_line(LineKind::Added, "xyz")])],
+            100,
+        )]);
+        app.show_line_numbers = true;
+        app.build_layout();
+        // Width 9 is too small: 5 + 9 (gutter) + 4 > 9. Fallback
+        // forces ln off, body_width = 9 - 5 = 4.
+        let view = render_to_string(&app, 12, 4);
+        // No "10" as a gutter number should appear in this narrow view.
+        // The fixture's new_start is 10 so we'd see it only if the
+        // fallback failed.
+        assert!(
+            !view.contains(" 10 "),
+            "narrow viewport must drop the gutter:\n{view}"
+        );
+    }
+
+    #[test]
+    fn line_number_digits_clamps_to_lower_bound_of_two() {
+        assert_eq!(line_number_digits(0), 2);
+        assert_eq!(line_number_digits(1), 2);
+        assert_eq!(line_number_digits(9), 2);
+        assert_eq!(line_number_digits(10), 2);
+        assert_eq!(line_number_digits(99), 2);
+        assert_eq!(line_number_digits(100), 3);
+        assert_eq!(line_number_digits(9999), 4);
     }
 
     #[test]
@@ -2211,6 +3093,50 @@ mod tests {
     }
 
     #[test]
+    fn line_numbers_hint_appears_in_footer_and_marks_state() {
+        // v0.5 plan §Important-4 (Codex): wrap/`z` hints are already
+        // visible in the footer, so the LN toggle must be too.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        // OFF by default → still shows a hint (just without bold).
+        let off_view = render_to_string(&app, 80, 8);
+        assert!(
+            off_view.contains("nums"),
+            "footer must always show the LN hint:\n{off_view}"
+        );
+
+        // ON → the hint stays (visual bold is asserted elsewhere; here
+        // we only pin the text).
+        app.show_line_numbers = true;
+        app.build_layout();
+        let on_view = render_to_string(&app, 80, 8);
+        assert!(on_view.contains("nums"));
+    }
+
+    #[test]
+    fn line_numbers_hint_marks_stream_mode_as_off() {
+        // Stream mode always suppresses the gutter, so the footer
+        // should make that explicit with an `(off)` marker no matter
+        // what `show_line_numbers` is.
+        let mut app = populated_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        app.show_line_numbers = true;
+        app.view_mode = crate::app::ViewMode::Stream;
+        app.build_layout();
+        let view = render_to_string(&app, 80, 8);
+        assert!(
+            view.contains("nums") && view.contains("off"),
+            "stream footer must flag LN as disabled:\n{view}"
+        );
+    }
+
+    #[test]
     fn wrap_nowrap_indicator_appears_in_footer() {
         let mut app = populated_app(vec![make_file(
             "a.rs",
@@ -2359,7 +3285,10 @@ mod tests {
             "watcher [worktree]: worktree watcher dead".into(),
         );
 
-        let view = render_to_string(&app, 160, 6);
+        // v0.5: the footer grew a `# nums` segment, so the viewport
+        // needs a little more room before the worktree warning is
+        // truncated at the right edge.
+        let view = render_to_string(&app, 200, 6);
         assert!(
             view.contains("⚠ WATCHER"),
             "missing watcher warning:\n{view}"
@@ -2559,6 +3488,43 @@ mod tests {
         assert!(
             view.contains("+3/-1"),
             "expected +3/-1 counts, got:\n{view}"
+        );
+    }
+
+    #[test]
+    fn hunk_header_pure_deletion_uses_baseline_range_not_l0() {
+        // Codex 3rd-round Important-3: a hunk that removes lines from
+        // the top of the file ends up with new_start=0 / new_count=0.
+        // The previous range formula `L{new_start}-{new_start + new_count - 1}`
+        // would render "L0-?" (underflow or nonsense) and, now that
+        // Deleted DiffLine rows have a blank gutter, the header was
+        // the only positional signal left. Fall back to the baseline
+        // range so the reader can still locate the removal.
+        let app = populated_app(vec![make_file(
+            "a.rs",
+            vec![Hunk {
+                old_start: 1,
+                old_count: 3,
+                new_start: 0,
+                new_count: 0,
+                lines: vec![
+                    diff_line(LineKind::Deleted, "gone1"),
+                    diff_line(LineKind::Deleted, "gone2"),
+                    diff_line(LineKind::Deleted, "gone3"),
+                ],
+                context: None,
+            }],
+            100,
+        )]);
+        let view = render_to_string(&app, 100, 14);
+        assert!(
+            !view.contains("L0"),
+            "pure deletion must not render L0 as the header range:\n{view}"
+        );
+        // Baseline range should appear instead (old_start .. old_start+old_count-1).
+        assert!(
+            view.contains("L1-3") || view.contains("L1"),
+            "pure deletion header must fall back to baseline range:\n{view}"
         );
     }
 

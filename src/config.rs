@@ -13,6 +13,7 @@ pub struct KizuConfig {
     pub timing: TimingConfig,
     pub editor: EditorConfig,
     pub attach: AttachConfig,
+    pub line_numbers: LineNumbersConfig,
 }
 
 /// Keybinding configuration. Each field holds the character that
@@ -39,6 +40,18 @@ pub struct KeyConfig {
     /// key pops the top of the session's scar undo stack and reverses
     /// just that one write, matching text-editor undo ergonomics.
     pub undo: char,
+    /// Toggle the line-number gutter (v0.5). Works in diff view and
+    /// file view; Stream mode always suppresses line numbers regardless.
+    pub line_numbers_toggle: char,
+}
+
+/// Line-number gutter configuration (v0.5).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LineNumbersConfig {
+    /// Initial state of the line-number gutter. `false` (default)
+    /// preserves v0.4 layout; set `true` in config.toml to opt in.
+    pub enabled: bool,
 }
 
 /// Diff background color configuration. Each field is an `[R, G, B]`
@@ -95,6 +108,7 @@ impl Default for KeyConfig {
             cursor_placement: 'z',
             wrap_toggle: 'w',
             undo: 'u',
+            line_numbers_toggle: '#',
         }
     }
 }
@@ -102,7 +116,7 @@ impl Default for KeyConfig {
 impl KeyConfig {
     /// Every `(action_name, char)` pair in this map, in a stable
     /// order. Used by [`Self::conflicts`] for duplicate detection.
-    fn bindings(&self) -> [(&'static str, char); 15] {
+    fn bindings(&self) -> [(&'static str, char); 16] {
         [
             ("ask", self.ask),
             ("reject", self.reject),
@@ -119,6 +133,7 @@ impl KeyConfig {
             ("cursor_placement", self.cursor_placement),
             ("wrap_toggle", self.wrap_toggle),
             ("undo", self.undo),
+            ("line_numbers_toggle", self.line_numbers_toggle),
         ]
     }
 
@@ -328,5 +343,26 @@ bg_added = [0, 80, 0]
             ..Default::default()
         };
         assert_eq!(config.bg_added_color(), Color::Rgb(20, 60, 20));
+    }
+
+    // ---- line numbers (v0.5) -----------------------------------------
+
+    #[test]
+    fn default_config_has_line_numbers_toggle_and_disabled() {
+        let config = KizuConfig::default();
+        // Default toggle key is '#' (see plan Decision Log: candidates
+        // 'l' / 'n' / 'L' all had conflicts or ergonomic issues).
+        assert_eq!(config.keys.line_numbers_toggle, '#');
+        // Default state is OFF to keep v0.4 layout unchanged for users
+        // who don't opt in.
+        assert!(!config.line_numbers.enabled);
+    }
+
+    #[test]
+    fn toml_can_override_line_numbers_enabled() {
+        let config: KizuConfig = toml::from_str("[line_numbers]\nenabled = true\n").unwrap();
+        assert!(config.line_numbers.enabled);
+        // Unrelated defaults must still be preserved.
+        assert_eq!(config.keys.ask, 'a');
     }
 }
