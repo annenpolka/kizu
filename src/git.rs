@@ -78,6 +78,44 @@ pub enum LineKind {
     Deleted,
 }
 
+/// Return the 1-indexed `(old, new)` line numbers for the DiffLine at
+/// `line_idx` inside `hunk`. `old` is `None` for Added rows, `new` is
+/// `None` for Deleted rows, both sides are `Some` for Context rows.
+/// Out-of-range `line_idx` returns `(None, None)` so callers can treat
+/// it as "no line number available" without panicking.
+///
+/// v0.5 `build_layout` inlines an equivalent cumulative walk for O(n)
+/// performance on large hunks (Codex 3rd-round Important-4), but this
+/// standalone helper is kept public for single-line lookups (tests /
+/// future call sites that don't already hold a cursor).
+#[allow(dead_code)]
+pub fn line_numbers_for(hunk: &Hunk, line_idx: usize) -> (Option<usize>, Option<usize>) {
+    let mut old = hunk.old_start;
+    let mut new = hunk.new_start;
+    for (i, line) in hunk.lines.iter().enumerate() {
+        if i == line_idx {
+            return match line.kind {
+                LineKind::Context => (Some(old), Some(new)),
+                LineKind::Added => (None, Some(new)),
+                LineKind::Deleted => (Some(old), None),
+            };
+        }
+        match line.kind {
+            LineKind::Context => {
+                old += 1;
+                new += 1;
+            }
+            LineKind::Added => {
+                new += 1;
+            }
+            LineKind::Deleted => {
+                old += 1;
+            }
+        }
+    }
+    (None, None)
+}
+
 /// Run `git diff --no-renames <baseline> --` and parse the result, then
 /// append synthesized [`FileDiff`] entries for untracked files.
 ///
@@ -2100,5 +2138,95 @@ index 1111111..2222222 100644
                 assert!(s.is_empty(), "dangling symlink should be empty, got {s:?}");
             }
         }
+    }
+
+    // ---- line_numbers_for (v0.5) -------------------------------------
+
+    fn diff_line(kind: LineKind, content: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            content: content.to_string(),
+            has_trailing_newline: true,
+        }
+    }
+
+    #[test]
+    fn line_numbers_for_context_row_returns_both_sides() {
+        let hunk = Hunk {
+            old_start: 10,
+            old_count: 3,
+            new_start: 10,
+            new_count: 3,
+            lines: vec![
+                diff_line(LineKind::Context, "a"),
+                diff_line(LineKind::Context, "b"),
+                diff_line(LineKind::Context, "c"),
+            ],
+            context: None,
+        };
+        assert_eq!(line_numbers_for(&hunk, 0), (Some(10), Some(10)));
+        assert_eq!(line_numbers_for(&hunk, 1), (Some(11), Some(11)));
+        assert_eq!(line_numbers_for(&hunk, 2), (Some(12), Some(12)));
+    }
+
+    #[test]
+    fn line_numbers_for_added_row_returns_new_only() {
+        // @@ -10,2 +10,3 @@
+        //  context        <- old 10, new 10
+        // +added          <- old None, new 11
+        //  context        <- old 11, new 12
+        let hunk = Hunk {
+            old_start: 10,
+            old_count: 2,
+            new_start: 10,
+            new_count: 3,
+            lines: vec![
+                diff_line(LineKind::Context, "a"),
+                diff_line(LineKind::Added, "b"),
+                diff_line(LineKind::Context, "c"),
+            ],
+            context: None,
+        };
+        assert_eq!(line_numbers_for(&hunk, 0), (Some(10), Some(10)));
+        assert_eq!(line_numbers_for(&hunk, 1), (None, Some(11)));
+        assert_eq!(line_numbers_for(&hunk, 2), (Some(11), Some(12)));
+    }
+
+    #[test]
+    fn line_numbers_for_deleted_row_returns_old_only() {
+        // @@ -10,3 +10,2 @@
+        //  context        <- old 10, new 10
+        // -deleted        <- old 11, new None
+        //  context        <- old 12, new 11
+        let hunk = Hunk {
+            old_start: 10,
+            old_count: 3,
+            new_start: 10,
+            new_count: 2,
+            lines: vec![
+                diff_line(LineKind::Context, "a"),
+                diff_line(LineKind::Deleted, "b"),
+                diff_line(LineKind::Context, "c"),
+            ],
+            context: None,
+        };
+        assert_eq!(line_numbers_for(&hunk, 0), (Some(10), Some(10)));
+        assert_eq!(line_numbers_for(&hunk, 1), (Some(11), None));
+        assert_eq!(line_numbers_for(&hunk, 2), (Some(12), Some(11)));
+    }
+
+    #[test]
+    fn line_numbers_for_out_of_range_returns_none() {
+        let hunk = Hunk {
+            old_start: 5,
+            old_count: 1,
+            new_start: 5,
+            new_count: 1,
+            lines: vec![diff_line(LineKind::Context, "a")],
+            context: None,
+        };
+        // Out-of-range index must not panic and must return (None, None)
+        // so the caller can treat it as "no line number available".
+        assert_eq!(line_numbers_for(&hunk, 99), (None, None));
     }
 }
