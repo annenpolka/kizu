@@ -25,6 +25,7 @@ export const KIZU_BIN: string = process.env.KIZU_BIN
  */
 export type Repo = {
   path: string;
+  statePath: string;
   write(rel: string, content: string): void;
   git(...args: string[]): string;
   cleanup(): void;
@@ -39,6 +40,7 @@ export type Repo = {
  */
 export function createTempRepo(): Repo {
   const path = mkdtempSync(join(tmpdir(), "kizu-e2e-"));
+  const statePath = `${path}-state`;
   const git = (...args: string[]): string =>
     execFileSync("git", args, { cwd: path, encoding: "utf8" }).trimEnd();
 
@@ -49,6 +51,7 @@ export function createTempRepo(): Repo {
 
   return {
     path,
+    statePath,
     git,
     write(rel, content) {
       const abs = join(path, rel);
@@ -57,6 +60,7 @@ export function createTempRepo(): Repo {
     },
     cleanup() {
       rmSync(path, { recursive: true, force: true });
+      rmSync(statePath, { recursive: true, force: true });
     },
   };
 }
@@ -82,6 +86,7 @@ export async function launchKizu(opts: {
     env: {
       PATH: process.env.PATH ?? "",
       HOME: process.env.HOME ?? "",
+      KIZU_STATE_DIR: `${opts.cwd}-state`,
       TERM: "xterm-256color",
       LC_ALL: "C.UTF-8",
       LANG: "C.UTF-8",

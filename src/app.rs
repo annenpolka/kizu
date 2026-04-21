@@ -203,6 +203,10 @@ pub struct App {
     /// looking at. Lets `recompute_diff` slide `scroll` to the same hunk
     /// even when the row count has shifted.
     pub anchor: Option<HunkAnchor>,
+    /// Help overlay state. `true` while the `?` keymap popup is open.
+    /// The overlay shadows normal action keys until Esc / `?` / `q`
+    /// closes it, so reading help never accidentally mutates files.
+    pub help_overlay: bool,
     /// Modal file picker. `Some` when the user has pressed `s`.
     pub picker: Option<PickerState>,
     /// Free-text scar input overlay. `Some` when the user has pressed
@@ -1260,6 +1264,7 @@ impl App {
             cursor_sub_row: 0,
             cursor_placement: CursorPlacement::Centered,
             anchor: None,
+            help_overlay: false,
             picker: None,
             scar_comment: None,
             revert_confirm: None,
@@ -1974,7 +1979,10 @@ impl App {
     /// side-effects without threading explicit parameters through
     /// every handler.
     pub fn handle_key(&mut self, key: KeyEvent) -> KeyEffect {
-        if self.picker.is_some() {
+        if self.help_overlay {
+            self.handle_help_key(key);
+            KeyEffect::None
+        } else if self.picker.is_some() {
             self.handle_picker_key(key);
             KeyEffect::None
         } else if self.scar_comment.is_some() {
@@ -2092,7 +2100,9 @@ impl App {
                 // are the action keys that users can remap in
                 // ~/.config/kizu/config.toml.
                 let k = &self.config.keys;
-                if ch == k.follow {
+                if ch == '?' {
+                    self.help_overlay = true;
+                } else if ch == k.follow {
                     self.follow_restore();
                 } else if ch == k.picker {
                     self.open_picker();
@@ -2139,6 +2149,20 @@ impl App {
             _ => {}
         }
         KeyEffect::None
+    }
+
+    // ---- help-overlay keys --------------------------------------------
+
+    fn handle_help_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                self.help_overlay = false;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            _ => {}
+        }
     }
 
     // ---- picker-mode keys --------------------------------------------
@@ -3263,7 +3287,9 @@ impl App {
             // who remaps `ask` to `A` gets the new key here too).
             KeyCode::Char(ch) => {
                 let k = &self.config.keys;
-                if ch == k.ask {
+                if ch == '?' {
+                    self.help_overlay = true;
+                } else if ch == k.ask {
                     self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
                 } else if ch == k.reject {
                     self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
@@ -4784,6 +4810,7 @@ mod tests {
             cursor_sub_row: 0,
             cursor_placement: CursorPlacement::Centered,
             anchor: None,
+            help_overlay: false,
             picker: None,
             scar_comment: None,
             revert_confirm: None,
@@ -6145,6 +6172,41 @@ mod tests {
         let mut app = fake_app(vec![]);
         app.handle_key(ctrl('c'));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn question_mark_opens_help_overlay_and_esc_closes_it() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        assert!(!app.help_overlay);
+
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(app.help_overlay);
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.help_overlay);
+    }
+
+    #[test]
+    fn help_overlay_shadows_normal_keys_until_closed() {
+        let mut app = fake_app(vec![make_file(
+            "a.rs",
+            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
+            100,
+        )]);
+        app.handle_key(key(KeyCode::Char('?')));
+        app.handle_key(key(KeyCode::Char('s')));
+        assert!(
+            app.picker.is_none(),
+            "help overlay must consume normal-mode action keys"
+        );
+        assert!(app.help_overlay);
+
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(!app.help_overlay);
     }
 
     #[test]

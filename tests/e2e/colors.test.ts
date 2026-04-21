@@ -58,18 +58,56 @@ test("footer mode indicators switch on toggle keys", async () => {
   session = await launchKizu({ cwd: repo.path });
   await session.waitForText("demo", { timeout: 10_000 });
 
-  // `z center` + `w nowrap` are the defaults.
+  // Footer shows state, while the key map lives in the `?` help overlay.
   let view = await session.text({ trimEnd: true });
-  expect(view).toContain("z center");
-  expect(view).toContain("w nowrap");
+  expect(view).toContain("center");
+  expect(view).toContain("nowrap");
+  expect(view).toContain("nums off");
+  expect(view).toContain("? help");
+  expect(view).not.toContain("z center");
+  expect(view).not.toContain("w nowrap");
 
-  // Toggle both modes; the footer spans should flip.
+  // Toggle both modes; the footer state should flip.
   await session.press("z");
   await session.press("w");
-  await session.waitForText("w wrap", { timeout: 5_000 });
+  await session.waitForText("wrap", { timeout: 5_000 });
   view = await session.text({ trimEnd: true });
-  expect(view).toContain("z top");
-  expect(view).toContain("w wrap");
+  expect(view).toContain("top");
+  expect(view).toContain("wrap");
+  expect(view).not.toContain("z top");
+  expect(view).not.toContain("w wrap");
+});
+
+test("help overlay shows keymap and shadows normal action keys", async () => {
+  repo = createTempRepo();
+  repo.write("src/app.rs", "fn main() {}\n");
+  repo.git("add", ".");
+  repo.git("commit", "-q", "-m", "seed");
+  repo.write("src/app.rs", "fn main() { println!(\"demo\"); }\n");
+
+  session = await launchKizu({ cwd: repo.path });
+  await session.waitForText("demo", { timeout: 10_000 });
+
+  await session.press("?");
+  await session.waitForText("Help", { timeout: 5_000 });
+  let view = await session.text({ trimEnd: true });
+  expect(view).toContain("Navigation");
+  expect(view).toContain("Review");
+  expect(view).toContain("Views");
+  expect(view).toContain("line numbers");
+  expect(view).toContain("Space");
+
+  // While help is open, action keys are consumed by the overlay.
+  await session.press("s");
+  await new Promise((r) => setTimeout(r, 300));
+  view = await session.text({ trimEnd: true });
+  expect(view).toContain("Help");
+  expect(view).not.toContain("Files 1/1");
+
+  await session.press("esc");
+  await session.waitForText("? help", { timeout: 5_000 });
+  view = await session.text({ trimEnd: true });
+  expect(view).not.toContain("Help");
 });
 
 test("file view wrap toggle reveals long-line continuation", async () => {
@@ -91,13 +129,14 @@ test("file view wrap toggle reveals long-line continuation", async () => {
   await session.waitForText("[file view]", { timeout: 5_000 });
 
   let view = await session.text({ trimEnd: true });
-  expect(view).toContain("w nowrap");
+  expect(view).toContain("nowrap");
+  expect(view).toContain("nums off");
   expect(view).not.toContain(lateSlice);
 
   await session.press("w");
-  await session.waitForText("w wrap", { timeout: 5_000 });
+  await session.waitForText("wrap", { timeout: 5_000 });
 
   view = await session.text({ trimEnd: true });
-  expect(view).toContain("w wrap");
+  expect(view).toContain("wrap");
   expect(view).toContain(lateSlice);
 });

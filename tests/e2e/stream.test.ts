@@ -25,7 +25,11 @@ function sendHookLogEvent(cwd: string, toolName: string, filePath: string) {
   execFileSync(KIZU_BIN, ["hook-log-event"], {
     input: json,
     cwd,
-    env: { ...process.env, PATH: process.env.PATH ?? "" },
+    env: {
+      ...process.env,
+      PATH: process.env.PATH ?? "",
+      KIZU_STATE_DIR: `${cwd}-state`,
+    },
   });
 }
 
