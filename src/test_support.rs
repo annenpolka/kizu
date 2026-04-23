@@ -36,6 +36,16 @@ pub(crate) fn hunk(old_start: usize, lines: Vec<DiffLine>) -> Hunk {
     }
 }
 
+pub(crate) fn added_hunk(old_start: usize, lines: &[&str]) -> Hunk {
+    hunk(
+        old_start,
+        lines
+            .iter()
+            .map(|line| diff_line(LineKind::Added, line))
+            .collect(),
+    )
+}
+
 pub(crate) fn make_file(name: &str, hunks: Vec<Hunk>, secs: u64) -> FileDiff {
     let added: usize = hunks
         .iter()

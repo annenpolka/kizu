@@ -4404,9 +4404,10 @@ mod tests {
     use super::*;
     use crate::git::{DiffContent, DiffLine, LineKind};
     use crate::test_support::{
-        app_with_files as fake_app, app_with_hunks, binary_file, diff_line, file_view_state, hunk,
-        install_search, make_file, numbered_added_lines, single_added_app, single_added_file,
-        single_added_hunk_file, single_deleted_file, single_hunk_app, single_hunk_file,
+        added_hunk, app_with_files as fake_app, app_with_hunks, binary_file, diff_line,
+        file_view_state, hunk, install_search, make_file, numbered_added_lines, single_added_app,
+        single_added_file, single_added_hunk_file, single_deleted_file, single_hunk_app,
+        single_hunk_file,
     };
     use std::time::Duration;
 
@@ -4654,10 +4655,7 @@ mod tests {
         // into the next hunk even without a "short hunk shortcut".
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(20, vec![diff_line(LineKind::Added, "y")]),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(20, &["y"])],
             100,
         );
         app.scroll_to(0);
@@ -4678,10 +4676,7 @@ mod tests {
         // because there is no third hunk.
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "alpha")]),
-                hunk(10, vec![diff_line(LineKind::Added, "beta")]),
-            ],
+            vec![added_hunk(1, &["alpha"]), added_hunk(10, &["beta"])],
             100,
         );
         assert_eq!(app.layout.hunk_starts.len(), 2);
@@ -4912,17 +4907,7 @@ mod tests {
         // start first. A second `k` then steps back to HH0.
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "a1"),
-                        diff_line(LineKind::Added, "a2"),
-                        diff_line(LineKind::Added, "a3"),
-                    ],
-                ),
-                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
-            ],
+            vec![added_hunk(1, &["a1", "a2", "a3"]), added_hunk(10, &["b1"])],
             100,
         );
         let first_hunk_top = app.layout.hunk_starts[0];
@@ -4953,14 +4938,7 @@ mod tests {
         for _ in 0..5 {
             lines_a.push(diff_line(LineKind::Context, "tail"));
         }
-        let mut app = app_with_hunks(
-            "a.rs",
-            vec![
-                hunk(1, lines_a),
-                hunk(20, vec![diff_line(LineKind::Added, "b1")]),
-            ],
-            100,
-        );
+        let mut app = app_with_hunks("a.rs", vec![hunk(1, lines_a), added_hunk(20, &["b1"])], 100);
         let first_hunk_top = app.layout.hunk_starts[0];
         let second_hunk_top = app.layout.hunk_starts[1];
         let (first_run_start, _) = app.layout.change_runs[0];
@@ -5014,10 +4992,7 @@ mod tests {
         // second — pressing `h` lands on the first hunk header.
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "alpha")]),
-                hunk(10, vec![diff_line(LineKind::Added, "beta")]),
-            ],
+            vec![added_hunk(1, &["alpha"]), added_hunk(10, &["beta"])],
             100,
         );
         let first_hunk = app.layout.hunk_starts[0];
@@ -5880,16 +5855,7 @@ mod tests {
         // hunk1's first change-run start.
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "a1")]),
-                hunk(
-                    10,
-                    vec![
-                        diff_line(LineKind::Added, "b1"),
-                        diff_line(LineKind::Added, "b2"),
-                    ],
-                ),
-            ],
+            vec![added_hunk(1, &["a1"]), added_hunk(10, &["b1", "b2"])],
             100,
         );
         let hh0 = hunk_header_row(&app, 0);
@@ -5916,16 +5882,7 @@ mod tests {
         // back.
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "a1"),
-                        diff_line(LineKind::Added, "a2"),
-                    ],
-                ),
-                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
-            ],
+            vec![added_hunk(1, &["a1", "a2"]), added_hunk(10, &["b1"])],
             100,
         );
         let hh1 = hunk_header_row(&app, 1);
@@ -5961,9 +5918,9 @@ mod tests {
         let mut app = app_with_hunks(
             "a.rs",
             vec![
-                hunk(1, vec![diff_line(LineKind::Added, "a")]),
-                hunk(10, vec![diff_line(LineKind::Added, "b")]),
-                hunk(20, vec![diff_line(LineKind::Added, "c")]),
+                added_hunk(1, &["a"]),
+                added_hunk(10, &["b"]),
+                added_hunk(20, &["c"]),
             ],
             100,
         );
@@ -6000,9 +5957,9 @@ mod tests {
         let mut app = app_with_hunks(
             "a.rs",
             vec![
-                hunk(1, vec![diff_line(LineKind::Added, "a")]),
-                hunk(10, vec![diff_line(LineKind::Added, "b")]),
-                hunk(20, vec![diff_line(LineKind::Added, "c")]),
+                added_hunk(1, &["a"]),
+                added_hunk(10, &["b"]),
+                added_hunk(20, &["c"]),
             ],
             100,
         );
@@ -6041,16 +5998,7 @@ mod tests {
         // HunkHeader.
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "a1")]),
-                hunk(
-                    10,
-                    vec![
-                        diff_line(LineKind::Added, "b1"),
-                        diff_line(LineKind::Added, "b2"),
-                    ],
-                ),
-            ],
+            vec![added_hunk(1, &["a1"]), added_hunk(10, &["b1", "b2"])],
             100,
         );
         cursor_on_nth_diff_line(&mut app, 0);
@@ -6078,17 +6026,7 @@ mod tests {
         // neighbor. The collapsed hunk's HunkHeader must win.
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "a1"),
-                        diff_line(LineKind::Added, "a2"),
-                        diff_line(LineKind::Added, "a3"),
-                    ],
-                ),
-                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
-            ],
+            vec![added_hunk(1, &["a1", "a2", "a3"]), added_hunk(10, &["b1"])],
             100,
         );
         // Park the cursor on the 2nd DiffLine of hunk 0 (a2).
@@ -6870,16 +6808,7 @@ mod tests {
     fn scroll_to_starts_animation_when_row_changes() {
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(
-                    10,
-                    vec![
-                        diff_line(LineKind::Added, "y1"),
-                        diff_line(LineKind::Added, "y2"),
-                    ],
-                ),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(10, &["y1", "y2"])],
             100,
         );
         app.anim = None;
@@ -6901,16 +6830,7 @@ mod tests {
     fn scroll_to_carries_current_visual_into_animation_from() {
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(
-                    20,
-                    vec![
-                        diff_line(LineKind::Added, "y1"),
-                        diff_line(LineKind::Added, "y2"),
-                    ],
-                ),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(20, &["y1", "y2"])],
             100,
         );
         app.scroll = 0;
