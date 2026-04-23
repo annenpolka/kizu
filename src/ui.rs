@@ -1726,8 +1726,8 @@ mod tests {
     use crate::git::{DiffContent, DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     use crate::test_support::{
         app_with_file, app_with_files, app_with_hunks, binary_file as timed_binary_file, diff_line,
-        file_view_state, hunk, install_search, make_file, single_added_app, single_added_file,
-        single_added_hunk_file, single_hunk_app,
+        file_view_state, hunk, install_search, make_file, numbered_added_lines, single_added_app,
+        single_added_file, single_added_hunk_file, single_hunk_app,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -3158,9 +3158,7 @@ mod tests {
         // 40-row hunk, 12-row viewport, cursor parked deep inside the
         // hunk. In centered mode the cursor row should land at roughly
         // viewport_height / 2.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(40);
         let mut app = app_with_context_hunk("src/foo.rs", "fn long_function() {", lines, 100);
         let header = app.layout.hunk_starts[0];
         // Park the cursor 20 rows past the hunk header (well inside the
@@ -3190,9 +3188,7 @@ mod tests {
         // Same fixture, toggled to Top placement. The arrow should
         // sit at the body's top row, just below the pinned sticky
         // hunk header.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(40);
         let mut app = app_with_context_hunk("src/foo.rs", "fn long_function() {", lines, 100);
         let header = app.layout.hunk_starts[0];
         app.scroll_to(header + 20);
@@ -3233,9 +3229,7 @@ mod tests {
         // that the full-body placement puts the header JUST at the
         // top (not sticky-worthy) but any reduction would push it
         // off. A 20-line hunk with a tight viewport hits this.
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(20);
         let mut app = app_with_context_hunk("src/foo.rs", "fn boundary() {", lines, 100);
         // Jump into the middle of the hunk so any sticky reservation
         // would definitely push the header off-screen.
@@ -3262,9 +3256,7 @@ mod tests {
         // Build a single hunk tall enough that scrolling past the header
         // pushes it off the top of a small viewport. The renderer should
         // pin the header on viewport row 0.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(40);
         let mut app = app_with_context_hunk("src/foo.rs", "fn long_function() {", lines, 100);
         // Skip past the hunk header so the renderer has to pin it.
         let header_row = app.layout.hunk_starts[0];

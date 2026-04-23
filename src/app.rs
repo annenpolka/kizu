@@ -4405,8 +4405,8 @@ mod tests {
     use crate::git::{DiffContent, DiffLine, LineKind};
     use crate::test_support::{
         app_with_files as fake_app, app_with_hunks, binary_file, diff_line, file_view_state, hunk,
-        install_search, make_file, single_added_app, single_added_file, single_added_hunk_file,
-        single_deleted_file, single_hunk_app, single_hunk_file,
+        install_search, make_file, numbered_added_lines, single_added_app, single_added_file,
+        single_added_hunk_file, single_deleted_file, single_hunk_app, single_hunk_file,
     };
     use std::time::Duration;
 
@@ -4619,12 +4619,7 @@ mod tests {
     fn follow_target_row_lands_on_hunk_header_even_for_tall_hunk() {
         // Even with a 20-line hunk, follow parks on the hunk header
         // so the user sees the @@ context and diff body from the top.
-        let huge_hunk = hunk(
-            1,
-            (0..20)
-                .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-                .collect(),
-        );
+        let huge_hunk = hunk(1, numbered_added_lines(20));
         let app = app_with_hunks("big.rs", vec![huge_hunk], 500);
         assert!(
             matches!(app.layout.rows[app.scroll], RowKind::HunkHeader { .. }),
@@ -4711,9 +4706,7 @@ mod tests {
         // old `next_hunk` fallback to `hunk_starts.last()` made the
         // cursor leap backward, which is the opposite of what `j`
         // should mean.
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(20);
         let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(15);
         let (_start, end) = app.layout.change_runs[0];
@@ -4734,9 +4727,7 @@ mod tests {
         // the user actually sees the change. Once the cursor reaches
         // the run's last row, the next `j` hands off to the straight
         // hunk-cross path (no trailing-context dwell).
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(20);
         let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
@@ -4792,9 +4783,7 @@ mod tests {
         // start; the next `k` falls through to the hunk header
         // (v0.4: hunk headers are landing targets). With no prev
         // hunk, a further `k` stays put.
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(20);
         let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
@@ -5089,9 +5078,7 @@ mod tests {
         // Even from the last row of a long hunk, `l` jumps to the
         // next hunk's header. This mirrors the old SHIFT-J "flow
         // across boundary" behavior but now lives on `l`.
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(20);
         let mut app = app_with_hunks(
             "a.rs",
             vec![
@@ -5188,9 +5175,7 @@ mod tests {
         // Single long hunk, much taller than the viewport: should fall
         // back to centring the cursor row instead of trying to centre
         // the whole hunk.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(40);
         let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         let header = app.layout.hunk_starts[0];
         // Park well inside the long hunk.
@@ -5283,9 +5268,7 @@ mod tests {
         // When hunk_size > viewport, Top mode falls back to pinning
         // the cursor row itself to the ceiling so J/K chunk scroll
         // keeps working.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
+        let lines = numbered_added_lines(40);
         let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.cursor_placement = CursorPlacement::Top;
         let header = app.layout.hunk_starts[0];

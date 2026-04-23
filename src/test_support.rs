@@ -17,6 +17,12 @@ pub(crate) fn diff_line(kind: LineKind, content: &str) -> DiffLine {
     }
 }
 
+pub(crate) fn numbered_added_lines(count: usize) -> Vec<DiffLine> {
+    (0..count)
+        .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+        .collect()
+}
+
 pub(crate) fn hunk(old_start: usize, lines: Vec<DiffLine>) -> Hunk {
     let added = lines.iter().filter(|l| l.kind == LineKind::Added).count();
     let deleted = lines.iter().filter(|l| l.kind == LineKind::Deleted).count();
