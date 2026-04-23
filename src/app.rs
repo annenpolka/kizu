@@ -4405,7 +4405,7 @@ mod tests {
     use crate::git::{DiffContent, DiffLine, FileStatus, LineKind};
     use crate::test_support::{
         app_with_files as fake_app, binary_file, diff_line, file_view_state, hunk, install_search,
-        make_file, single_added_app,
+        make_file, single_added_app, single_added_file, single_hunk_file,
     };
     use std::time::Duration;
 
@@ -4538,11 +4538,7 @@ mod tests {
                 200,
             ),
             // b.rs: older, 1 hunk
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-                100,
-            ),
+            single_added_file("b.rs", "z", 100),
         ];
         let mut app = fake_app(app_files);
         // Three hunks total → three hunk_starts.
@@ -4587,11 +4583,7 @@ mod tests {
         // the newest file so the user sees the most recent @@
         // context and the diff body below it.
         let app = fake_app(vec![
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "c")])],
-                100,
-            ),
+            single_added_file("older.rs", "c", 100),
             make_file(
                 "newest.rs",
                 vec![
@@ -4643,16 +4635,8 @@ mod tests {
     #[test]
     fn current_file_path_reports_the_file_under_the_cursor() {
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("a.rs", "x", 200),
+            single_added_file("b.rs", "y", 100),
         ]);
         // a.rs has the larger mtime → it sorts to the bottom of the
         // layout, and bootstrap follow lands on it.
@@ -4729,7 +4713,7 @@ mod tests {
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(15);
         let (_start, end) = app.layout.change_runs[0];
         let last = end - 1;
@@ -4752,7 +4736,7 @@ mod tests {
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
         assert_eq!(chunk, 5, "viewport=15 → chunk=5");
@@ -4784,16 +4768,8 @@ mod tests {
         // file boundary between them. One tiny hunk per file so the
         // jump has to cross from a.rs into b.rs.
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "alpha")])],
-                100,
-            ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "beta")])],
-                200,
-            ),
+            single_added_file("a.rs", "alpha", 100),
+            single_added_file("b.rs", "beta", 200),
         ]);
         assert_eq!(app.layout.hunk_starts.len(), 2);
         let first_hunk = app.layout.hunk_starts[0];
@@ -4818,7 +4794,7 @@ mod tests {
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
         let (run_start, run_end) = app.layout.change_runs[0];
@@ -4873,7 +4849,7 @@ mod tests {
             diff_line(LineKind::Added, "r3-a1"), // run 3 start
             diff_line(LineKind::Context, "ctx11"),
         ];
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(10);
         let runs: Vec<_> = app.layout.change_runs.clone();
         assert_eq!(runs.len(), 3);
@@ -4915,11 +4891,7 @@ mod tests {
                 )],
                 100,
             ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "b1")])],
-                200,
-            ),
+            single_added_file("b.rs", "b1", 200),
         ]);
         app.last_body_height.set(40);
         let runs = app.layout.change_runs.clone();
@@ -5031,12 +5003,8 @@ mod tests {
             lines.push(diff_line(LineKind::Context, "trail"));
         }
         let mut app = fake_app(vec![
-            make_file("a.rs", vec![hunk(1, lines)], 100),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
+            single_hunk_file("a.rs", lines, 100),
+            single_added_file("b.rs", "x", 200),
         ]);
         app.last_body_height.set(10);
         let (run_start, _) = app.layout.change_runs[0];
@@ -5226,7 +5194,7 @@ mod tests {
         let lines: Vec<DiffLine> = (0..40)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         let header = app.layout.hunk_starts[0];
         // Park well inside the long hunk.
         app.scroll_to(header + 20);
@@ -5321,7 +5289,7 @@ mod tests {
         let lines: Vec<DiffLine> = (0..40)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.cursor_placement = CursorPlacement::Top;
         let header = app.layout.hunk_starts[0];
         app.scroll_to(header + 20);
@@ -5691,16 +5659,8 @@ mod tests {
     #[test]
     fn scroll_to_does_not_land_on_spacer_rows() {
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                100,
-            ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                200,
-            ),
+            single_added_file("a.rs", "x", 100),
+            single_added_file("b.rs", "y", 200),
         ]);
 
         let spacer = app
@@ -5720,16 +5680,8 @@ mod tests {
     #[test]
     fn scroll_by_skips_spacer_rows_in_nowrap_mode() {
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                100,
-            ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                200,
-            ),
+            single_added_file("a.rs", "x", 100),
+            single_added_file("b.rs", "y", 200),
         ]);
         app.follow_mode = false;
 
@@ -6392,21 +6344,9 @@ mod tests {
     #[test]
     fn picker_filters_by_substring_case_insensitively() {
         let mut app = fake_app(vec![
-            make_file(
-                "src/Auth.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "src/handler.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                200,
-            ),
-            make_file(
-                "tests/auth_test.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-                100,
-            ),
+            single_added_file("src/Auth.rs", "x", 300),
+            single_added_file("src/handler.rs", "y", 200),
+            single_added_file("tests/auth_test.rs", "z", 100),
         ]);
         app.open_picker();
         type_chars(&mut app, "auth");
@@ -6421,11 +6361,7 @@ mod tests {
     #[test]
     fn picker_enter_jumps_to_selected_file_first_hunk_and_closes() {
         let mut app = fake_app(vec![
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
+            single_added_file("newest.rs", "x", 300),
             make_file(
                 "older.rs",
                 vec![hunk(50, vec![diff_line(LineKind::Added, "y")])],
@@ -6523,11 +6459,7 @@ mod tests {
         // filesystem. Every piece of baseline-adjacent state must
         // survive a failed reset unchanged.
         let mut app = fake_app(vec![
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "keep me")])],
-                100,
-            ),
+            single_added_file("older.rs", "keep me", 100),
             make_file(
                 "newer.rs",
                 vec![hunk(2, vec![diff_line(LineKind::Added, "also keep")])],
@@ -6717,16 +6649,8 @@ mod tests {
         // Success path: bootstrap populates files, sorts them ascending by
         // mtime, builds a layout, and lands on the follow target.
         let diff = Ok(vec![
-            make_file(
-                "newer.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
-                200,
-            ),
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "b")])],
-                100,
-            ),
+            single_added_file("newer.rs", "a", 200),
+            single_added_file("older.rs", "b", 100),
         ]);
         let app = App::bootstrap_with_diff(
             PathBuf::from("/tmp/fake"),
@@ -6765,11 +6689,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         unsafe { std::env::set_var("KIZU_SESSION_ID", "agent-xyz") };
-        let diff = Ok(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
-            100,
-        )]);
+        let diff = Ok(vec![single_added_file("a.rs", "a", 100)]);
         let app = App::bootstrap_with_diff(
             PathBuf::from("/tmp/fake"),
             PathBuf::from("/tmp/fake/.git"),
@@ -6794,11 +6714,7 @@ mod tests {
         // explicit manual navigation — the next recompute must not yank
         // the user back to the newest file's last hunk.
         let mut app = fake_app(vec![
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
+            single_added_file("newest.rs", "x", 300),
             make_file(
                 "older.rs",
                 vec![hunk(50, vec![diff_line(LineKind::Added, "y")])],
@@ -6843,16 +6759,8 @@ mod tests {
     #[test]
     fn picker_cursor_tracks_same_file_across_recompute_reordering() {
         let mut app = fake_app(vec![
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("newest.rs", "x", 300),
+            single_added_file("older.rs", "y", 100),
         ]);
 
         app.open_picker();
@@ -6866,21 +6774,9 @@ mod tests {
         // reorder newest-first, so a cursor tracked only by index would now
         // point at a different file.
         app.apply_computed_files(vec![
-            make_file(
-                "brand_new.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-                400,
-            ),
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("brand_new.rs", "z", 400),
+            single_added_file("newest.rs", "x", 300),
+            single_added_file("older.rs", "y", 100),
         ]);
 
         let after = app
@@ -6897,11 +6793,7 @@ mod tests {
     fn refresh_anchor_keeps_us_on_the_same_hunk_after_recompute() {
         // First snapshot: 2 files, scroll parked on b.rs's hunk.
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
+            single_added_file("a.rs", "x", 200),
             make_file(
                 "b.rs",
                 vec![hunk(42, vec![diff_line(LineKind::Added, "y")])],
@@ -6921,11 +6813,7 @@ mod tests {
         // Simulate a recompute by appending a new (older) file. The list
         // is re-sorted ascending; b.rs stays in the layout but its row
         // index moves. The anchor must still resolve to it.
-        app.files.push(make_file(
-            "c.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-            50, // older than b.rs
-        ));
+        app.files.push(single_added_file("c.rs", "z", 50));
         app.files.sort_by_key(|x| x.mtime);
         app.build_layout();
         app.refresh_anchor();
@@ -6936,11 +6824,7 @@ mod tests {
     #[test]
     fn refresh_anchor_keeps_manual_mode_on_same_file_when_hunk_identity_changes() {
         let mut app = fake_app(vec![
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
+            single_added_file("newest.rs", "x", 300),
             make_file(
                 "older.rs",
                 vec![hunk(50, vec![diff_line(LineKind::Added, "y")])],
@@ -7038,11 +6922,7 @@ mod tests {
         }
         body_lines.push(diff_line(LineKind::Added, "y"));
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
+            single_added_file("a.rs", "x", 200),
             make_file("b.rs", vec![hunk(42, body_lines.clone())], 100),
         ]);
 
@@ -7074,11 +6954,7 @@ mod tests {
         // and its mtime bumped past a.rs's, so its position in the
         // layout moves from first to last.
         let fresh = vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
+            single_added_file("a.rs", "x", 200),
             make_file("b.rs", vec![hunk(42, body_lines.clone())], 400),
         ];
         app.apply_computed_files(fresh);
@@ -7121,7 +6997,7 @@ mod tests {
             diff_line(LineKind::Added, "scar target"),
             diff_line(LineKind::Added, "line three"),
         ];
-        let mut app = fake_app(vec![make_file("b.rs", vec![hunk(1, pre_edit_body)], 100)]);
+        let mut app = fake_app(vec![single_hunk_file("b.rs", pre_edit_body, 100)]);
 
         // Park cursor on the "scar target" DiffLine (hunk_idx=0,
         // line_idx=1) and pretend a scar was just inserted there —
@@ -7159,7 +7035,7 @@ mod tests {
         // "line gone" branch we cut the hunk down to one line so
         // new-line 2 is past the end.
         let edited_body = vec![diff_line(LineKind::Added, "line one")];
-        let fresh = vec![make_file("b.rs", vec![hunk(1, edited_body)], 100)];
+        let fresh = vec![single_hunk_file("b.rs", edited_body, 100)];
         app.view_mode = ViewMode::Stream;
         app.apply_computed_files(fresh);
 
@@ -7396,11 +7272,7 @@ mod tests {
     /// visual rows. Used by the wrap regression tests below.
     fn wrap_regression_app(wrap_factor: usize, width: usize) -> App {
         let content: String = std::iter::repeat_n('x', width * wrap_factor).collect();
-        fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, &content)])],
-            100,
-        )])
+        single_added_app("a.rs", &content)
     }
 
     #[test]
@@ -7654,11 +7526,7 @@ mod tests {
         // successful payload. The pre-rework bug cleared
         // watcher_health via the same code path that clears
         // last_error.
-        app.apply_computed_files(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        app.apply_computed_files(vec![single_added_file("a.rs", "x", 100)]);
 
         assert!(
             app.watcher_health
@@ -7672,11 +7540,7 @@ mod tests {
         let mut app = fake_app(vec![]);
         app.input_health = Some("input: stream hiccup".into());
 
-        app.apply_computed_files(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        app.apply_computed_files(vec![single_added_file("a.rs", "x", 100)]);
 
         assert_eq!(
             app.input_health.as_deref(),
@@ -7921,11 +7785,7 @@ mod tests {
         // dispatch must surface that through `last_error` without
         // panicking.
         let tmp = tempfile::tempdir().expect("tmp");
-        let file = make_file(
-            "ghost.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "fn missing()")])],
-            100,
-        );
+        let file = single_added_file("ghost.rs", "fn missing()", 100);
         let mut app = fake_app(vec![file]);
         app.root = tmp.path().to_path_buf();
         cursor_on_nth_diff_line(&mut app, 0);
@@ -8618,11 +8478,7 @@ mod tests {
                 vec![hunk(1, vec![diff_line(LineKind::Context, "ctx")])],
                 50,
             ),
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
-                100,
-            ),
+            single_added_file("a.rs", "foo bar", 100),
         ]);
 
         let state = app.search.as_ref().expect("search survives recompute");
@@ -8721,11 +8577,7 @@ mod tests {
         assert_eq!(match_count, 2);
 
         // Recompute with only one `foo` remaining.
-        app.apply_computed_files(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
-            100,
-        )]);
+        app.apply_computed_files(vec![single_added_file("a.rs", "foo bar", 100)]);
 
         let state = app.search.as_ref().unwrap();
         assert_eq!(state.matches.len(), 1);

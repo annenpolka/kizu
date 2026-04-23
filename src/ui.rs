@@ -1726,7 +1726,7 @@ mod tests {
     use crate::git::{DiffContent, DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     use crate::test_support::{
         app_with_files, binary_file as timed_binary_file, diff_line, file_view_state, hunk,
-        install_search, make_file, single_added_app,
+        install_search, make_file, single_added_app, single_added_file,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2311,11 +2311,7 @@ mod tests {
         // EOF-no-newline rows get a Yellow `∅`. Pin the new default:
         // normal rows must be glyph-free.
         let long_content: String = (0..120u8).map(|i| (b'a' + (i % 26)) as char).collect();
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, &long_content)])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", &long_content);
         app.wrap_lines = true;
 
         let view = render_to_string(&app, 80, 14);
@@ -2392,11 +2388,7 @@ mod tests {
         // silently truncated or that bled past the viewport.
         let forty_kanji: String = "あいうえおかきくけこ".repeat(4);
         assert_eq!(forty_kanji.chars().count(), 40);
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, &forty_kanji)])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", &forty_kanji);
         app.wrap_lines = true;
 
         // Viewport: 45 cols (5 for left bar + 40 for body).
@@ -2421,11 +2413,7 @@ mod tests {
         // at end of file` case. The new EOF marker is `∅` in Yellow.
         // Pin the *presence* of `∅` and the *absence* of the legacy `¶`.
         let long_content: String = (0..40u8).map(|i| (b'a' + (i % 26)) as char).collect();
-        let mut file = make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, &long_content)])],
-            100,
-        );
+        let mut file = single_added_file("a.rs", &long_content, 100);
         let DiffContent::Text(hunks) = &mut file.content else {
             panic!("expected text diff");
         };
@@ -2445,11 +2433,7 @@ mod tests {
     fn nowrap_mode_shows_eof_marker_when_no_terminal_newline() {
         // v0.5 M2: EOF-no-newline information is independent of wrap
         // mode. The marker must appear in nowrap as well.
-        let mut file = make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "short")])],
-            100,
-        );
+        let mut file = single_added_file("a.rs", "short", 100);
         let DiffContent::Text(hunks) = &mut file.content else {
             panic!("expected text diff");
         };
@@ -2692,21 +2676,9 @@ mod tests {
     #[test]
     fn render_picker_overlays_a_box_with_query_and_filtered_list() {
         let mut app = populated_app(vec![
-            make_file(
-                "src/auth.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "src/handler.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                200,
-            ),
-            make_file(
-                "tests/auth_test.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-                100,
-            ),
+            single_added_file("src/auth.rs", "x", 300),
+            single_added_file("src/handler.rs", "y", 200),
+            single_added_file("tests/auth_test.rs", "z", 100),
         ]);
         app.picker = Some(PickerState {
             query: "auth".into(),
@@ -2859,11 +2831,7 @@ mod tests {
 
     #[test]
     fn file_header_shows_prefix_when_set() {
-        let mut file = make_file(
-            "src/auth.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        );
+        let mut file = single_added_file("src/auth.rs", "x", 100);
         file.header_prefix = Some("14:03:22 Write".to_string());
         let mut app = populated_app(vec![file]);
         app.scroll = 0;

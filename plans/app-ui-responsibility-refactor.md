@@ -32,6 +32,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 21:03:51Z) 共通 key dispatch / fixture 削減後の full gate (`just ci`) を通す
 - [x] (2026-04-23 21:07:25Z) thin wrapper cleanup pass: picker/search navigation の薄い wrapper と UI test の local `fake_app` / `binary_file` wrapper を削除
 - [x] (2026-04-23 21:07:25Z) thin wrapper cleanup 後の full gate (`just ci`) を通す
+- [x] (2026-04-23 21:23:39Z) one-hunk fixture 削減 pass: `single_hunk_file` / `single_added_file` を追加し、app/ui tests の単一 hunk fixture 重複を削除
+- [x] (2026-04-23 21:23:39Z) one-hunk fixture 削減後の targeted tests と full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -95,6 +97,9 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - Observation: UI test module の local `fake_app()` と `binary_file()` は、`test_support` の helper を薄く包むだけだった。
   Evidence: `app_with_files(Vec::new())` と `timed_binary_file(..., 0)` を直接使う形にして wrapper を削除した後、`ui::tests` 63 件と full `just ci` が成功した。
 
+- Observation: app/ui tests には `make_file(..., vec![hunk(1, vec![diff_line(LineKind::Added, ...)])], secs)` と `make_file(..., vec![hunk(1, lines)], secs)` が大量に残っていた。
+  Evidence: `single_added_file` と `single_hunk_file` に置換した後、差分は 3 ファイルで 65 insertions / 241 deletions、純減 176 行になり、`ui::tests` 63 件、`picker` 6 件、`search` 19 件、`apply_reset` 6 件、`scroll_to` 5 件、`apply_computed_files` 3 件、`refresh_anchor` 3 件、`wrap` 31 件、full `just ci` が成功した。
+
 ## Decision Log
 
 - Decision: 最初の大規模リファクタは全ファイル一括分割ではなく、`src/app.rs` の Stream mode 差分構築と `src/ui.rs` の footer 描画に限定する。
@@ -157,6 +162,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: `move_picker_cursor(1)` / `search_jump_by(-1)` は十分に読める。中間 wrapper があると分岐の実体を追うためにジャンプが増え、コード量も増える。
   Date/Author: 2026-04-23 21:07:25Z / Codex
 
+- Decision: 単一 hunk / 単一 added 行の fixture は `src/test_support.rs` に寄せる。
+  Rationale: これらは app/ui test の意味ではなく、`FileDiff` を作るための儀式だった。`single_hunk_file` と `single_added_file` に閉じることで、テスト本文を「どのファイルに何があるか」だけに近づけられる。
+  Date/Author: 2026-04-23 21:23:39Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -172,6 +181,8 @@ post-commit 削減 pass では、`src/app.rs` と `src/ui.rs` の test-only boil
 共通 key dispatch / fixture 削減 pass では、normal/file-view の共通 action key を `handle_common_action_key` に寄せ、単一 added 行の fixture を `single_added_app` として共有化した。`src/app.rs` は 10386 行から 10281 行へ、`src/ui.rs` は 3730 行から 3661 行へ、`src/test_support.rs` は 153 行から 161 行になった。差分は 3 ファイルで 92 insertions / 258 deletions、純減 166 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 thin wrapper cleanup pass では、picker/search navigation の direction wrapper と UI test module の local wrapper を削除した。`src/app.rs` は 10281 行から 10259 行へ、`src/ui.rs` は 3661 行から 3653 行へ減った。差分は 2 ファイルで 14 insertions / 44 deletions、純減 30 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
+
+one-hunk fixture 削減 pass では、app/ui tests の単一 hunk / 単一 added 行 fixture を `single_hunk_file` と `single_added_file` に集約した。`src/app.rs` は 10259 行から 10111 行へ、`src/ui.rs` は 3653 行から 3621 行へ、`src/test_support.rs` は 161 行から 165 行になった。差分は 3 ファイルで 65 insertions / 241 deletions、純減 176 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -468,6 +479,53 @@ thin wrapper cleanup pass 後の追加証拠は以下である。
     35 pass
     0 fail
 
+one-hunk fixture 削減 pass 後の追加証拠は以下である。
+
+    src/app.rs          10111 lines
+    src/ui.rs            3621 lines
+    src/test_support.rs   165 lines
+
+    git diff --stat -- src/app.rs src/ui.rs src/test_support.rs
+    src/app.rs          | 242 ++++++++++------------------------------------------
+    src/test_support.rs |  14 +--
+    src/ui.rs           |  50 ++---------
+    3 files changed, 65 insertions(+), 241 deletions(-)
+
+    cargo test --all-targets --all-features ui::tests -- --nocapture
+    63 passed
+
+    cargo test --all-targets --all-features picker -- --nocapture
+    6 passed
+
+    cargo test --all-targets --all-features search -- --nocapture
+    19 passed
+
+    cargo test --all-targets --all-features apply_reset -- --nocapture
+    6 passed
+
+    cargo test --all-targets --all-features scroll_to -- --nocapture
+    5 passed
+
+    cargo test --all-targets --all-features apply_computed_files -- --nocapture
+    3 passed
+
+    cargo test --all-targets --all-features refresh_anchor -- --nocapture
+    3 passed
+
+    cargo test --all-targets --all-features wrap -- --nocapture
+    31 passed
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
 ## Interfaces and Dependencies
 
 `/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/stream.rs` は次の interface を提供する。
@@ -491,4 +549,4 @@ thin wrapper cleanup pass 後の追加証拠は以下である。
 
 help overlay は `app.config.keys` を読んでキー表示を組み立てる。picker overlay は `app.picker_results()`、`app.files`、`format_mtime` を使い、表示だけを担当する。状態更新やキー入力処理は引き続き `src/app.rs` に残す。
 
-`/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/test_support.rs` は `#[cfg(test)]` の test-only module である。`src/app.rs` と `src/ui.rs` の test module からだけ使い、production code からは参照しない。主な helper は `diff_line`、`hunk`、`make_file`、`binary_file`、`app_with_files`、`file_view_state`、`install_search` で、同じ fixture 生成を複数 test module に置かないためのもの。
+`/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/test_support.rs` は `#[cfg(test)]` の test-only module である。`src/app.rs` と `src/ui.rs` の test module からだけ使い、production code からは参照しない。主な helper は `diff_line`、`hunk`、`make_file`、`single_hunk_file`、`single_added_file`、`binary_file`、`app_with_files`、`file_view_state`、`install_search` で、同じ fixture 生成を複数 test module に置かないためのもの。
