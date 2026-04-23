@@ -4404,10 +4404,11 @@ mod tests {
     use super::*;
     use crate::git::{DiffContent, DiffLine, LineKind};
     use crate::test_support::{
-        added_hunk, added_hunk_app, app_with_files as fake_app, app_with_hunks, binary_file,
-        diff_line, diff_lines, file_view_state, hunk, install_search, make_file,
-        numbered_added_lines, prefixed_diff_lines, single_added_app, single_added_file,
-        single_added_hunk_file, single_deleted_file, single_hunk_app, single_hunk_file,
+        added_hunk, added_hunk_app, added_hunk_file, app_with_files as fake_app, app_with_hunks,
+        binary_file, context_hunk_file, diff_line, file_view_state, file_with_hunk, hunk,
+        install_search, make_file, numbered_added_lines, prefixed_diff_lines, single_added_app,
+        single_added_file, single_added_hunk_file, single_deleted_file, single_hunk_app,
+        single_hunk_file,
     };
     use std::time::Duration;
 
@@ -5064,23 +5065,9 @@ mod tests {
         // Centring 3 rows in a 9-row viewport means
         // viewport_top = 8 - (9 - 3)/2 = 8 - 3 = 5.
         let mut app = fake_app(vec![
-            make_file(
-                "before.rs",
-                vec![hunk(
-                    1,
-                    diff_lines(LineKind::Context, &[" a", " b", " c", " d"]),
-                )],
-                100,
-            ),
-            make_file("target.rs", vec![added_hunk(1, &["alpha", "beta"])], 200),
-            make_file(
-                "after.rs",
-                vec![hunk(
-                    1,
-                    diff_lines(LineKind::Context, &[" a", " b", " c", " d"]),
-                )],
-                300,
-            ),
+            context_hunk_file("before.rs", 1, &[" a", " b", " c", " d"], 100),
+            added_hunk_file("target.rs", 1, &["alpha", "beta"], 200),
+            context_hunk_file("after.rs", 1, &[" a", " b", " c", " d"], 300),
         ]);
         // Park the cursor on target.rs's hunk header.
         let target_hunk_row = app.layout.hunk_starts[1];
@@ -5137,23 +5124,9 @@ mod tests {
         // Top mode pins hunk_top (8) to the viewport ceiling, so
         // viewport_top = 8.
         let mut app = fake_app(vec![
-            make_file(
-                "before.rs",
-                vec![hunk(
-                    1,
-                    diff_lines(LineKind::Context, &[" a", " b", " c", " d"]),
-                )],
-                100,
-            ),
-            make_file("target.rs", vec![added_hunk(1, &["alpha", "beta"])], 200),
-            make_file(
-                "after.rs",
-                vec![hunk(
-                    1,
-                    diff_lines(LineKind::Context, &[" a", " b", " c", " d"]),
-                )],
-                300,
-            ),
+            context_hunk_file("before.rs", 1, &[" a", " b", " c", " d"], 100),
+            added_hunk_file("target.rs", 1, &["alpha", "beta"], 200),
+            context_hunk_file("after.rs", 1, &[" a", " b", " c", " d"], 300),
         ]);
         app.cursor_placement = CursorPlacement::Top;
         let target_hunk_row = app.layout.hunk_starts[1];
@@ -6740,14 +6713,14 @@ mod tests {
     fn visual_viewport_top_matches_target_when_idle() {
         // Build a multi-file layout so the viewport has something to center.
         let app = fake_app(vec![
-            make_file(
+            file_with_hunk(
                 "a.rs",
-                vec![hunk(1, prefixed_diff_lines(LineKind::Added, "a", 8))],
+                hunk(1, prefixed_diff_lines(LineKind::Added, "a", 8)),
                 100,
             ),
-            make_file(
+            file_with_hunk(
                 "b.rs",
-                vec![hunk(1, prefixed_diff_lines(LineKind::Added, "b", 8))],
+                hunk(1, prefixed_diff_lines(LineKind::Added, "b", 8)),
                 200,
             ),
         ]);
@@ -6760,14 +6733,14 @@ mod tests {
     #[test]
     fn visual_viewport_top_tweens_between_from_and_target() {
         let mut app = fake_app(vec![
-            make_file(
+            file_with_hunk(
                 "a.rs",
-                vec![hunk(1, prefixed_diff_lines(LineKind::Added, "a", 8))],
+                hunk(1, prefixed_diff_lines(LineKind::Added, "a", 8)),
                 100,
             ),
-            make_file(
+            file_with_hunk(
                 "b.rs",
-                vec![hunk(1, prefixed_diff_lines(LineKind::Added, "b", 8))],
+                hunk(1, prefixed_diff_lines(LineKind::Added, "b", 8)),
                 200,
             ),
         ]);
@@ -7971,11 +7944,7 @@ mod tests {
         // Simulate a watcher-driven recompute that prepends a new file
         // so every layout row index downstream of it shifts.
         app.apply_computed_files(vec![
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Context, "ctx")])],
-                50,
-            ),
+            context_hunk_file("b.rs", 1, &["ctx"], 50),
             single_added_file("a.rs", "foo bar", 100),
         ]);
 

@@ -56,6 +56,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 22:10:48Z) scar real-fs fixture 後の scar/editor/undo targeted tests、clippy、full gate (`just ci`) を通す
 - [x] (2026-04-23 22:13:40Z) deleted-row lookup pass: scar deleted-line tests の duplicated RowKind scan を helper に寄せる
 - [x] (2026-04-23 22:13:40Z) deleted-row lookup 後の targeted tests、clippy、full gate (`just ci`) を通す
+- [x] (2026-04-23 22:16:57Z) hunk file fixture pass: single-hunk `FileDiff` wrapper を `file_with_hunk` / `added_hunk_file` / `context_hunk_file` に寄せる
+- [x] (2026-04-23 22:16:57Z) hunk file fixture 後の targeted tests、clippy、full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -154,6 +156,9 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: deleted-line scar e2e tests は、layout から最初の Deleted `DiffLine` row を探す同じ closure を二重に持っていた。
   Evidence: `first_diff_row_with_kind` に寄せた後、`src/app.rs` は 9506 行から 9480 行へ減った。差分は 1 ファイルで 26 insertions / 52 deletions、純減 26 行になり、`scar_on_` 3 件、fmt check、clippy、full `just ci` が成功した。
+
+- Observation: app tests には、単一 hunk の `FileDiff` を作るためだけに `make_file(name, vec![hunk(...)], secs)` を展開する箇所がまだ残っていた。
+  Evidence: `file_with_hunk` / `added_hunk_file` / `context_hunk_file` に寄せた後、`src/app.rs` は 9480 行から 9449 行へ、`src/test_support.rs` は 219 行から 240 行になった。差分は 2 ファイルで 43 insertions / 53 deletions、純減 10 行になり、`viewport_top` 6 件、`search_matches_rehydrate` 2 件、fmt check、clippy、full `just ci` が成功した。
 
 ## Decision Log
 
@@ -265,6 +270,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: scar deleted-line tests は、row の種類だけではなく `FileDiff` 側の line kind を見て対象行を決める必要がある。この lookup を closure の直書きにすると、テスト本文より探索手順の方が大きくなるため helper 化する。
   Date/Author: 2026-04-23 22:13:40Z / Codex
 
+- Decision: 単一 hunk の `FileDiff` fixture は `file_with_hunk` 系 helper に寄せる。
+  Rationale: `make_file(name, vec![hunk(...)], secs)` は、テスト本文にとって hunk vector の包装手順でしかない。helper 名で added/context/single hunk の意図を表すと、viewport や search rehydrate の主張に読み筋が戻る。
+  Date/Author: 2026-04-23 22:16:57Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -304,6 +313,8 @@ UI buffer lookup pass では、UI tests の rendered buffer text-run 探索を `
 scar real-fs fixture pass では、tempdir-backed scar/editor/undo tests の単一 added/context 行 fixture を helper に寄せた。`src/app.rs` は 9556 行から 9506 行へ減った。差分は 1 ファイルで 76 insertions / 126 deletions、純減 50 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 deleted-row lookup pass では、scar deleted-line tests の重複 RowKind scan を `first_diff_row_with_kind` に集約した。`src/app.rs` は 9506 行から 9480 行へ減った。差分は 1 ファイルで 26 insertions / 52 deletions、純減 26 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
+
+hunk file fixture pass では、single-hunk `FileDiff` wrapper を `file_with_hunk` / `added_hunk_file` / `context_hunk_file` に寄せた。`src/app.rs` は 9480 行から 9449 行へ、`src/test_support.rs` は 219 行から 240 行になった。差分は 2 ファイルで 43 insertions / 53 deletions、純減 10 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -1030,6 +1041,39 @@ deleted-row lookup pass 後の追加証拠は以下である。
     35 pass
     0 fail
 
+hunk file fixture pass 後の追加証拠は以下である。
+
+    src/app.rs           9449 lines
+    src/ui.rs            3516 lines
+    src/test_support.rs   240 lines
+
+    git diff --stat
+    src/app.rs          | 71 +++++++++++++++--------------------------------------
+    src/test_support.rs | 25 +++++++++++++++++--
+    2 files changed, 43 insertions(+), 53 deletions(-)
+
+    cargo test --all-targets --all-features viewport_top -- --nocapture
+    6 passed
+
+    cargo test --all-targets --all-features search_matches_rehydrate -- --nocapture
+    2 passed
+
+    cargo fmt --all -- --check
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
 ## Interfaces and Dependencies
 
 `/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/stream.rs` は次の interface を提供する。
@@ -1053,4 +1097,4 @@ deleted-row lookup pass 後の追加証拠は以下である。
 
 help overlay は `app.config.keys` を読んでキー表示を組み立てる。picker overlay は `app.picker_results()`、`app.files`、`format_mtime` を使い、表示だけを担当する。状態更新やキー入力処理は引き続き `src/app.rs` に残す。
 
-`/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/test_support.rs` は `#[cfg(test)]` の test-only module である。`src/app.rs` と `src/ui.rs` の test module からだけ使い、production code からは参照しない。主な helper は `diff_line`、`diff_lines`、`numbered_added_lines`、`prefixed_diff_lines`、`hunk`、`added_hunk`、`make_file`、`single_hunk_file`、`single_added_file`、`single_added_hunk_file`、`single_deleted_file`、`binary_file`、`app_with_file`、`app_with_hunks`、`single_hunk_app`、`added_hunk_app`、`app_with_files`、`file_view_state`、`install_search` で、同じ fixture 生成を複数 test module に置かないためのもの。
+`/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/test_support.rs` は `#[cfg(test)]` の test-only module である。`src/app.rs` と `src/ui.rs` の test module からだけ使い、production code からは参照しない。主な helper は `diff_line`、`diff_lines`、`numbered_added_lines`、`prefixed_diff_lines`、`hunk`、`added_hunk`、`make_file`、`file_with_hunk`、`added_hunk_file`、`context_hunk_file`、`single_hunk_file`、`single_added_file`、`single_added_hunk_file`、`single_deleted_file`、`binary_file`、`app_with_file`、`app_with_hunks`、`single_hunk_app`、`added_hunk_app`、`app_with_files`、`file_view_state`、`install_search` で、同じ fixture 生成を複数 test module に置かないためのもの。

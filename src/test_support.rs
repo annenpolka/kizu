@@ -70,8 +70,29 @@ pub(crate) fn make_file(name: &str, hunks: Vec<Hunk>, secs: u64) -> FileDiff {
     }
 }
 
+pub(crate) fn file_with_hunk(name: &str, hunk: Hunk, secs: u64) -> FileDiff {
+    make_file(name, vec![hunk], secs)
+}
+
+pub(crate) fn added_hunk_file(name: &str, old_start: usize, lines: &[&str], secs: u64) -> FileDiff {
+    file_with_hunk(name, added_hunk(old_start, lines), secs)
+}
+
+pub(crate) fn context_hunk_file(
+    name: &str,
+    old_start: usize,
+    lines: &[&str],
+    secs: u64,
+) -> FileDiff {
+    file_with_hunk(
+        name,
+        hunk(old_start, diff_lines(LineKind::Context, lines)),
+        secs,
+    )
+}
+
 pub(crate) fn single_hunk_file(name: &str, lines: Vec<DiffLine>, secs: u64) -> FileDiff {
-    make_file(name, vec![hunk(1, lines)], secs)
+    file_with_hunk(name, hunk(1, lines), secs)
 }
 
 pub(crate) fn single_added_hunk_file(
@@ -80,7 +101,7 @@ pub(crate) fn single_added_hunk_file(
     text: &str,
     secs: u64,
 ) -> FileDiff {
-    make_file(name, vec![added_hunk(old_start, &[text])], secs)
+    added_hunk_file(name, old_start, &[text], secs)
 }
 
 pub(crate) fn single_added_file(name: &str, text: &str, secs: u64) -> FileDiff {
