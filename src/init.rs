@@ -664,10 +664,33 @@ fn ask_scope_fallback(kind: AgentKind, requested: Scope) -> Result<Option<Scope>
 
 fn install_agent(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<InstallReport> {
     match kind {
-        AgentKind::ClaudeCode => install_claude_code(scope, project_root),
+        AgentKind::ClaudeCode => install_settings_hook_agent(
+            AgentKind::ClaudeCode,
+            scope,
+            project_root,
+            "claude-code",
+            Some("Edit|Write|MultiEdit"),
+            vec![],
+        ),
         AgentKind::Cursor => install_cursor(scope, project_root),
-        AgentKind::Codex => install_codex(scope, project_root),
-        AgentKind::QwenCode => install_qwen(scope, project_root),
+        AgentKind::Codex => install_settings_hook_agent(
+            AgentKind::Codex,
+            scope,
+            project_root,
+            "codex",
+            None,
+            vec![
+                "Codex PreTool/PostTool currently only matches Bash tools; Stop hook only.".into(),
+            ],
+        ),
+        AgentKind::QwenCode => install_settings_hook_agent(
+            AgentKind::QwenCode,
+            scope,
+            project_root,
+            "qwen",
+            Some("Edit|Write|MultiEdit"),
+            vec![],
+        ),
         AgentKind::Cline => install_cline(project_root),
         AgentKind::Gemini => install_gemini(),
     }
@@ -792,6 +815,13 @@ fn kizu_command_token(command: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn contains_kizu_hook_command(text: &str) -> bool {
+    text.contains("kizu hook-")
+        || text
+            .split_whitespace()
+            .any(|token| matches!(token, "hook-post-tool" | "hook-stop" | "hook-log-event"))
 }
 
 fn merge_hooks_into_settings(
@@ -958,45 +988,63 @@ fn merge_hooks_into_settings(
 
 // ── Per-agent installers ────────────────────────────────────────
 
-fn install_claude_code(scope: Scope, project_root: &Path) -> Result<InstallReport> {
-    let path = config_path(AgentKind::ClaudeCode, scope, project_root)?;
-    let post_cmd = kizu_hook_command(scope, "hook-post-tool --agent claude-code");
+fn settings_hook_path(kind: AgentKind, scope: Scope, project_root: &Path) -> Result<PathBuf> {
+    if kind == AgentKind::Codex {
+        return Ok(match scope {
+            Scope::ProjectLocal | Scope::ProjectShared => {
+                project_root.join(".codex").join("hooks.json")
+            }
+            Scope::User => dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?
+                .join(".codex")
+                .join("hooks.json"),
+        });
+    }
+    config_path(kind, scope, project_root)
+}
+
+fn install_settings_hook_agent(
+    kind: AgentKind,
+    scope: Scope,
+    project_root: &Path,
+    agent_arg: &str,
+    post_matcher: Option<&str>,
+    warnings: Vec<String>,
+) -> Result<InstallReport> {
+    let path = settings_hook_path(kind, scope, project_root)?;
     let log_cmd = kizu_hook_command(scope, "hook-log-event");
-    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent claude-code");
-    let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[
-        (
-            "PostToolUse",
-            "Edit|Write|MultiEdit",
-            &[
-                HookCmd {
-                    command: &post_cmd,
-                    timeout: Some(10),
-                    is_async: false,
-                },
-                HookCmd {
-                    command: &log_cmd,
-                    timeout: None,
-                    is_async: true,
-                },
-            ],
-        ),
-        (
-            "Stop",
-            "",
-            &[HookCmd {
-                command: &stop_cmd,
-                timeout: Some(10),
-                is_async: false,
-            }],
-        ),
+    let post_cmd = kizu_hook_command(scope, &format!("hook-post-tool --agent {agent_arg}"));
+    let stop_cmd = kizu_hook_command(scope, &format!("hook-stop --agent {agent_arg}"));
+    let post_cmds = [
+        HookCmd {
+            command: &post_cmd,
+            timeout: Some(10),
+            is_async: false,
+        },
+        HookCmd {
+            command: &log_cmd,
+            timeout: None,
+            is_async: true,
+        },
     ];
-    let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
+    let stop_cmds = [HookCmd {
+        command: &stop_cmd,
+        timeout: Some(10),
+        is_async: false,
+    }];
+    let mut hooks: Vec<(&str, &str, &[HookCmd<'_>])> = Vec::with_capacity(2);
+    if let Some(matcher) = post_matcher {
+        hooks.push(("PostToolUse", matcher, post_cmds.as_slice()));
+    }
+    hooks.push(("Stop", "", stop_cmds.as_slice()));
+
+    let (added, skipped) = merge_hooks_into_settings(&path, &hooks)?;
     Ok(InstallReport {
-        agent: AgentKind::ClaudeCode,
+        agent: kind,
         files_modified: vec![path],
         entries_added: added,
         entries_skipped: skipped,
-        warnings: vec![],
+        warnings,
     })
 }
 
@@ -1078,81 +1126,6 @@ fn install_cursor(scope: Scope, project_root: &Path) -> Result<InstallReport> {
     })
 }
 
-fn install_codex(scope: Scope, project_root: &Path) -> Result<InstallReport> {
-    let path = match scope {
-        Scope::ProjectLocal | Scope::ProjectShared => {
-            project_root.join(".codex").join("hooks.json")
-        }
-        Scope::User => dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?
-            .join(".codex")
-            .join("hooks.json"),
-    };
-    // Codex: Stop only (PreTool/PostTool is Bash-only).
-    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent codex");
-    let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[(
-        "Stop",
-        "",
-        &[HookCmd {
-            command: &stop_cmd,
-            timeout: Some(10),
-            is_async: false,
-        }],
-    )];
-    let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
-    Ok(InstallReport {
-        agent: AgentKind::Codex,
-        files_modified: vec![path],
-        entries_added: added,
-        entries_skipped: skipped,
-        warnings: vec![
-            "Codex PreTool/PostTool currently only matches Bash tools; Stop hook only.".into(),
-        ],
-    })
-}
-
-fn install_qwen(scope: Scope, project_root: &Path) -> Result<InstallReport> {
-    let path = config_path(AgentKind::QwenCode, scope, project_root)?;
-    let post_cmd = kizu_hook_command(scope, "hook-post-tool --agent qwen");
-    let log_cmd = kizu_hook_command(scope, "hook-log-event");
-    let stop_cmd = kizu_hook_command(scope, "hook-stop --agent qwen");
-    let hooks: &[(&str, &str, &[HookCmd<'_>])] = &[
-        (
-            "PostToolUse",
-            "Edit|Write|MultiEdit",
-            &[
-                HookCmd {
-                    command: &post_cmd,
-                    timeout: Some(10),
-                    is_async: false,
-                },
-                HookCmd {
-                    command: &log_cmd,
-                    timeout: None,
-                    is_async: true,
-                },
-            ],
-        ),
-        (
-            "Stop",
-            "",
-            &[HookCmd {
-                command: &stop_cmd,
-                timeout: Some(10),
-                is_async: false,
-            }],
-        ),
-    ];
-    let (added, skipped) = merge_hooks_into_settings(&path, hooks)?;
-    Ok(InstallReport {
-        agent: AgentKind::QwenCode,
-        files_modified: vec![path],
-        entries_added: added,
-        entries_skipped: skipped,
-        warnings: vec![],
-    })
-}
-
 fn install_cline(project_root: &Path) -> Result<InstallReport> {
     // Cline uses file-based hooks: .clinerules/hooks/<EventType>
     let hook_dir = project_root.join(".clinerules").join("hooks");
@@ -1163,7 +1136,7 @@ fn install_cline(project_root: &Path) -> Result<InstallReport> {
     let mut added = 0;
     if hook_file.exists() {
         let content = std::fs::read_to_string(&hook_file)?;
-        if content.contains("hook-post-tool") || content.contains("hook-stop") {
+        if contains_kizu_hook_command(&content) {
             skipped = 1;
         } else {
             // Append to existing hook script.
@@ -1233,17 +1206,12 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
 
     for agent in &detected {
         let mut agent_removed = false;
+        let agent_label = agent.kind.to_string();
 
         if let Some(dir) = agent.kind.project_config_dir() {
             for filename in ["settings.json", "settings.local.json"] {
                 let path = project_root.join(dir).join(filename);
-                if remove_kizu_hooks_from_json(&path)? {
-                    println!(
-                        "  {}  {}  {}",
-                        c_bold(&format!("{:<12}", agent.kind.to_string())),
-                        c_green("✓ removed"),
-                        c_dim(&format!("→ {}", path.display())),
-                    );
+                if remove_json_hooks_with_report(&agent_label, &path)? {
                     agent_removed = true;
                     any_removed = true;
                 }
@@ -1251,26 +1219,14 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
         }
         if let Some(dir) = agent.kind.user_config_dir() {
             let path = dir.join("settings.json");
-            if remove_kizu_hooks_from_json(&path)? {
-                println!(
-                    "  {}  {}  {}",
-                    c_bold(&format!("{:<12}", agent.kind.to_string())),
-                    c_green("✓ removed"),
-                    c_dim(&format!("→ {}", path.display())),
-                );
+            if remove_json_hooks_with_report(&agent_label, &path)? {
                 agent_removed = true;
                 any_removed = true;
             }
         }
         if agent.kind == AgentKind::Cursor {
             let path = project_root.join(".cursor").join("hooks.json");
-            if remove_kizu_hooks_from_json(&path)? {
-                println!(
-                    "  {}  {}  {}",
-                    c_bold(&format!("{:<12}", "Cursor")),
-                    c_green("✓ removed"),
-                    c_dim(&format!("→ {}", path.display())),
-                );
+            if remove_json_hooks_with_report("Cursor", &path)? {
                 agent_removed = true;
                 any_removed = true;
             }
@@ -1279,31 +1235,19 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
             // returns `None` for (Cursor uses hooks.json, not the
             // settings.json shape the generic path handles). Install
             // writes there; teardown must match.
-            if let Some(home) = dirs::home_dir()
-                && teardown_cursor_user_hooks(&home)?
-            {
+            if let Some(home) = dirs::home_dir() {
                 let path = home.join(".cursor").join("hooks.json");
-                println!(
-                    "  {}  {}  {}",
-                    c_bold(&format!("{:<12}", "Cursor")),
-                    c_green("✓ removed"),
-                    c_dim(&format!("→ {}", path.display())),
-                );
-                agent_removed = true;
-                any_removed = true;
+                if remove_json_hooks_with_report("Cursor", &path)? {
+                    agent_removed = true;
+                    any_removed = true;
+                }
             }
         }
         if agent.kind == AgentKind::Codex {
             // Codex project-scoped install writes to <repo>/.codex/hooks.json
             // which is not covered by project_config_dir() (returns None for Codex).
             let path = project_root.join(".codex").join("hooks.json");
-            if remove_kizu_hooks_from_json(&path)? {
-                println!(
-                    "  {}  {}  {}",
-                    c_bold(&format!("{:<12}", "Codex CLI")),
-                    c_green("✓ removed"),
-                    c_dim(&format!("→ {}", path.display())),
-                );
+            if remove_json_hooks_with_report("Codex CLI", &path)? {
                 agent_removed = true;
                 any_removed = true;
             }
@@ -1315,10 +1259,10 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
                 .join("PostToolUse");
             if hook_file.exists() {
                 let content = std::fs::read_to_string(&hook_file)?;
-                if content.contains("hook-post-tool") || content.contains("hook-stop") {
+                if contains_kizu_hook_command(&content) {
                     let cleaned: String = content
                         .lines()
-                        .filter(|l| !l.contains("hook-post-tool") && !l.contains("hook-stop"))
+                        .filter(|l| !contains_kizu_hook_command(l))
                         .collect::<Vec<_>>()
                         .join("\n");
                     if cleaned.trim().is_empty() || cleaned.trim() == "#!/bin/sh" {
@@ -1326,12 +1270,7 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
                     } else {
                         std::fs::write(&hook_file, cleaned + "\n")?;
                     }
-                    println!(
-                        "  {}  {}  {}",
-                        c_bold(&format!("{:<12}", "Cline")),
-                        c_green("✓ removed"),
-                        c_dim(&format!("→ {}", hook_file.display())),
-                    );
+                    print_removed("Cline", &hook_file);
                     agent_removed = true;
                     any_removed = true;
                 }
@@ -1375,6 +1314,23 @@ pub fn run_teardown(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn print_removed(agent_label: &str, path: &Path) {
+    println!(
+        "  {}  {}  {}",
+        c_bold(&format!("{agent_label:<12}")),
+        c_green("✓ removed"),
+        c_dim(&format!("→ {}", path.display())),
+    );
+}
+
+fn remove_json_hooks_with_report(agent_label: &str, path: &Path) -> Result<bool> {
+    let removed = remove_kizu_hooks_from_json(path)?;
+    if removed {
+        print_removed(agent_label, path);
+    }
+    Ok(removed)
+}
+
 /// Remove kizu's pre-commit hook and restore the user's original if
 /// it was wrapped by the shim installer.
 fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
@@ -1409,6 +1365,7 @@ fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
 /// when `Scope::User`. Split out of `run_teardown` so tests can
 /// inject a fake home directory without monkey-patching
 /// `dirs::home_dir()`. Returns `true` if anything was removed.
+#[cfg(test)]
 fn teardown_cursor_user_hooks(home: &Path) -> Result<bool> {
     let path = home.join(".cursor").join("hooks.json");
     remove_kizu_hooks_from_json(&path)
@@ -1438,12 +1395,7 @@ fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
     let is_kizu_cmd = |cmd: &serde_json::Value| -> bool {
         cmd.get("command")
             .and_then(|v| v.as_str())
-            .is_some_and(|c| {
-                c.contains("kizu hook-")
-                    || c.contains(" hook-post-tool")
-                    || c.contains(" hook-stop")
-                    || c.contains(" hook-log-event")
-            })
+            .is_some_and(contains_kizu_hook_command)
     };
 
     let mut removed = false;

@@ -616,6 +616,98 @@ fn edit_backspace(text: &mut String, cursor_pos: &mut usize) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextInputKeyEffect {
+    Continue,
+    Commit,
+    Cancel,
+}
+
+fn handle_text_input_edit(
+    key: KeyEvent,
+    text: &mut String,
+    cursor_pos: &mut usize,
+) -> TextInputKeyEffect {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') => return TextInputKeyEffect::Cancel,
+            KeyCode::Char('a') => *cursor_pos = 0,
+            KeyCode::Char('e') => *cursor_pos = text.chars().count(),
+            _ => {}
+        }
+        return TextInputKeyEffect::Continue;
+    }
+    match key.code {
+        KeyCode::Esc => TextInputKeyEffect::Cancel,
+        KeyCode::Enter => TextInputKeyEffect::Commit,
+        KeyCode::Backspace => {
+            edit_backspace(text, cursor_pos);
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::Left => {
+            *cursor_pos = cursor_pos.saturating_sub(1);
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::Right => {
+            *cursor_pos = (*cursor_pos + 1).min(text.chars().count());
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::Home => {
+            *cursor_pos = 0;
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::End => {
+            *cursor_pos = text.chars().count();
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::Char(c) => {
+            edit_insert_char(text, cursor_pos, c);
+            TextInputKeyEffect::Continue
+        }
+        _ => TextInputKeyEffect::Continue,
+    }
+}
+
+fn is_quit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('q'))
+        || (matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn control_page_delta(key: KeyEvent) -> Option<isize> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('d') => Some(HALF_PAGE as isize),
+        KeyCode::Char('u') => Some(-(HALF_PAGE as isize)),
+        _ => None,
+    }
+}
+
+fn scroll_top_to_keep_visible(scroll_top: usize, cursor_y: usize, viewport_height: usize) -> usize {
+    let viewport_height = viewport_height.max(1);
+    if cursor_y < scroll_top {
+        cursor_y
+    } else if cursor_y >= scroll_top + viewport_height {
+        cursor_y.saturating_sub(viewport_height - 1)
+    } else {
+        scroll_top
+    }
+}
+
+fn update_file_view_scroll_anim(fv: &mut FileViewState, old_top: usize, animate: bool) {
+    if animate && fv.scroll_top != old_top {
+        fv.anim = Some(ScrollAnim {
+            from: fv.visual_top,
+            start: Instant::now(),
+            dur: SCROLL_ANIM_DURATION,
+        });
+    } else if !animate {
+        fv.anim = None;
+        fv.visual_top = fv.scroll_top as f32;
+    }
+}
+
 /// Two ways the renderer can park the cursor inside the viewport.
 /// Defaults to [`CursorPlacement::Centered`]; `z` toggles to
 /// [`CursorPlacement::Top`] (the cursor sits at the viewport ceiling
@@ -750,12 +842,35 @@ impl VisualIndex {
     /// resulting index acts as the identity and keeps the legacy
     /// logical-row scroll model intact.
     pub fn build(layout: &ScrollLayout, files: &[FileDiff], body_width: Option<usize>) -> Self {
-        let n = layout.rows.len();
-        let mut prefix = Vec::with_capacity(n + 1);
+        Self::from_heights(
+            body_width,
+            layout
+                .rows
+                .iter()
+                .map(|row| Self::row_visual_height(row, files, body_width)),
+        )
+    }
+
+    /// Build a visual index for full-file view lines. The prefix
+    /// coordinate machinery is identical to the diff layout; only
+    /// the per-logical-row height calculation changes.
+    pub fn build_lines(lines: &[String], body_width: Option<usize>) -> Self {
+        Self::from_heights(
+            body_width,
+            lines
+                .iter()
+                .map(|line| Self::line_visual_height(line, body_width)),
+        )
+    }
+
+    fn from_heights<I>(body_width: Option<usize>, heights: I) -> Self
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut prefix = Vec::new();
         prefix.push(0);
         let mut acc = 0usize;
-        for row in &layout.rows {
-            let h = Self::row_visual_height(row, files, body_width);
+        for h in heights {
             acc += h;
             prefix.push(acc);
         }
@@ -846,6 +961,29 @@ impl VisualIndex {
         } else {
             cells.div_ceil(width.max(1))
         }
+    }
+
+    fn line_visual_height(line: &str, body_width: Option<usize>) -> usize {
+        let Some(width) = body_width else {
+            return 1;
+        };
+        use unicode_width::UnicodeWidthChar;
+
+        if line.is_empty() {
+            return 1;
+        }
+
+        let mut rows = 1usize;
+        let mut chunk_cells = 0usize;
+        for ch in line.chars() {
+            let ch_cells = ch.width().unwrap_or(0);
+            if chunk_cells > 0 && chunk_cells + ch_cells > width {
+                rows += 1;
+                chunk_cells = 0;
+            }
+            chunk_cells += ch_cells;
+        }
+        rows
     }
 }
 
@@ -1060,92 +1198,6 @@ pub struct FileViewState {
     /// `lines: Vec<String>` (which discards the terminal delimiter)
     /// still carries the information.
     pub last_line_has_trailing_newline: bool,
-}
-
-/// File-view counterpart to [`VisualIndex`]. Maps logical file lines
-/// to visual y offsets under the current wrap width so file-view
-/// navigation can move inside a single long line instead of jumping
-/// straight to the next logical line.
-#[derive(Debug, Clone)]
-pub struct FileViewVisualIndex {
-    prefix: Vec<usize>,
-    #[allow(dead_code)]
-    pub body_width: Option<usize>,
-}
-
-impl FileViewVisualIndex {
-    pub fn build(lines: &[String], body_width: Option<usize>) -> Self {
-        let mut prefix = Vec::with_capacity(lines.len() + 1);
-        prefix.push(0);
-        let mut acc = 0usize;
-        for line in lines {
-            let h = Self::line_visual_height(line, body_width);
-            acc += h;
-            prefix.push(acc);
-        }
-        Self { prefix, body_width }
-    }
-
-    pub fn visual_y(&self, line_idx: usize) -> usize {
-        self.prefix.get(line_idx).copied().unwrap_or(0)
-    }
-
-    pub fn visual_height(&self, line_idx: usize) -> usize {
-        match (self.prefix.get(line_idx), self.prefix.get(line_idx + 1)) {
-            (Some(&a), Some(&b)) => b - a,
-            _ => 1,
-        }
-    }
-
-    pub fn total_visual(&self) -> usize {
-        self.prefix.last().copied().unwrap_or(0)
-    }
-
-    pub fn logical_at(&self, y: usize) -> (usize, usize) {
-        if self.prefix.len() < 2 {
-            return (0, 0);
-        }
-        let total = self.total_visual();
-        if y >= total {
-            let last = self.prefix.len() - 2;
-            return (last, self.visual_height(last).saturating_sub(1));
-        }
-        let mut lo = 0usize;
-        let mut hi = self.prefix.len() - 1;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.prefix[mid + 1] > y {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        let within = y - self.prefix[lo];
-        (lo, within)
-    }
-
-    fn line_visual_height(line: &str, body_width: Option<usize>) -> usize {
-        let Some(width) = body_width else {
-            return 1;
-        };
-        use unicode_width::UnicodeWidthChar;
-
-        if line.is_empty() {
-            return 1;
-        }
-
-        let mut rows = 1usize;
-        let mut chunk_cells = 0usize;
-        for ch in line.chars() {
-            let ch_cells = ch.width().unwrap_or(0);
-            if chunk_cells > 0 && chunk_cells + ch_cells > width {
-                rows += 1;
-                chunk_cells = 0;
-            }
-            chunk_cells += ch_cells;
-        }
-        rows
-    }
 }
 
 /// Confirmation overlay for hunk revert (`x` key). Holds the
@@ -1365,7 +1417,7 @@ impl App {
     /// gutter regardless of the flag.
     ///
     /// Rebuilds the layout (to refresh `diff_line_numbers` / `max_line_number`)
-    /// and reflows the file view (so `FileViewVisualIndex` matches the
+    /// and reflows the file view (so `VisualIndex::build_lines` matches the
     /// new body_width). Codex adversarial review §Important-2 flagged
     /// that skipping either step leaves stale derived state.
     pub fn toggle_line_numbers(&mut self) {
@@ -1984,10 +2036,7 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> KeyEffect {
         // Quit shortcuts.
-        if matches!(key.code, KeyCode::Char('q'))
-            || (matches!(key.code, KeyCode::Char('c'))
-                && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
+        if is_quit_key(key) {
             self.should_quit = true;
             return KeyEffect::None;
         }
@@ -1999,20 +2048,10 @@ impl App {
         // leaving the cursor pinned to the last scar.
         self.clear_scar_focus_on_nav();
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('d') => {
-                    self.scroll_by(HALF_PAGE as isize);
-                    self.follow_mode = false;
-                    return KeyEffect::None;
-                }
-                KeyCode::Char('u') => {
-                    self.scroll_by(-(HALF_PAGE as isize));
-                    self.follow_mode = false;
-                    return KeyEffect::None;
-                }
-                _ => {}
-            }
+        if let Some(delta) = control_page_delta(key) {
+            self.scroll_by(delta);
+            self.follow_mode = false;
+            return KeyEffect::None;
         }
 
         match key.code {
@@ -2251,18 +2290,21 @@ impl App {
     }
 
     fn picker_cursor_down(&mut self) {
-        let len = self.picker_results().len();
-        if let Some(picker) = self.picker.as_mut()
-            && len > 0
-            && picker.cursor + 1 < len
-        {
-            picker.cursor += 1;
-        }
+        self.move_picker_cursor(1);
     }
 
     fn picker_cursor_up(&mut self) {
+        self.move_picker_cursor(-1);
+    }
+
+    fn move_picker_cursor(&mut self, delta: isize) {
+        let len = self.picker_results().len();
+        if len == 0 {
+            return;
+        }
         if let Some(picker) = self.picker.as_mut() {
-            picker.cursor = picker.cursor.saturating_sub(1);
+            let max = len as isize - 1;
+            picker.cursor = (picker.cursor as isize + delta).clamp(0, max) as usize;
         }
     }
 
@@ -3161,7 +3203,7 @@ impl App {
 
         let guessed_body_width = self.last_body_width.get().unwrap_or(1).max(1);
         let scroll_top = if self.wrap_lines {
-            let vi = FileViewVisualIndex::build(&lines, Some(guessed_body_width));
+            let vi = VisualIndex::build_lines(&lines, Some(guessed_body_width));
             vi.visual_y(initial_cursor)
                 .saturating_sub(self.last_body_height.get() / 2)
         } else {
@@ -3194,28 +3236,16 @@ impl App {
     /// `Enter`/`Esc` to exit, `j`/`k`/`J`/`K` for cursor
     /// movement, `g`/`G` for top/bottom, and `q` to quit.
     fn handle_file_view_key(&mut self, key: KeyEvent) -> KeyEffect {
-        if matches!(key.code, KeyCode::Char('q'))
-            || (matches!(key.code, KeyCode::Char('c'))
-                && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
+        if is_quit_key(key) {
             self.should_quit = true;
             return KeyEffect::None;
         }
         // Same sticky-focus discipline as normal mode: every keypress
         // drops the scar-focus pin; scar action keys re-establish it.
         self.clear_scar_focus_on_nav();
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('d') => {
-                    self.file_view_scroll_by(HALF_PAGE as isize, true);
-                    return KeyEffect::None;
-                }
-                KeyCode::Char('u') => {
-                    self.file_view_scroll_by(-(HALF_PAGE as isize), true);
-                    return KeyEffect::None;
-                }
-                _ => {}
-            }
+        if let Some(delta) = control_page_delta(key) {
+            self.file_view_scroll_by(delta, true);
+            return KeyEffect::None;
         }
         match key.code {
             KeyCode::Enter | KeyCode::Esc => self.close_file_view(),
@@ -3302,7 +3332,7 @@ impl App {
         };
         fv.cursor_sub_row = 0;
         let body_width = wrap_lines.then_some(fv.last_body_width.get().max(1));
-        let vi = FileViewVisualIndex::build(&fv.lines, body_width);
+        let vi = VisualIndex::build_lines(&fv.lines, body_width);
         let cursor_y = vi.visual_y(fv.cursor);
         let max_top = vi.total_visual().saturating_sub(1);
         fv.scroll_top = cursor_y.saturating_sub(viewport_height / 2).min(max_top);
@@ -3317,7 +3347,7 @@ impl App {
             return;
         };
         if wrap_lines {
-            let vi = FileViewVisualIndex::build(&fv.lines, Some(fv.last_body_width.get().max(1)));
+            let vi = VisualIndex::build_lines(&fv.lines, Some(fv.last_body_width.get().max(1)));
             let cur_y = vi.visual_y(fv.cursor) + fv.cursor_sub_row;
             let new_y = (cur_y as isize + delta).max(0) as usize;
             let clamped = new_y.min(vi.total_visual().saturating_sub(1));
@@ -3325,21 +3355,8 @@ impl App {
             fv.cursor = new_cursor;
             fv.cursor_sub_row = new_sub;
             let old_top = fv.scroll_top;
-            if clamped < fv.scroll_top {
-                fv.scroll_top = clamped;
-            } else if clamped >= fv.scroll_top + viewport_height {
-                fv.scroll_top = clamped.saturating_sub(viewport_height - 1);
-            }
-            if animate && fv.scroll_top != old_top {
-                fv.anim = Some(ScrollAnim {
-                    from: fv.visual_top,
-                    start: Instant::now(),
-                    dur: SCROLL_ANIM_DURATION,
-                });
-            } else if !animate {
-                fv.anim = None;
-                fv.visual_top = fv.scroll_top as f32;
-            }
+            fv.scroll_top = scroll_top_to_keep_visible(fv.scroll_top, clamped, viewport_height);
+            update_file_view_scroll_anim(fv, old_top, animate);
             return;
         }
 
@@ -3348,22 +3365,8 @@ impl App {
         fv.cursor = new;
         fv.cursor_sub_row = 0;
         let old_top = fv.scroll_top;
-        if fv.cursor < fv.scroll_top {
-            fv.scroll_top = fv.cursor;
-        } else if fv.cursor >= fv.scroll_top + viewport_height {
-            fv.scroll_top = fv.cursor.saturating_sub(viewport_height - 1);
-        }
-        if animate && fv.scroll_top != old_top {
-            fv.anim = Some(ScrollAnim {
-                from: fv.visual_top,
-                start: Instant::now(),
-                dur: SCROLL_ANIM_DURATION,
-            });
-        } else if !animate {
-            // Snap: clear any in-flight animation (J/K 1-row moves).
-            fv.anim = None;
-            fv.visual_top = fv.scroll_top as f32;
-        }
+        fv.scroll_top = scroll_top_to_keep_visible(fv.scroll_top, fv.cursor, viewport_height);
+        update_file_view_scroll_anim(fv, old_top, animate);
     }
 
     /// Advance the file-view scroll animation by one frame.
@@ -3392,16 +3395,12 @@ impl App {
         fv.cursor = line.min(max);
         fv.cursor_sub_row = 0;
         let cursor_y = if wrap_lines {
-            let vi = FileViewVisualIndex::build(&fv.lines, Some(fv.last_body_width.get().max(1)));
+            let vi = VisualIndex::build_lines(&fv.lines, Some(fv.last_body_width.get().max(1)));
             vi.visual_y(fv.cursor)
         } else {
             fv.cursor
         };
-        if cursor_y < fv.scroll_top {
-            fv.scroll_top = cursor_y;
-        } else if cursor_y >= fv.scroll_top + viewport_height {
-            fv.scroll_top = cursor_y.saturating_sub(viewport_height - 1);
-        }
+        fv.scroll_top = scroll_top_to_keep_visible(fv.scroll_top, cursor_y, viewport_height);
         // g/G are instant jumps — no animation.
         fv.anim = None;
         fv.visual_top = fv.scroll_top as f32;
@@ -3460,57 +3459,13 @@ impl App {
     /// deletes, Enter commits, Esc cancels. Ctrl-C also cancels
     /// (matches the other modal overlays).
     fn handle_search_input_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('c') => self.close_search_input(),
-                KeyCode::Char('a') => {
-                    if let Some(s) = self.search_input.as_mut() {
-                        s.cursor_pos = 0;
-                    }
-                }
-                KeyCode::Char('e') => {
-                    if let Some(s) = self.search_input.as_mut() {
-                        s.cursor_pos = s.query.chars().count();
-                    }
-                }
-                _ => {}
-            }
+        let Some(s) = self.search_input.as_mut() else {
             return;
-        }
-        match key.code {
-            KeyCode::Esc => self.close_search_input(),
-            KeyCode::Enter => self.commit_search_input(),
-            KeyCode::Backspace => {
-                if let Some(s) = self.search_input.as_mut() {
-                    edit_backspace(&mut s.query, &mut s.cursor_pos);
-                }
-            }
-            KeyCode::Left => {
-                if let Some(s) = self.search_input.as_mut() {
-                    s.cursor_pos = s.cursor_pos.saturating_sub(1);
-                }
-            }
-            KeyCode::Right => {
-                if let Some(s) = self.search_input.as_mut() {
-                    s.cursor_pos = (s.cursor_pos + 1).min(s.query.chars().count());
-                }
-            }
-            KeyCode::Home => {
-                if let Some(s) = self.search_input.as_mut() {
-                    s.cursor_pos = 0;
-                }
-            }
-            KeyCode::End => {
-                if let Some(s) = self.search_input.as_mut() {
-                    s.cursor_pos = s.query.chars().count();
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(s) = self.search_input.as_mut() {
-                    edit_insert_char(&mut s.query, &mut s.cursor_pos, c);
-                }
-            }
-            _ => {}
+        };
+        match handle_text_input_edit(key, &mut s.query, &mut s.cursor_pos) {
+            TextInputKeyEffect::Continue => {}
+            TextInputKeyEffect::Commit => self.commit_search_input(),
+            TextInputKeyEffect::Cancel => self.close_search_input(),
         }
     }
 
@@ -3518,32 +3473,24 @@ impl App {
     /// cursor to its row. Wraps around at the end. No-op when
     /// there is no confirmed search or it has zero matches.
     pub fn search_jump_next(&mut self) {
-        let Some(state) = self.search.as_mut() else {
-            return;
-        };
-        if state.matches.is_empty() {
-            return;
-        }
-        state.current = (state.current + 1) % state.matches.len();
-        let row = state.matches[state.current].row;
-        self.follow_mode = false;
-        self.scroll_to(row);
+        self.search_jump_by(1);
     }
 
     /// `N` — step back to the previous confirmed search hit,
     /// wrapping to the tail at the start.
     pub fn search_jump_prev(&mut self) {
+        self.search_jump_by(-1);
+    }
+
+    fn search_jump_by(&mut self, delta: isize) {
         let Some(state) = self.search.as_mut() else {
             return;
         };
         if state.matches.is_empty() {
             return;
         }
-        state.current = if state.current == 0 {
-            state.matches.len() - 1
-        } else {
-            state.current - 1
-        };
+        let len = state.matches.len() as isize;
+        state.current = (state.current as isize + delta).rem_euclid(len) as usize;
         let row = state.matches[state.current].row;
         self.follow_mode = false;
         self.scroll_to(row);
@@ -3681,57 +3628,13 @@ impl App {
     }
 
     fn handle_scar_comment_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('c') => self.close_scar_comment(),
-                KeyCode::Char('a') => {
-                    if let Some(s) = self.scar_comment.as_mut() {
-                        s.cursor_pos = 0;
-                    }
-                }
-                KeyCode::Char('e') => {
-                    if let Some(s) = self.scar_comment.as_mut() {
-                        s.cursor_pos = s.body.chars().count();
-                    }
-                }
-                _ => {}
-            }
+        let Some(s) = self.scar_comment.as_mut() else {
             return;
-        }
-        match key.code {
-            KeyCode::Esc => self.close_scar_comment(),
-            KeyCode::Enter => self.commit_scar_comment(),
-            KeyCode::Backspace => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    edit_backspace(&mut s.body, &mut s.cursor_pos);
-                }
-            }
-            KeyCode::Left => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    s.cursor_pos = s.cursor_pos.saturating_sub(1);
-                }
-            }
-            KeyCode::Right => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    s.cursor_pos = (s.cursor_pos + 1).min(s.body.chars().count());
-                }
-            }
-            KeyCode::Home => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    s.cursor_pos = 0;
-                }
-            }
-            KeyCode::End => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    s.cursor_pos = s.body.chars().count();
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    edit_insert_char(&mut s.body, &mut s.cursor_pos, c);
-                }
-            }
-            _ => {}
+        };
+        match handle_text_input_edit(key, &mut s.body, &mut s.cursor_pos) {
+            TextInputKeyEffect::Continue => {}
+            TextInputKeyEffect::Commit => self.commit_scar_comment(),
+            TextInputKeyEffect::Cancel => self.close_scar_comment(),
         }
     }
 
@@ -4526,7 +4429,11 @@ fn run_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::{DiffContent, DiffLine, FileStatus, Hunk, LineKind};
+    use crate::git::{DiffContent, DiffLine, FileStatus, LineKind};
+    use crate::test_support::{
+        app_with_files as fake_app, binary_file, diff_line, file_view_state, hunk, install_search,
+        make_file,
+    };
     use std::time::Duration;
 
     #[test]
@@ -4586,123 +4493,6 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-    }
-
-    fn diff_line(kind: LineKind, content: &str) -> DiffLine {
-        DiffLine {
-            kind,
-            content: content.to_string(),
-            has_trailing_newline: true,
-        }
-    }
-
-    fn hunk(old_start: usize, lines: Vec<DiffLine>) -> Hunk {
-        let added = lines.iter().filter(|l| l.kind == LineKind::Added).count();
-        let deleted = lines.iter().filter(|l| l.kind == LineKind::Deleted).count();
-        Hunk {
-            old_start,
-            old_count: deleted,
-            new_start: old_start,
-            new_count: added,
-            lines,
-            context: None,
-        }
-    }
-
-    fn make_file(name: &str, hunks: Vec<Hunk>, secs: u64) -> FileDiff {
-        let added: usize = hunks
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .filter(|l| l.kind == LineKind::Added)
-            .count();
-        let deleted: usize = hunks
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .filter(|l| l.kind == LineKind::Deleted)
-            .count();
-        FileDiff {
-            path: PathBuf::from(name),
-            status: FileStatus::Modified,
-            added,
-            deleted,
-            content: DiffContent::Text(hunks),
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-            header_prefix: None,
-        }
-    }
-
-    fn binary_file(name: &str, secs: u64) -> FileDiff {
-        FileDiff {
-            path: PathBuf::from(name),
-            status: FileStatus::Modified,
-            added: 0,
-            deleted: 0,
-            content: DiffContent::Binary,
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-            header_prefix: None,
-        }
-    }
-
-    /// Build an `App` against `/tmp/fake` with no real filesystem use; the
-    /// `populate_mtimes` step is bypassed by writing `mtime` directly on the
-    /// fixtures. Files are sorted in ascending mtime order to match the
-    /// real `recompute_diff` path.
-    fn fake_app(files: Vec<FileDiff>) -> App {
-        let mut app = App {
-            root: PathBuf::from("/tmp/fake"),
-            git_dir: PathBuf::from("/tmp/fake/.git"),
-            common_git_dir: PathBuf::from("/tmp/fake/.git"),
-            current_branch_ref: Some("refs/heads/main".into()),
-            baseline_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
-            files: Vec::new(),
-            layout: ScrollLayout::default(),
-            scroll: 0,
-            cursor_sub_row: 0,
-            cursor_placement: CursorPlacement::Centered,
-            anchor: None,
-            help_overlay: false,
-            picker: None,
-            scar_comment: None,
-            revert_confirm: None,
-            file_view: None,
-            search_input: None,
-            search: None,
-            seen_hunks: BTreeMap::new(),
-            follow_mode: true,
-            last_error: None,
-            input_health: None,
-            head_dirty: false,
-            should_quit: false,
-            last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
-            last_body_width: Cell::new(None),
-            visual_top: Cell::new(0.0),
-            anim: None,
-            wrap_lines: false,
-            show_line_numbers: false,
-            watcher_health: WatcherHealth::default(),
-            highlighter: std::cell::OnceCell::new(),
-            config: crate::config::KizuConfig::default(),
-            view_mode: ViewMode::default(),
-            saved_diff_scroll: 0,
-            saved_stream_scroll: 0,
-            stream_events: Vec::new(),
-            processed_event_paths: std::collections::HashSet::new(),
-            // Tests use small timestamps (1000, 2000, …) for events.
-            // Leave `session_start_ms` at 0 so the session-isolation
-            // filter in `handle_event_log` is a no-op by default;
-            // tests that exercise the filter set this field explicitly.
-            session_start_ms: 0,
-            bound_session_id: None,
-            diff_snapshots: DiffSnapshots::default(),
-            scar_undo_stack: Vec::new(),
-            scar_focus: None,
-            pinned_cursor_y: None,
-        };
-        app.files = files;
-        app.files.sort_by_key(|a| a.mtime);
-        app.build_layout();
-        app.refresh_anchor();
-        app
     }
 
     fn file_idx(app: &App, name: &str) -> usize {
@@ -8860,15 +8650,7 @@ mod tests {
             100,
         )]);
         // Pre-install a fake confirmed search state.
-        app.search = Some(SearchState {
-            query: "alpha".into(),
-            matches: vec![MatchLocation {
-                row: 0,
-                byte_start: 0,
-                byte_end: 5,
-            }],
-            current: 0,
-        });
+        install_search(&mut app, "alpha", 0);
 
         app.handle_key(key(KeyCode::Char('/')));
         app.handle_key(key(KeyCode::Enter)); // empty body
@@ -8990,12 +8772,7 @@ mod tests {
             vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
             100,
         )]);
-        let matches = find_matches(&app.layout, &app.files, "foo");
-        app.search = Some(SearchState {
-            query: "foo".to_string(),
-            matches,
-            current: 0,
-        });
+        install_search(&mut app, "foo", 0);
         let pre_row = app.search.as_ref().unwrap().matches[0].row;
 
         // Simulate a watcher-driven recompute that prepends a new file
@@ -9109,13 +8886,8 @@ mod tests {
             vec![hunk(1, vec![diff_line(LineKind::Added, "foo foo")])],
             100,
         )]);
-        let matches = find_matches(&app.layout, &app.files, "foo");
-        assert_eq!(matches.len(), 2);
-        app.search = Some(SearchState {
-            query: "foo".to_string(),
-            matches,
-            current: 1,
-        });
+        let match_count = install_search(&mut app, "foo", 1);
+        assert_eq!(match_count, 2);
 
         // Recompute with only one `foo` remaining.
         app.apply_computed_files(vec![make_file(
@@ -9649,23 +9421,16 @@ mod tests {
         );
         // Use file-view mode to target line 3 (where `fn b` lives)
         // deterministically — the line above is the pre-existing scar.
-        app.file_view = Some(FileViewState {
-            path: PathBuf::from("src/main.rs"),
-            return_scroll: 0,
-            lines: vec![
+        app.file_view = Some(file_view_state(
+            "src/main.rs",
+            vec![
                 "fn a() {}".into(),
                 "// @kizu[ask]: explain this change".into(),
                 "fn b() {}".into(),
             ],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 2, // 0-indexed → 1-indexed line 3
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: Cell::new(1),
-            last_line_has_trailing_newline: true,
-        });
+            2,
+            true,
+        ));
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
         assert!(
             app.scar_undo_stack.is_empty(),
@@ -9783,19 +9548,12 @@ mod tests {
         // Fake a file-view state directly (bypassing open_file_view's
         // hunk-centering logic). `cursor: 1` is 0-indexed → scar
         // targets 1-indexed line 2.
-        app.file_view = Some(FileViewState {
-            path: PathBuf::from("src/main.rs"),
-            return_scroll: 0,
-            lines: vec!["line1".into(), "line2".into(), "line3".into()],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 1,
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: Cell::new(1),
-            last_line_has_trailing_newline: true,
-        });
+        app.file_view = Some(file_view_state(
+            "src/main.rs",
+            vec!["line1".into(), "line2".into(), "line3".into()],
+            1,
+            true,
+        ));
         let (path, line) = app.scar_target_line().expect("target");
         assert_eq!(line, 2);
         assert_eq!(path, tmp.path().join("src/main.rs"));
@@ -9816,19 +9574,12 @@ mod tests {
         // Enter file view programmatically (don't rely on the Enter
         // key, which requires the diff layout to have a hunk under
         // the cursor).
-        app.file_view = Some(FileViewState {
-            path: PathBuf::from("src/main.rs"),
-            return_scroll: 0,
-            lines: vec!["line1".into(), "line2".into(), "line3".into()],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 1,
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: Cell::new(1),
-            last_line_has_trailing_newline: true,
-        });
+        app.file_view = Some(file_view_state(
+            "src/main.rs",
+            vec!["line1".into(), "line2".into(), "line3".into()],
+            1,
+            true,
+        ));
 
         // `a` in file view must route to insert_canned_scar via
         // handle_file_view_key.

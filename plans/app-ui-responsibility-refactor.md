@@ -18,6 +18,14 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 20:08:48Z) help overlay と picker overlay を `src/ui/overlays.rs` に切り出し、既存 UI テストを通す
 - [x] (2026-04-23 20:08:48Z) `just ci` を通す
 - [x] (2026-04-23 20:08:48Z) 実装結果と検証ログをこの ExecPlan に反映する
+- [x] (2026-04-23 20:21:24Z) 敵対的削減 pass: settings 系 agent installer を統合し、line-number 付き renderer wrapper と `FileViewVisualIndex` の重複実装を削除
+- [x] (2026-04-23 20:21:24Z) 対象テスト確認: `init::tests` 18 件、`ui::tests` 63 件、`visual_index` 2 件、`file_view` 16 件が成功
+- [x] (2026-04-23 20:21:24Z) 削減後の full gate (`just ci`) を通す
+- [x] (2026-04-23 20:36:04Z) 自律削減 pass: search/scar 入力編集、quit/page/picker/search navigation、Cline hook 判定、app/ui test fixture の重複を集約
+- [x] (2026-04-23 20:36:04Z) 追加対象テスト確認: `search_input` 5 件、`scar_comment` 7 件、`picker` 6 件、`file_view` 16 件などが成功
+- [x] (2026-04-23 20:36:04Z) 追加削減後の full gate (`just ci`) を通す
+- [x] (2026-04-23 20:46:07Z) 仕上げ削減 pass: file-view scroll helper、`file_view_state` / `install_search` test fixture helper を追加し、行数を増やした候補 helper は撤回
+- [x] (2026-04-23 20:46:07Z) 仕上げ後の full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -32,6 +40,36 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: overlay 抽出後に `src/ui.rs` の widget imports が余り、通常の `cargo test` では warning としてだけ出た。
   Evidence: `cargo test --all-targets --all-features` が `unused imports: Block, Borders, Clear, ListItem, ListState, List, and Wrap` を警告した。`src/ui.rs` の import を `widgets::Paragraph` のみに縮め、`cargo clippy --all-targets --all-features -- -D warnings` で warning がないことを確認した。
+
+- Observation: `src/init.rs` の Claude Code / Qwen Code / Codex installer は同じ `merge_hooks_into_settings` 呼び出しを agent 名と PostToolUse の有無だけ変えて重複していた。
+  Evidence: `install_claude_code` と `install_qwen` は `hook-post-tool`、`hook-log-event`、`hook-stop` の同一構成で、`install_codex` は Stop のみだった。`install_settings_hook_agent` に統合後、`init::tests` 18 件が成功した。
+
+- Observation: `src/ui.rs` の `render_*_numbered` 関数群は本体描画を呼んで gutter を差し込むだけの wrapper だった。
+  Evidence: `render_diff_line_numbered`、`render_diff_line_wrapped_numbered`、`render_file_view_line_numbered`、`render_file_view_line_wrapped_numbered` を `add_line_number_gutters` へ置換しても `ui::tests` 63 件が成功した。
+
+- Observation: `FileViewVisualIndex` は `VisualIndex` と同じ prefix sum、`visual_y`、`visual_height`、`total_visual`、`logical_at` を再実装していた。
+  Evidence: `FileViewVisualIndex` を削除し、`VisualIndex::build_lines` へ統合した後、`visual_index` 2 件と `file_view` 16 件が成功した。
+
+- Observation: search 入力と scar comment 入力は、文字追加、Backspace、Esc、Enter の小さな editor state machine をそれぞれ手書きしていた。
+  Evidence: `TextInputKeyEffect` と `handle_text_input_edit` に集約した後、`search_input` 5 件、`scar_comment` 7 件、`handle_key_c` 2 件が成功した。
+
+- Observation: normal mode と file view mode の `q` / Ctrl-c、Ctrl-d / Ctrl-u、picker の上下移動、search の next / prev は、同じ条件分岐を別々の match arm で再実装していた。
+  Evidence: `is_quit_key`、`control_page_delta`、`move_picker_cursor`、`search_jump_by` へ寄せた後、`handle_key_q`、`file_view_j_k`、`shift_j`、`scroll_by_in_wrap_mode`、`search_jump`、`picker` の対象テストが成功した。
+
+- Observation: `src/app.rs` と `src/ui.rs` のテストは、`DiffLine`、`Hunk`、`FileDiff`、`App` fixture 生成を別々に持っていた。
+  Evidence: `src/test_support.rs` に共有 fixture を追加して両 test module から使った後、`cargo test --all-targets --all-features` は 467 件成功した。
+
+- Observation: Cline の install / teardown と JSON hook removal は、kizu hook command の文字列判定を複数箇所に持っていた。
+  Evidence: `contains_kizu_hook_command` と `remove_json_hooks_with_report` に寄せた後、`init::tests` を含む full gate が成功した。
+
+- Observation: `src/ui.rs` の file-view renderer に `render_file_view_line_block` helper を入れる案は、見通しは少し良くなるが行数を増やした。
+  Evidence: helper 導入後の `wc -l` で `src/ui.rs` は 3890 行から 3912 行に増えたため、変更を撤回した。
+
+- Observation: `src/init.rs` の teardown removal mark helper は意味的には素直だが、今回の削減軸では純増だった。
+  Evidence: helper 導入後の `src/init.rs` は 2116 行から 2122 行に増えたため、変更を撤回した。
+
+- Observation: test-only fixture helper は、追加行数を差し引いても app/ui の重複を削れた。
+  Evidence: `file_view_state` と `install_search` を `src/test_support.rs` に追加した後、`src/app.rs` は 10486 行から 10441 行、`src/ui.rs` は 3890 行から 3830 行になり、`file_view` 16 件、`search` 19 件、full `just ci` が成功した。
 
 ## Decision Log
 
@@ -51,11 +89,43 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: どちらも modal overlay 描画で、`src/ui.rs` の diff/file view 描画から独立している。`centered_line` は empty state で使われるため親 module に残すが、`centered_rect` は overlay 専用なので移動する。
   Date/Author: 2026-04-23 20:08:48Z / Codex
 
+- Decision: 2nd pass は module extraction よりも、重複 wrapper と二重実装の削除を優先する。
+  Rationale: 単に別ファイルへ移すだけではコード量は減らない。ユーザー要望は「もっと敵対的に大胆にレビューして、コード量の削減」なので、挙動を既存テストで固定した上で不要な抽象境界を消す。
+  Date/Author: 2026-04-23 20:21:24Z / Codex
+
+- Decision: settings.json 系 installer だけを `install_settings_hook_agent` に統合し、Cursor / Cline / Gemini は agent 固有実装のまま残す。
+  Rationale: Cursor は `hooks.json` の flat schema、Cline は hook script file、Gemini は hook mechanism なしで、無理に統合すると条件分岐が増えて逆に読みにくくなる。
+  Date/Author: 2026-04-23 20:21:24Z / Codex
+
+- Decision: search/scar 入力編集は汎用 helper に寄せるが、Enter 時の commit 処理は各 overlay に残す。
+  Rationale: 文字編集は同じ状態機械だが、検索の commit は match index 更新、scar comment の commit は file write と undo stack 更新で副作用が異なる。共通化の境界を編集操作だけにすると、削減しつつ責務の混線を避けられる。
+  Date/Author: 2026-04-23 20:36:04Z / Codex
+
+- Decision: app/ui の test fixture 共有は `#[cfg(test)] mod test_support` に限定し、production crate surface には出さない。
+  Rationale: fixture 重複は削れるが、本番コードから見える helper にすると依存関係が濁る。`src/main.rs` の test-only module 宣言に閉じることで、テストの読みやすさだけを改善できる。
+  Date/Author: 2026-04-23 20:36:04Z / Codex
+
+- Decision: Cursor user-scope teardown helper は production path から外れたため `#[cfg(test)]` にする。
+  Rationale: `run_teardown` は path を表示する `remove_json_hooks_with_report` を直接使うようになり、旧 helper は fake home を注入するテスト境界としてだけ必要になった。test-only にすることで dead code warning を消しつつ既存テストの意図を保つ。
+  Date/Author: 2026-04-23 20:36:04Z / Codex
+
+- Decision: 行数が増えるだけの抽象化は、この pass では採用しない。
+  Rationale: 今回の指示は「敵対的に」「コード量の削減」であり、読み味だけの helper は優先度が低い。`render_file_view_line_block` と teardown mark helper は実装後に行数が増えたため撤回し、削減に効いた helper だけ残す。
+  Date/Author: 2026-04-23 20:46:07Z / Codex
+
+- Decision: `file_view_state` と `install_search` は `src/test_support.rs` に置く。
+  Rationale: app/ui の test module が同じ `FileViewState` / `SearchState` fixture を繰り返していた。test-only helper に閉じると production code の依存を増やさず、テストの儀式だけを削れる。
+  Date/Author: 2026-04-23 20:46:07Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
 
-検証は `just ci` が成功した。残る課題は、まだ `src/app.rs` が 1 万行を超えていること、`src/ui.rs` も diff 行描画と file view 描画を抱えていることである。次の分割候補は search/scar 入力状態、file view state、diff/file view renderer である。
+2nd pass では、単なる file split ではなく重複削除に寄せた。Claude Code / Qwen Code / Codex の settings hook installer を `install_settings_hook_agent` に統合し、`src/ui.rs` の numbered renderer wrapper 4 本を `add_line_number_gutters` に置換し、`FileViewVisualIndex` を削除して `VisualIndex::build_lines` に統合した。差分は `src/app.rs`、`src/init.rs`、`src/ui.rs` の 3 ファイルで 256 insertions / 508 deletions、純減 252 行。完了時点の行数は `src/app.rs` 10650、`src/ui.rs` 4017、`src/init.rs` 2130。
+
+自律削減 pass では、search/scar 入力編集、normal/file-view の共通キー、picker/search navigation、Cline hook 判定、app/ui test fixture をまとめた。`src/test_support.rs` は test-only の共有 fixture として追加した。2nd pass 完了時点からさらに `src/app.rs` は 10650 行から 10441 行へ、`src/ui.rs` は 4017 行から 3830 行へ、`src/init.rs` は 2130 行から 2116 行へ減った。`src/test_support.rs` 153 行と `src/main.rs` の test-only module 宣言 2 行を差し引いても、この pass だけで約 255 行の純減になった。
+
+検証は `just ci` が成功した。Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗。残る課題は、まだ `src/app.rs` が 1 万行を超えていること、`src/ui.rs` も diff 行描画と file view 描画を抱えていることである。次の削減候補は file view state の module 化、diff/file view renderer の境界整理、`init.rs` の Cursor / Cline install/teardown の schema 別 adapter 化である。
 
 ## Context and Orientation
 
@@ -155,6 +225,104 @@ Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/fo
     35 pass
     0 fail
 
+2nd pass 後の追加証拠は以下である。
+
+    src/app.rs        10650 lines
+    src/ui.rs          4017 lines
+    src/init.rs        2130 lines
+
+    git diff --stat
+    src/app.rs  | 150 ++++++++-------------
+    src/init.rs | 188 +++++++++++----------------
+    src/ui.rs   | 426 ++++++++++++++++++------------------------------------------
+    3 files changed, 256 insertions(+), 508 deletions(-)
+
+    cargo test --all-targets --all-features init::tests -- --nocapture
+    18 passed
+
+    cargo test --all-targets --all-features ui::tests -- --nocapture
+    63 passed
+
+    cargo test --all-targets --all-features visual_index -- --nocapture
+    2 passed
+
+    cargo test --all-targets --all-features file_view -- --nocapture
+    16 passed
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
+自律削減 pass 後の追加証拠は以下である。
+
+    src/app.rs          10486 lines
+    src/ui.rs            3890 lines
+    src/init.rs          2116 lines
+    src/test_support.rs   118 lines
+    src/main.rs           215 lines
+
+    git diff --stat
+    plans/app-ui-responsibility-refactor.md |  59 +++-
+    src/app.rs                              | 536 +++++++++--------------------
+    src/init.rs                             | 282 +++++++--------
+    src/main.rs                             |   2 +
+    src/ui.rs                               | 589 ++++++++------------------------
+    5 files changed, 485 insertions(+), 983 deletions(-)
+
+    src/test_support.rs
+    118 lines added as a new test-only fixture module
+
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
+仕上げ削減 pass 後の追加証拠は以下である。
+
+    src/app.rs          10441 lines
+    src/ui.rs            3830 lines
+    src/init.rs          2116 lines
+    src/test_support.rs   153 lines
+    src/main.rs           215 lines
+
+    git diff --numstat -- src/app.rs src/init.rs src/main.rs src/ui.rs
+    218  467  src/app.rs
+    117  165  src/init.rs
+      2    0  src/main.rs
+    173  538  src/ui.rs
+
+    src/test_support.rs
+    153 lines added as a new test-only fixture module
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
 ## Interfaces and Dependencies
 
 `/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/stream.rs` は次の interface を提供する。
@@ -177,3 +345,5 @@ Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/fo
     pub(super) fn render_picker(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &crate::app::App)
 
 help overlay は `app.config.keys` を読んでキー表示を組み立てる。picker overlay は `app.picker_results()`、`app.files`、`format_mtime` を使い、表示だけを担当する。状態更新やキー入力処理は引き続き `src/app.rs` に残す。
+
+`/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/test_support.rs` は `#[cfg(test)]` の test-only module である。`src/app.rs` と `src/ui.rs` の test module からだけ使い、production code からは参照しない。主な helper は `diff_line`、`hunk`、`make_file`、`binary_file`、`app_with_files`、`file_view_state`、`install_search` で、同じ fixture 生成を複数 test module に置かないためのもの。
