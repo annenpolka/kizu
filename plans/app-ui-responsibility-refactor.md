@@ -61,6 +61,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 22:25:36Z) many-hunk performance investigation: 4,000 hunk probe で wrap viewport placement と hunk range lookup の hot path を特定
 - [x] (2026-04-23 22:25:36Z) performance pass: `ScrollLayout` に hunk range / fingerprint cache を持たせ、wrap mode の `VisualIndex` を body width ごとに再利用
 - [x] (2026-04-23 22:25:36Z) performance pass 後の targeted tests、clippy、full gate (`just ci`) を通す
+- [x] (2026-04-23 22:30:54Z) navigation performance pass: hunk/run navigation の線形探索と nowrap `VisualIndex` 再構築を削る
+- [x] (2026-04-23 22:30:54Z) navigation performance pass 後の targeted tests、clippy、full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -168,6 +170,9 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: seen hunk がない通常状態でも、`build_layout` は各 hunk の full-line fingerprint を計算していた。
   Evidence: `build_layout no seen x100` は修正前 `42.202333ms`、修正後 `20.6235ms`。`seen_hunk_fingerprint` で該当 mark がある hunk だけ current fingerprint を計算するようにした。
+
+- Observation: 描画 hot path を軽くした後も、`j` / `k` / `h` / `l` / follow mode の navigation は sorted な `hunk_starts` / `change_runs` を線形探索していた。
+  Evidence: `next_hunk`、`prev_hunk`、`next_change`、`prev_change` は `.iter().find(...)` / `.iter().rev().find(...)` を持ち、`follow_target_row` は layout rows を前後に scan していた。`partition_point` helper と `hunk_ranges` / `file_first_hunk` 参照へ置換後、`handle_key_j`、`lowercase_j` 5 件、`lowercase_k` 3 件、`follow_target` 2 件、clippy が成功した。
 
 ## Decision Log
 
@@ -287,6 +292,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: `current_hunk_range` は `build_layout` 時に hunk span を確定でき、`VisualIndex` は layout と body width が変わらない限り同じ値である。render hot path で再計算し続ける理由がないため、`ScrollLayout` の hunk cache と `App` の width-keyed visual index cache に寄せる。
   Date/Author: 2026-04-23 22:25:36Z / Codex
 
+- Decision: navigation は sorted index の binary search に寄せ、nowrap の visual height 判定では `VisualIndex` を作らない。
+  Rationale: `hunk_starts` と `change_runs` は `build_layout` が昇順で作る index なので、次/前の候補探索は `partition_point` で十分である。nowrap では 1 logical row = 1 visual row のため、long-run 判定に prefix-sum index を作る必要がない。
+  Date/Author: 2026-04-23 22:30:54Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -330,6 +339,8 @@ deleted-row lookup pass では、scar deleted-line tests の重複 RowKind scan 
 hunk file fixture pass では、single-hunk `FileDiff` wrapper を `file_with_hunk` / `added_hunk_file` / `context_hunk_file` に寄せた。`src/app.rs` は 9480 行から 9449 行へ、`src/test_support.rs` は 219 行から 240 行になった。差分は 2 ファイルで 43 insertions / 53 deletions、純減 10 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 performance pass では、`current_hunk_range` の render-time scan を `ScrollLayout::hunk_ranges` lookup に置換し、seen hunk fingerprint を該当 mark がある hunk だけ計算するようにした。さらに wrap mode の `viewport_placement` が毎回 `VisualIndex::build` する経路を、body width keyed cache にした。`src/app.rs` は 9449 行から 9482 行へ、`src/ui.rs` は 3516 行から 3530 行へ、`src/test_support.rs` は 240 行から 241 行になった。差分は 3 ファイルで 109 insertions / 61 deletions、純増 48 行だが、4,000 hunk probe では wrap placement が約 85 倍、hunk range lookup が約 10,000 倍軽くなった。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
+
+navigation performance pass では、hunk/run の前後候補探索を `partition_point` helper に寄せ、follow target を `hunk_ranges` / `file_first_hunk` から直接読むようにした。nowrap の long-run 判定では visual height を row span から直接計算し、wrap 時だけ cached `VisualIndex` を使う。`src/app.rs` は 9482 行から 9480 行へ減り、差分は 1 ファイルで 65 insertions / 67 deletions、純減 2 行になった。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -1137,6 +1148,42 @@ performance pass 後の追加証拠は以下である。
     35 pass
     0 fail
 
+navigation performance pass 後の追加証拠は以下である。
+
+    src/app.rs           9480 lines
+    src/ui.rs            3530 lines
+    src/test_support.rs   241 lines
+
+    git diff --stat
+    src/app.rs | 132 ++++++++++++++++++++++++++++++-------------------------------
+    1 file changed, 65 insertions(+), 67 deletions(-)
+
+    cargo test --all-targets --all-features handle_key_j -- --nocapture
+    1 passed
+
+    cargo test --all-targets --all-features lowercase_j -- --nocapture
+    5 passed
+
+    cargo test --all-targets --all-features lowercase_k -- --nocapture
+    3 passed
+
+    cargo test --all-targets --all-features follow_target -- --nocapture
+    2 passed
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
 ## Interfaces and Dependencies
 
 `/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/stream.rs` は次の interface を提供する。
@@ -1163,3 +1210,5 @@ help overlay は `app.config.keys` を読んでキー表示を組み立てる。
 `/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/test_support.rs` は `#[cfg(test)]` の test-only module である。`src/app.rs` と `src/ui.rs` の test module からだけ使い、production code からは参照しない。主な helper は `diff_line`、`diff_lines`、`numbered_added_lines`、`prefixed_diff_lines`、`hunk`、`added_hunk`、`make_file`、`file_with_hunk`、`added_hunk_file`、`context_hunk_file`、`single_hunk_file`、`single_added_file`、`single_added_hunk_file`、`single_deleted_file`、`binary_file`、`app_with_file`、`app_with_hunks`、`single_hunk_app`、`added_hunk_app`、`app_with_files`、`file_view_state`、`install_search` で、同じ fixture 生成を複数 test module に置かないためのもの。
 
 `/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/app.rs` の `ScrollLayout` は render hot path 用に `hunk_ranges` と `hunk_fingerprints` を持つ。`hunk_ranges[file_idx][hunk_idx]` は `(start, end_exclusive)` の row span、`hunk_fingerprints[file_idx][hunk_idx]` は seen mark のある hunk だけ `Some(current_fp)` になる。`App` は wrap mode の `VisualIndex` を `visual_index_cache` に body width keyed で保持し、`build_layout` で無効化する。
+
+`next_sorted_after`、`prev_sorted_before`、`change_run_at`、`next_change_run_start_after`、`prev_change_run_start_before` は、`build_layout` が昇順に作る `hunk_starts` / `change_runs` を `partition_point` で読む navigation helper である。これらは `src/app.rs` 内部専用で、外部 interface は増やさない。

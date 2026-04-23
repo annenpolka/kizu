@@ -560,6 +560,37 @@ fn nearest_landing_backward(prev_run: Option<usize>, prev_hh: Option<usize>) -> 
     }
 }
 
+fn next_sorted_after(values: &[usize], cursor: usize) -> Option<usize> {
+    values
+        .get(values.partition_point(|&value| value <= cursor))
+        .copied()
+}
+
+fn prev_sorted_before(values: &[usize], cursor: usize) -> Option<usize> {
+    values
+        .partition_point(|&value| value < cursor)
+        .checked_sub(1)
+        .and_then(|idx| values.get(idx).copied())
+}
+
+fn change_run_at(runs: &[(usize, usize)], cursor: usize) -> Option<(usize, usize)> {
+    let idx = runs.partition_point(|&(_, end)| end <= cursor);
+    runs.get(idx)
+        .copied()
+        .filter(|(start, end)| *start <= cursor && cursor < *end)
+}
+
+fn next_change_run_start_after(runs: &[(usize, usize)], cursor: usize) -> Option<usize> {
+    runs.get(runs.partition_point(|&(start, _)| start <= cursor))
+        .map(|(start, _)| *start)
+}
+
+fn prev_change_run_start_before(runs: &[(usize, usize)], cursor: usize) -> Option<usize> {
+    runs.partition_point(|&(start, _)| start < cursor)
+        .checked_sub(1)
+        .and_then(|idx| runs.get(idx).map(|(start, _)| *start))
+}
+
 /// Hash the full `lines` vector of a hunk (kind + content + trailing
 /// newline flag) into a single u64 fingerprint. Used by the seen
 /// mark to detect content drift between the moment the user pressed
@@ -2505,6 +2536,20 @@ impl App {
         f(index)
     }
 
+    fn run_visual_height(
+        &self,
+        run_start: usize,
+        run_end: usize,
+        body_width: Option<usize>,
+    ) -> usize {
+        match body_width {
+            None => run_end.saturating_sub(run_start),
+            Some(_) => self.with_visual_index(body_width, |vi| {
+                vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start))
+            }),
+        }
+    }
+
     /// Compute the viewport's top position for the current render,
     /// returning `(top_row, skip_visual)` where `top_row` is the first
     /// logical layout row to draw and `skip_visual` is the number of
@@ -2617,24 +2662,13 @@ impl App {
         // jump **backward** whenever the cursor sat past the final hunk
         // header (e.g. on the last diff line of a long hunk), which is
         // the opposite of what "next" should mean.
-        if let Some(&row) = self
-            .layout
-            .hunk_starts
-            .iter()
-            .find(|&&start| start > self.scroll)
-        {
+        if let Some(row) = next_sorted_after(&self.layout.hunk_starts, self.scroll) {
             self.scroll_to(row);
         }
     }
 
     pub fn prev_hunk(&mut self) {
-        if let Some(&row) = self
-            .layout
-            .hunk_starts
-            .iter()
-            .rev()
-            .find(|&&start| start < self.scroll)
-        {
+        if let Some(row) = prev_sorted_before(&self.layout.hunk_starts, self.scroll) {
             self.scroll_to(row);
         } else if let Some(&row) = self.layout.hunk_starts.first() {
             self.scroll_to(row);
@@ -2667,17 +2701,10 @@ impl App {
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
 
-        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-
         // Inside a long run, not at its last row → chunk forward
         // within the run so its body isn't teleported past.
-        if let Some(&(run_start, run_end)) = self
-            .layout
-            .change_runs
-            .iter()
-            .find(|(s, e)| *s <= cursor && cursor < *e)
-        {
-            let run_visual = vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start));
+        if let Some((run_start, run_end)) = change_run_at(&self.layout.change_runs, cursor) {
+            let run_visual = self.run_visual_height(run_start, run_end, body_width);
             if is_long_run(run_visual, viewport) && cursor + 1 < run_end {
                 let last_row = run_end.saturating_sub(1);
                 let target = (cursor + self.chunk_size()).min(last_row);
@@ -2692,18 +2719,8 @@ impl App {
         // headers *and* run starts, matching how a reader walks
         // through a diff (header = "here comes a hunk", run =
         // "here's a change inside it").
-        let next_run = self
-            .layout
-            .change_runs
-            .iter()
-            .find(|(s, _)| *s > cursor)
-            .map(|(s, _)| *s);
-        let next_hh = self
-            .layout
-            .hunk_starts
-            .iter()
-            .find(|&&s| s > cursor)
-            .copied();
+        let next_run = next_change_run_start_after(&self.layout.change_runs, cursor);
+        let next_hh = next_sorted_after(&self.layout.hunk_starts, cursor);
         if let Some(target) = nearest_landing_forward(next_run, next_hh) {
             self.scroll_to(target);
         }
@@ -2717,16 +2734,9 @@ impl App {
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
 
-        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-
         // Inside a long run, not at its start → chunk back within.
-        if let Some(&(run_start, run_end)) = self
-            .layout
-            .change_runs
-            .iter()
-            .find(|(s, e)| *s <= cursor && cursor < *e)
-        {
-            let run_visual = vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start));
+        if let Some((run_start, run_end)) = change_run_at(&self.layout.change_runs, cursor) {
+            let run_visual = self.run_visual_height(run_start, run_end, body_width);
             if is_long_run(run_visual, viewport) && cursor > run_start {
                 let target = cursor.saturating_sub(self.chunk_size()).max(run_start);
                 self.scroll_to(target);
@@ -2736,20 +2746,8 @@ impl App {
 
         // v0.4: landing candidates are `{HunkHeader rows} ∪
         // {change-run starts}`. Mirror of [`Self::next_change`].
-        let prev_run = self
-            .layout
-            .change_runs
-            .iter()
-            .rev()
-            .find(|(s, _)| *s < cursor)
-            .map(|(s, _)| *s);
-        let prev_hh = self
-            .layout
-            .hunk_starts
-            .iter()
-            .rev()
-            .find(|&&s| s < cursor)
-            .copied();
+        let prev_run = prev_change_run_start_before(&self.layout.change_runs, cursor);
+        let prev_hh = prev_sorted_before(&self.layout.hunk_starts, cursor);
         if let Some(target) = nearest_landing_backward(prev_run, prev_hh) {
             self.scroll_to(target);
         }
@@ -2778,17 +2776,17 @@ impl App {
             return None;
         }
         let newest = self.files.len() - 1;
-        // Walk from the end to find the last HunkHeader of the newest file.
-        for (i, row) in self.layout.rows.iter().enumerate().rev() {
-            if matches!(row, RowKind::HunkHeader { file_idx, .. } if *file_idx == newest) {
-                return Some(i);
-            }
+        if let Some((row, _)) = self
+            .layout
+            .hunk_ranges
+            .get(newest)
+            .and_then(|ranges| ranges.last())
+            .copied()
+        {
+            return Some(row);
         }
-        // Fallback: try file header, then the absolute last row.
-        for (i, row) in self.layout.rows.iter().enumerate() {
-            if matches!(row, RowKind::FileHeader { file_idx } if *file_idx == newest) {
-                return Some(i);
-            }
+        if let Some(row) = self.layout.file_first_hunk.get(newest).copied().flatten() {
+            return Some(row);
         }
         self.layout.rows.len().checked_sub(1)
     }
