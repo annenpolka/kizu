@@ -12,6 +12,7 @@ mod paths;
 mod prompt;
 mod scar;
 mod session;
+mod stream;
 mod ui;
 mod watcher;
 

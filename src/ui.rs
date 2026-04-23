@@ -5,8 +5,13 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::Paragraph,
 };
+
+mod footer;
+mod overlays;
+
+pub(crate) use footer::format_local_time;
 
 use crate::app::{App, RowKind};
 use crate::git::{DiffContent, FileDiff, FileStatus, Hunk, LineKind};
@@ -97,14 +102,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         render_input_line(frame, input_area, prefix, &text, cursor_pos);
     }
 
-    render_footer(frame, footer, app);
+    footer::render_footer(frame, footer, app);
 
     if app.picker.is_some() {
-        render_picker(frame, area, app);
+        overlays::render_picker(frame, area, app);
     }
 
     if app.help_overlay {
-        render_help_overlay(frame, area, app);
+        overlays::render_help_overlay(frame, area, app);
     }
 }
 
@@ -201,28 +206,13 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // numbered renderers — receives the exact same width this block
     // computes.
     let aw = area.width as usize;
-    let mut effective_show_ln =
-        app.show_line_numbers && app.view_mode != crate::app::ViewMode::Stream;
-    let digits = line_number_digits(app.layout.max_line_number);
     // Single-column gutter for both diff and file view (2026-04-21
-    // feedback: two columns read as "duplicated").
-    let mut ln_gutter_width = if effective_show_ln {
-        LineNumberGutter::single(digits).total_width
-    } else {
-        0
-    };
-    // Extreme-narrow fallback: if the viewport can't even fit the
-    // gutter + 4 body cells, drop the gutter so the user still gets
-    // diff content instead of an empty body strip.
-    if effective_show_ln && aw < 5 + ln_gutter_width + 4 {
-        effective_show_ln = false;
-        ln_gutter_width = 0;
-    }
-    let ln_gutter = if effective_show_ln {
-        LineNumberGutter::single(digits)
-    } else {
-        LineNumberGutter::single(0)
-    };
+    // feedback: two columns read as "duplicated"). `resolve_ln_gutter`
+    // also applies the extreme-narrow fallback so the body never
+    // collapses below 4 cells.
+    let wants_ln = app.show_line_numbers && app.view_mode != crate::app::ViewMode::Stream;
+    let (effective_show_ln, ln_gutter_width, ln_gutter) =
+        resolve_ln_gutter(wants_ln, app.layout.max_line_number, aw);
 
     // v0.5 M2: wrap mode reserves 5 cells for the left bar only. The
     // legacy `¶` marker column took another cell on every row, but
@@ -720,23 +710,35 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
     }
 }
 
-/// Insert a blank line-number gutter span directly after the first
-/// span of `line` (which is the 5-cell cursor bar for DiffLine /
-/// HunkHeader rows, or the 2-cell bar for FileHeader rows). Keeps
-/// the non-DiffLine row bodies horizontally aligned with DiffLine
-/// bodies when the gutter is on.
-fn insert_blank_gutter(line: Line<'static>, gutter: &LineNumberGutter) -> Line<'static> {
+/// Splice `gutter_span` directly after the first span of `line`
+/// (which is the bar — 5-cell for DiffLine / HunkHeader rows,
+/// 2-cell for FileHeader rows). Used to keep non-DiffLine row bodies
+/// horizontally aligned with DiffLine bodies when the gutter is on.
+/// `bar_fallback` is the span to emit when the line has no spans at
+/// all; callers pass a matching-width blank bar so downstream
+/// measurements stay consistent.
+fn insert_gutter_span(
+    line: Line<'static>,
+    gutter_span: Span<'static>,
+    bar_fallback: Span<'static>,
+) -> Line<'static> {
     let mut spans = line.spans;
-    let head = if spans.is_empty() {
-        Span::raw("")
+    let bar = if spans.is_empty() {
+        bar_fallback
     } else {
         spans.remove(0)
     };
     let mut new_spans = Vec::with_capacity(spans.len() + 2);
-    new_spans.push(head);
-    new_spans.push(gutter.blank_span());
+    new_spans.push(bar);
+    new_spans.push(gutter_span);
     new_spans.extend(spans);
     Line::from(new_spans)
+}
+
+/// Shorthand for splicing a blank gutter after the head span of a
+/// line that already has its own bar (or no bar at all, for Spacer).
+fn insert_blank_gutter(line: Line<'static>, gutter: &LineNumberGutter) -> Line<'static> {
+    insert_gutter_span(line, gutter.blank_span(), Span::raw(""))
 }
 
 /// Splice a blank gutter span after the first `split_at` cells of
@@ -1114,12 +1116,13 @@ impl LineNumberGutter {
 /// looking at". Showing only the worktree side keeps the column
 /// monotonic.
 fn diff_ln_span(pair: (Option<usize>, Option<usize>), gutter: &LineNumberGutter) -> Span<'static> {
-    let num = match pair.1 {
-        Some(v) => format!("{v:>w$}", w = gutter.col_width),
-        None => " ".repeat(gutter.col_width),
+    let w = gutter.col_width;
+    let content = match pair.1 {
+        Some(v) => format!(" {v:>w$} "),
+        None => " ".repeat(gutter.total_width),
     };
     Span::styled(
-        format!(" {num} "),
+        content,
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
@@ -1129,7 +1132,7 @@ fn diff_ln_span(pair: (Option<usize>, Option<usize>), gutter: &LineNumberGutter)
 /// File-view single-column line-number gutter span.
 fn file_ln_span(line_number: usize, gutter: &LineNumberGutter) -> Span<'static> {
     Span::styled(
-        format!(" {n:>w$} ", n = line_number, w = gutter.col_width),
+        format!(" {line_number:>w$} ", w = gutter.col_width),
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
@@ -1166,18 +1169,7 @@ fn render_diff_line_numbered(
         bg_deleted,
         search_matches,
     );
-    let mut spans = base.spans;
-    let bar = if spans.is_empty() {
-        Span::raw("     ")
-    } else {
-        spans.remove(0)
-    };
-    let ln = diff_ln_span(line_numbers, gutter);
-    let mut new_spans = Vec::with_capacity(spans.len() + 2);
-    new_spans.push(bar);
-    new_spans.push(ln);
-    new_spans.extend(spans);
-    Line::from(new_spans)
+    insert_gutter_span(base, diff_ln_span(line_numbers, gutter), Span::raw("     "))
 }
 
 /// Wrap-mode variant. Continuation rows (`i > 0`) get a blank gutter
@@ -1211,22 +1203,12 @@ fn render_diff_line_wrapped_numbered(
     base.into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let mut spans = line.spans;
-            let bar = if spans.is_empty() {
-                Span::raw("     ")
-            } else {
-                spans.remove(0)
-            };
             let ln = if i == 0 {
                 diff_ln_span(line_numbers, gutter)
             } else {
                 gutter.blank_span()
             };
-            let mut new_spans = Vec::with_capacity(spans.len() + 2);
-            new_spans.push(bar);
-            new_spans.push(ln);
-            new_spans.extend(spans);
-            Line::from(new_spans)
+            insert_gutter_span(line, ln, Span::raw("     "))
         })
         .collect()
 }
@@ -1253,18 +1235,7 @@ fn render_file_view_line_numbered(
         file_path,
         show_eof_marker,
     );
-    let mut spans = base.spans;
-    let bar = if spans.is_empty() {
-        Span::raw("     ")
-    } else {
-        spans.remove(0)
-    };
-    let ln = file_ln_span(line_number, gutter);
-    let mut new_spans = Vec::with_capacity(spans.len() + 2);
-    new_spans.push(bar);
-    new_spans.push(ln);
-    new_spans.extend(spans);
-    Line::from(new_spans)
+    insert_gutter_span(base, file_ln_span(line_number, gutter), Span::raw("     "))
 }
 
 /// Wrap-mode file-view variant. Continuation rows get a blank gutter.
@@ -1292,22 +1263,12 @@ fn render_file_view_line_wrapped_numbered(
     base.into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let mut spans = line.spans;
-            let bar = if spans.is_empty() {
-                Span::raw("     ")
-            } else {
-                spans.remove(0)
-            };
             let ln = if i == 0 {
                 file_ln_span(line_number, gutter)
             } else {
                 gutter.blank_span()
             };
-            let mut new_spans = Vec::with_capacity(spans.len() + 2);
-            new_spans.push(bar);
-            new_spans.push(ln);
-            new_spans.extend(spans);
-            Line::from(new_spans)
+            insert_gutter_span(line, ln, Span::raw("     "))
         })
         .collect()
 }
@@ -1315,7 +1276,38 @@ fn render_file_view_line_wrapped_numbered(
 /// Compute the line-number gutter width for a given max line number.
 /// 10 is the lower bound so tiny files stay at a stable 2 digits.
 pub(crate) fn line_number_digits(max: usize) -> usize {
-    max.max(10).to_string().len()
+    let mut n = max.max(10);
+    let mut digits = 0;
+    while n > 0 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// Resolve the effective line-number gutter: apply the
+/// extreme-narrow fallback so the caller doesn't have to. Returns
+/// `(effective_show_ln, ln_gutter_width, ln_gutter)` where
+/// `ln_gutter` uses a zero col-width when the gutter is suppressed
+/// so blank-slot helpers keep working without separate nil handling.
+fn resolve_ln_gutter(
+    show_ln: bool,
+    max_line_number: usize,
+    viewport_width: usize,
+) -> (bool, usize, LineNumberGutter) {
+    let digits = line_number_digits(max_line_number);
+    let raw_width = if show_ln {
+        LineNumberGutter::single(digits).total_width
+    } else {
+        0
+    };
+    // Fallback: if the gutter would leave < 4 cells of body width,
+    // drop it entirely so the user still gets diff content.
+    if show_ln && viewport_width >= 5 + raw_width + 4 {
+        (true, raw_width, LineNumberGutter::single(digits))
+    } else {
+        (false, 0, LineNumberGutter::single(0))
+    }
 }
 
 fn render_hunk_header(
@@ -1330,17 +1322,18 @@ fn render_hunk_header(
     // mistaken for each other.
     let seen_mark = if is_seen { "▸ " } else { "  " };
 
-    // Count added/deleted lines from the actual hunk content.
-    let added: usize = hunk
+    // Count added/deleted lines from the actual hunk content in a
+    // single pass — render_hunk_header is called once per visible
+    // hunk header and a second time for the sticky copy, so even one
+    // extra iteration compounds across large hunks.
+    let (added, deleted) = hunk
         .lines
         .iter()
-        .filter(|l| l.kind == LineKind::Added)
-        .count();
-    let deleted: usize = hunk
-        .lines
-        .iter()
-        .filter(|l| l.kind == LineKind::Deleted)
-        .count();
+        .fold((0usize, 0usize), |(a, d), l| match l.kind {
+            LineKind::Added => (a + 1, d),
+            LineKind::Deleted => (a, d + 1),
+            _ => (a, d),
+        });
     let counts = format!("+{added}/-{deleted}");
 
     // Line range: show new_start (where the change lands in the
@@ -1619,22 +1612,8 @@ fn render_file_view(
     // v0.5: mirror render_scroll's single-source body_width calc so
     // FileViewVisualIndex and the numbered renderer see the same value
     // (Codex review §Critical-1).
-    let mut effective_show_ln = show_line_numbers;
-    let digits = line_number_digits(fv.lines.len());
-    let mut ln_gutter_width = if effective_show_ln {
-        LineNumberGutter::single(digits).total_width
-    } else {
-        0
-    };
-    if effective_show_ln && width < 5 + ln_gutter_width + 4 {
-        effective_show_ln = false;
-        ln_gutter_width = 0;
-    }
-    let ln_gutter = if effective_show_ln {
-        LineNumberGutter::single(digits)
-    } else {
-        LineNumberGutter::single(0)
-    };
+    let (effective_show_ln, ln_gutter_width, ln_gutter) =
+        resolve_ln_gutter(show_line_numbers, fv.lines.len(), width);
     let body_width = width.saturating_sub(5 + ln_gutter_width).max(1);
     fv.last_body_width.set(body_width);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
@@ -1913,781 +1892,6 @@ fn render_file_view_line_wrapped(
         .collect()
 }
 
-/// Convert a Unix epoch millisecond timestamp to a local-time
-/// `HH:MM:SS` string. Uses `libc::localtime_r` on Unix for
-/// timezone-aware conversion; falls back to UTC on other platforms.
-pub fn format_local_time(timestamp_ms: u64) -> String {
-    let epoch_secs = (timestamp_ms / 1000) as i64;
-
-    #[cfg(unix)]
-    {
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        let time_t = epoch_secs as libc::time_t;
-        unsafe { libc::localtime_r(&time_t, &mut tm) };
-        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let secs = epoch_secs as u64;
-        let hours = (secs / 3600) % 24;
-        let mins = (secs / 60) % 60;
-        let s = secs % 60;
-        format!("{hours:02}:{mins:02}:{s:02}")
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FooterDensity {
-    Full,
-    Compact,
-    Minimal,
-}
-
-fn spans_display_width(spans: &[Span<'static>]) -> usize {
-    use unicode_width::UnicodeWidthStr;
-    spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum()
-}
-
-fn truncate_display(s: &str, max_width: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-    if max_width == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    if max_width == 1 {
-        return "…".to_string();
-    }
-
-    let mut out = String::new();
-    let mut used = 0usize;
-    let limit = max_width - 1;
-    for ch in s.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > limit {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
-}
-
-fn choose_footer_variant(candidates: Vec<Vec<Span<'static>>>, width: u16) -> Vec<Span<'static>> {
-    let width = width as usize;
-    let mut candidates = candidates.into_iter();
-    let Some(mut fallback) = candidates.next() else {
-        return Vec::new();
-    };
-    if spans_display_width(&fallback) <= width {
-        return fallback;
-    }
-    for candidate in candidates {
-        if spans_display_width(&candidate) <= width {
-            return candidate;
-        }
-        fallback = candidate;
-    }
-    fallback
-}
-
-fn key_label(ch: char) -> String {
-    if ch == ' ' {
-        "Space".to_string()
-    } else {
-        ch.to_string()
-    }
-}
-
-fn sep_span(dim: Style) -> Span<'static> {
-    Span::styled(" │ ", dim)
-}
-
-fn slash_span(dim: Style) -> Span<'static> {
-    Span::styled(" / ", dim)
-}
-
-fn footer_mode(app: &App) -> (&'static str, Color) {
-    if app.picker.is_some() {
-        ("[picker]", Color::Magenta)
-    } else if app.scar_comment.is_some() {
-        ("[scar]", Color::Magenta)
-    } else if app.revert_confirm.is_some() {
-        ("[revert?]", Color::Red)
-    } else if app.search_input.is_some() {
-        ("[search]", Color::Yellow)
-    } else if app.file_view.is_some() {
-        ("[file view]", Color::Cyan)
-    } else if app.view_mode == crate::app::ViewMode::Stream {
-        ("[stream]", Color::Blue)
-    } else if app.follow_mode {
-        ("[follow]", Color::Green)
-    } else {
-        ("[manual]", Color::Yellow)
-    }
-}
-
-fn push_mode(spans: &mut Vec<Span<'static>>, app: &App, bold: Modifier) {
-    let (mode_text, mode_color) = footer_mode(app);
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        mode_text,
-        Style::default().fg(mode_color).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-}
-
-fn line_numbers_label(app: &App) -> &'static str {
-    if app.view_mode == crate::app::ViewMode::Stream {
-        "nums off"
-    } else if app.show_line_numbers {
-        "nums on"
-    } else {
-        "nums off"
-    }
-}
-
-fn line_numbers_style(app: &App, dim: Style, bold: Modifier) -> Style {
-    if app.view_mode == crate::app::ViewMode::Stream {
-        dim
-    } else if app.show_line_numbers {
-        Style::default().fg(Color::Cyan).add_modifier(bold)
-    } else {
-        Style::default().fg(Color::Cyan)
-    }
-}
-
-fn wrap_label(app: &App) -> &'static str {
-    if app.wrap_lines { "wrap" } else { "nowrap" }
-}
-
-fn push_line_numbers_full(spans: &mut Vec<Span<'static>>, app: &App, dim: Style, bold: Modifier) {
-    spans.push(sep_span(dim));
-    spans.push(Span::styled(
-        line_numbers_label(app),
-        line_numbers_style(app, dim, bold),
-    ));
-}
-
-fn push_compact_toggles(
-    spans: &mut Vec<Span<'static>>,
-    app: &App,
-    dim: Style,
-    bold: Modifier,
-    include_picker: bool,
-) {
-    spans.push(Span::styled(
-        app.cursor_placement.label(),
-        Style::default().fg(Color::Cyan).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        wrap_label(app),
-        Style::default().fg(Color::Cyan).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        line_numbers_label(app),
-        line_numbers_style(app, dim, bold),
-    ));
-    if include_picker {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("? help", Style::default().fg(Color::Magenta)));
-    }
-}
-
-fn session_counts(app: &App) -> (usize, usize, usize) {
-    let added: usize = app.files.iter().map(|f| f.added).sum();
-    let deleted: usize = app.files.iter().map(|f| f.deleted).sum();
-    (added, deleted, app.files.len())
-}
-
-fn push_session_full(spans: &mut Vec<Span<'static>>, app: &App, dim: Style, bold: Modifier) {
-    let (session_added, session_deleted, files_len) = session_counts(app);
-    spans.push(sep_span(dim));
-    spans.push(Span::styled("session", dim));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("+{session_added}"),
-        Style::default().fg(Color::Green).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("-{session_deleted}"),
-        Style::default().fg(Color::Red).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("{files_len} files"),
-        Style::default().fg(Color::Cyan),
-    ));
-    if app.head_dirty {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            "HEAD*",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-}
-
-fn push_session_compact(spans: &mut Vec<Span<'static>>, app: &App) {
-    let (session_added, session_deleted, files_len) = session_counts(app);
-    spans.push(Span::raw(format!(
-        "+{session_added}/-{session_deleted} {files_len}f"
-    )));
-    if app.head_dirty {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            "HEAD*",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-}
-
-fn current_path_and_color(app: &App) -> (String, Color) {
-    let current_path = app
-        .current_file_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "--".to_string());
-    let path_color = app
-        .current_file_idx()
-        .and_then(|i| app.files.get(i))
-        .map(|f| match f.status {
-            FileStatus::Modified => Color::Cyan,
-            FileStatus::Added => Color::Green,
-            FileStatus::Deleted => Color::Red,
-            FileStatus::Untracked => Color::Yellow,
-        })
-        .unwrap_or(Color::Reset);
-    (current_path, path_color)
-}
-
-fn push_diagnostics(
-    spans: &mut Vec<Span<'static>>,
-    app: &App,
-    density: FooterDensity,
-    dim: Style,
-    bold: Modifier,
-) {
-    if let Some(msg) = app.watcher_health.summary() {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled(
-            "⚠ WATCHER",
-            Style::default().fg(Color::Red).add_modifier(bold),
-        ));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            let msg = if density == FooterDensity::Full {
-                msg
-            } else {
-                truncate_display(&msg, 28)
-            };
-            spans.push(Span::styled(msg, Style::default().fg(Color::Red)));
-        }
-    }
-
-    if let Some(msg) = &app.input_health {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled(
-            "⚠ INPUT",
-            Style::default().fg(Color::Red).add_modifier(bold),
-        ));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            let msg = if density == FooterDensity::Full {
-                msg.clone()
-            } else {
-                truncate_display(msg, 28)
-            };
-            spans.push(Span::styled(msg, Style::default().fg(Color::Red)));
-        }
-    }
-
-    if let Some(err) = &app.last_error {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled(
-            "×",
-            Style::default().fg(Color::Red).add_modifier(bold),
-        ));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            let err = if density == FooterDensity::Full {
-                err.clone()
-            } else {
-                truncate_display(err, 28)
-            };
-            spans.push(Span::styled(err, Style::default().fg(Color::Red)));
-        }
-    }
-}
-
-fn build_footer_spans(
-    app: &App,
-    density: FooterDensity,
-    dim: Style,
-    bold: Modifier,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    push_mode(&mut spans, app, bold);
-
-    if app.picker.is_some() {
-        spans.push(sep_span(dim));
-        match density {
-            FooterDensity::Full => {
-                spans.push(Span::styled(
-                    "type to filter",
-                    Style::default().fg(Color::Yellow),
-                ));
-                spans.push(slash_span(dim));
-                spans.push(Span::styled(
-                    "↑↓ Ctrl-n/p",
-                    Style::default().fg(Color::Cyan),
-                ));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("move", dim));
-                spans.push(slash_span(dim));
-                spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("jump", dim));
-                spans.push(slash_span(dim));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("cancel", dim));
-            }
-            FooterDensity::Compact => {
-                spans.push(Span::styled("filter", Style::default().fg(Color::Yellow)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-                spans.push(Span::styled("/Esc", dim));
-            }
-            FooterDensity::Minimal => {
-                spans.push(Span::styled("filter", Style::default().fg(Color::Yellow)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-            }
-        }
-    } else if let Some(fv) = app.file_view.as_ref() {
-        match density {
-            FooterDensity::Full => {
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    wrap_label(app),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-                push_line_numbers_full(&mut spans, app, dim, bold);
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    fv.path.display().to_string(),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-                spans.push(Span::styled(
-                    format!(" [{}/{}]", fv.cursor + 1, fv.lines.len()),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                spans.push(sep_span(dim));
-                spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-                spans.push(Span::styled("/", dim));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("back", dim));
-            }
-            FooterDensity::Compact => {
-                spans.push(sep_span(dim));
-                push_compact_toggles(&mut spans, app, dim, bold, false);
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    truncate_display(&fv.path.display().to_string(), 18),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-                spans.push(Span::raw(format!(" {}/{}", fv.cursor + 1, fv.lines.len())));
-                spans.push(sep_span(dim));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("back", dim));
-            }
-            FooterDensity::Minimal => {
-                spans.push(sep_span(dim));
-                spans.push(Span::raw(format!("{}/{}", fv.cursor + 1, fv.lines.len())));
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    wrap_label(app),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    line_numbers_label(app),
-                    line_numbers_style(app, dim, bold),
-                ));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-            }
-        }
-    } else if app.search_input.is_some() {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("find", dim));
-        if density != FooterDensity::Minimal {
-            spans.push(slash_span(dim));
-        } else {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled("cancel", dim));
-        }
-    } else if let Some(state) = app.revert_confirm.as_ref() {
-        spans.push(sep_span(dim));
-        match density {
-            FooterDensity::Full => spans.push(Span::styled(
-                format!("revert hunk in {} ?", state.file_path.display()),
-                Style::default().fg(Color::Red).add_modifier(bold),
-            )),
-            FooterDensity::Compact => spans.push(Span::styled(
-                format!(
-                    "revert {} ?",
-                    truncate_display(&state.file_path.display().to_string(), 24)
-                ),
-                Style::default().fg(Color::Red).add_modifier(bold),
-            )),
-            FooterDensity::Minimal => spans.push(Span::styled(
-                "revert ?",
-                Style::default().fg(Color::Red).add_modifier(bold),
-            )),
-        }
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("(y/N)", Style::default().fg(Color::Yellow)));
-    } else if app.scar_comment.is_some() {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("save", dim));
-        if density != FooterDensity::Minimal {
-            spans.push(slash_span(dim));
-        } else {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled("cancel", dim));
-        }
-    } else {
-        let (current_path, path_color) = current_path_and_color(app);
-        match density {
-            FooterDensity::Full => {
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    current_path,
-                    Style::default().fg(path_color).add_modifier(bold),
-                ));
-                push_session_full(&mut spans, app, dim, bold);
-
-                if let Some(state) = app.search.as_ref() {
-                    spans.push(sep_span(dim));
-                    spans.push(Span::styled(
-                        format!("/{}", state.query),
-                        Style::default().fg(Color::Yellow).add_modifier(bold),
-                    ));
-                    spans.push(Span::raw(" "));
-                    let position = if state.matches.is_empty() {
-                        "[0/0]".to_string()
-                    } else {
-                        format!("[{}/{}]", state.current + 1, state.matches.len())
-                    };
-                    spans.push(Span::styled(position, Style::default().fg(Color::DarkGray)));
-                }
-
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    app.cursor_placement.label(),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    wrap_label(app),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-
-                push_line_numbers_full(&mut spans, app, dim, bold);
-
-                spans.push(sep_span(dim));
-                spans.push(Span::styled("? help", Style::default().fg(Color::Magenta)));
-            }
-            FooterDensity::Compact => {
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    truncate_display(&current_path, 18),
-                    Style::default().fg(path_color).add_modifier(bold),
-                ));
-                spans.push(sep_span(dim));
-                push_session_compact(&mut spans, app);
-                if let Some(state) = app.search.as_ref() {
-                    spans.push(sep_span(dim));
-                    spans.push(Span::styled(
-                        truncate_display(&format!("/{}", state.query), 16),
-                        Style::default().fg(Color::Yellow).add_modifier(bold),
-                    ));
-                    spans.push(Span::raw(" "));
-                    let position = if state.matches.is_empty() {
-                        "[0/0]".to_string()
-                    } else {
-                        format!("[{}/{}]", state.current + 1, state.matches.len())
-                    };
-                    spans.push(Span::styled(position, Style::default().fg(Color::DarkGray)));
-                }
-                spans.push(sep_span(dim));
-                push_compact_toggles(&mut spans, app, dim, bold, true);
-            }
-            FooterDensity::Minimal => {
-                spans.push(sep_span(dim));
-                push_session_compact(&mut spans, app);
-                if let Some(state) = app.search.as_ref() {
-                    spans.push(Span::raw(" "));
-                    let position = if state.matches.is_empty() {
-                        "[0/0]".to_string()
-                    } else {
-                        format!("[{}/{}]", state.current + 1, state.matches.len())
-                    };
-                    spans.push(Span::styled(position, Style::default().fg(Color::DarkGray)));
-                }
-                spans.push(sep_span(dim));
-                push_compact_toggles(&mut spans, app, dim, bold, true);
-            }
-        }
-    }
-
-    push_diagnostics(&mut spans, app, density, dim, bold);
-    spans
-}
-
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let dim = Style::default().fg(Color::DarkGray);
-    let bold = Modifier::BOLD;
-    let spans = choose_footer_variant(
-        vec![
-            build_footer_spans(app, FooterDensity::Full, dim, bold),
-            build_footer_spans(app, FooterDensity::Compact, dim, bold),
-            build_footer_spans(app, FooterDensity::Minimal, dim, bold),
-        ],
-        area.width,
-    );
-    let line = Line::from(spans);
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-fn help_section(title: &'static str) -> Line<'static> {
-    Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    ))
-}
-
-fn help_row(key: impl Into<String>, description: impl Into<String>) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{:<14}", key.into()),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(description.into()),
-    ])
-}
-
-fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let popup_area = centered_rect(72, 72, area);
-    frame.render_widget(Clear, popup_area);
-
-    let block = Block::default().borders(Borders::ALL).title(" Help ");
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-
-    let k = &app.config.keys;
-    let columns =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
-
-    let left = vec![
-        help_section("Navigation"),
-        help_row("j / ↓", "next change"),
-        help_row("k / ↑", "previous change"),
-        help_row("J / K", "move one visual row"),
-        help_row("h / l", "previous / next hunk"),
-        help_row("g / G", "top / bottom"),
-        help_row("Ctrl-d/u", "half-page down / up"),
-        Line::raw(""),
-        help_section("Review"),
-        help_row(key_label(k.ask), "ask scar"),
-        help_row(key_label(k.reject), "reject scar"),
-        help_row(key_label(k.comment), "free comment scar"),
-        help_row(key_label(k.revert), "revert hunk"),
-        help_row(key_label(k.seen), "seen / fold hunk"),
-        help_row(key_label(k.undo), "undo scar"),
-        help_row(key_label(k.editor), "open editor"),
-    ];
-
-    let right = vec![
-        help_section("Views"),
-        help_row("Enter", "file view / back"),
-        help_row("Tab", "stream / diff"),
-        help_row(key_label(k.follow), "follow latest"),
-        help_row(key_label(k.picker), "picker"),
-        help_row(key_label(k.cursor_placement), "center / top cursor"),
-        help_row(key_label(k.wrap_toggle), "wrap"),
-        help_row(key_label(k.line_numbers_toggle), "line numbers"),
-        Line::raw(""),
-        help_section("Search"),
-        help_row(key_label(k.search), "search"),
-        help_row(key_label(k.search_next), "next match"),
-        help_row(key_label(k.search_prev), "previous match"),
-        Line::raw(""),
-        help_section("Other"),
-        help_row("? / Esc", "close help"),
-        help_row("q", "quit"),
-    ];
-
-    frame.render_widget(Paragraph::new(left).wrap(Wrap { trim: false }), columns[0]);
-    frame.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), columns[1]);
-}
-
-/// Pad or truncate `s` so its display width (cells) equals exactly
-/// `target`. Truncation is rune-aware via `unicode-width` so CJK
-/// filenames do not land mid-codepoint or overflow by one cell.
-fn pad_or_truncate_display(s: &str, target: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    let w = UnicodeWidthStr::width(s);
-    if w <= target {
-        let pad = target - w;
-        let mut out = String::with_capacity(s.len() + pad);
-        out.push_str(s);
-        for _ in 0..pad {
-            out.push(' ');
-        }
-        return out;
-    }
-    // Truncate, reserving 1 cell for an ellipsis when it fits.
-    let keep = target.saturating_sub(1);
-    let mut acc = 0usize;
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if acc + cw > keep {
-            break;
-        }
-        acc += cw;
-        out.push(ch);
-    }
-    // Add the ellipsis marker + a trailing space when target - acc >= 1.
-    if target > acc {
-        out.push('…');
-        acc += 1;
-    }
-    while acc < target {
-        out.push(' ');
-        acc += 1;
-    }
-    out
-}
-
-fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let popup_area = centered_rect(60, 60, area);
-    let Some(picker) = &app.picker else { return };
-    let results = app.picker_results();
-
-    // Wipe whatever was beneath the popup so the underlying scroll view
-    // doesn't bleed through translucent rows.
-    frame.render_widget(Clear, popup_area);
-
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        " Files {}/{} ",
-        results.len(),
-        app.files.len()
-    ));
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-
-    // Inside the block, top row is the query line; the rest is the file list.
-    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-    let query_area = chunks[0];
-    let list_area = chunks[1];
-
-    let query_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Yellow)),
-        Span::raw(picker.query.clone()),
-    ]);
-    frame.render_widget(Paragraph::new(query_line), query_area);
-
-    // Reserve a fixed right-hand slot for `HH:MM` + `+N -M` so the
-    // minute column is never clipped by a long path. The selection
-    // gutter (2 cells) sits left of the path, so the usable width
-    // inside `list_area` is `width - 2`. The path takes the rest.
-    let list_width = list_area.width as usize;
-    const MTIME_WIDTH: usize = 5; // "HH:MM"
-    const COUNTS_WIDTH: usize = 10; // "+NNN -MMM" fits comfortably
-    const GAP: usize = 1;
-    const GUTTER: usize = 2; // space for "▸ "
-    let reserved = MTIME_WIDTH + GAP + COUNTS_WIDTH + GAP;
-    let path_width = list_width.saturating_sub(reserved + GUTTER).max(10);
-
-    let items: Vec<ListItem<'_>> = results
-        .iter()
-        .map(|&file_idx| {
-            let file = &app.files[file_idx];
-            let path_color = match file.status {
-                FileStatus::Modified => Color::Cyan,
-                FileStatus::Added => Color::Green,
-                FileStatus::Deleted => Color::Red,
-                FileStatus::Untracked => Color::Yellow,
-            };
-            let counts = match &file.content {
-                DiffContent::Binary => "bin".to_string(),
-                DiffContent::Text(_) => format!("+{} -{}", file.added, file.deleted),
-            };
-            let mtime = format_mtime(file.mtime);
-            // Pad path to `path_width` using unicode-width so CJK
-            // filenames stay aligned. Truncate from the right if the
-            // name overflows the column so the right-hand mtime/counts
-            // columns are never pushed off-screen.
-            let path_str = file.path.display().to_string();
-            let padded_path = pad_or_truncate_display(&path_str, path_width);
-            // Right-pad counts to a fixed width so the mtime column
-            // lands at a stable offset even when +/- counts vary.
-            let padded_counts = format!("{counts:>width$}", width = COUNTS_WIDTH);
-            ListItem::new(Line::from(vec![
-                Span::styled(padded_path, Style::default().fg(path_color)),
-                Span::raw(" "),
-                Span::styled(mtime, Style::default().fg(Color::DarkGray)),
-                Span::raw(" "),
-                Span::raw(padded_counts),
-            ]))
-        })
-        .collect();
-
-    let list = List::new(items)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▸ ");
-    let mut state = ListState::default();
-    if !results.is_empty() {
-        state.select(Some(picker.cursor.min(results.len() - 1)));
-    }
-    frame.render_stateful_widget(list, list_area, &mut state);
-}
-
 fn centered_line(area: Rect) -> Rect {
     let row = area.y + area.height / 2;
     Rect {
@@ -2695,17 +1899,6 @@ fn centered_line(area: Rect) -> Rect {
         y: row,
         width: area.width,
         height: 1,
-    }
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_width = area.width.saturating_mul(percent_x) / 100;
-    let popup_height = area.height.saturating_mul(percent_y) / 100;
-    Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
     }
 }
 
