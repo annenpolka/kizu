@@ -46,6 +46,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 21:51:16Z) added hunk fixture 後の targeted tests、clippy、full gate (`just ci`) を通す
 - [x] (2026-04-23 21:55:07Z) added hunk app fixture pass: Added 行だけの single-hunk app fixture を `added_hunk_app` に寄せる
 - [x] (2026-04-23 21:55:07Z) added hunk app fixture 後の targeted tests、clippy、full gate (`just ci`) を通す
+- [x] (2026-04-23 21:59:34Z) remaining Added-only hunk literal cleanup pass: app/ui tests に残った raw `hunk(... diff_line(LineKind::Added, ...))` を `added_hunk` に寄せる
+- [x] (2026-04-23 21:59:34Z) remaining Added-only hunk literal cleanup 後の targeted tests、clippy、full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -129,6 +131,9 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: app/ui tests の single-hunk app fixture にも、Added 行だけなのに `single_hunk_app(..., vec![diff_line(LineKind::Added, ...)])` を展開する箇所が大量に残っていた。
   Evidence: `added_hunk_app` に寄せた後、`src/app.rs` は 9786 行から 9640 行へ、`src/ui.rs` は 3566 行から 3542 行へ減った。差分は 3 ファイルで 35 insertions / 201 deletions、純減 166 行になり、`search` 19 件、`line_number` 27 件、`scar_target` 5 件、`ui::tests` 63 件、clippy、full `just ci` が成功した。
+
+- Observation: app/ui tests には、Added-only だが `App` ではなく raw `Hunk` が必要な箇所に `hunk(... diff_line(LineKind::Added, ...))` が残っていた。
+  Evidence: `added_hunk` へ追加で寄せた後、`src/app.rs` は 9640 行から 9619 行へ、`src/ui.rs` は 3542 行から 3535 行へ減った。差分は 2 ファイルで 15 insertions / 43 deletions、純減 28 行になり、`refresh_anchor` 3 件、`next_hunk` 4 件、`ui::tests` 63 件、fmt check、clippy、full `just ci` が成功した。
 
 ## Decision Log
 
@@ -220,6 +225,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: `single_hunk_app` は Context / Deleted を混ぜる低レベル fixture として残し、Added-only の頻出ケースはより狭い helper に寄せる。これでテスト本文の fixture は、変更の種類ではなく表示文字列と hunk 開始行だけを示せる。
   Date/Author: 2026-04-23 21:55:07Z / Codex
 
+- Decision: raw `Hunk` が必要な Added-only fixture も `added_hunk` で作り、`single_hunk_app` は mixed-line fixture 専用に残す。
+  Rationale: `hunk(..., vec![diff_line(LineKind::Added, ...)])` は意味のある low-level 表現ではなく、テスト本文を水増しする構築手順だった。`added_hunk` を使うと hunk 開始行と表示文字列だけが残り、Context / Deleted を含む例だけが `single_hunk_app` の raw line vector を使う。
+  Date/Author: 2026-04-23 21:59:34Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -249,6 +258,8 @@ numbered added lines fixture pass では、長い added hunk fixture を `number
 added hunk fixture pass では、Added 行だけの hunk fixture を `added_hunk` に集約した。`src/app.rs` は 9866 行から 9786 行へ、`src/test_support.rs` は 207 行から 217 行になった。差分は 2 ファイルで 31 insertions / 101 deletions、純減 70 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 added hunk app fixture pass では、Added 行だけの single-hunk app fixture を `added_hunk_app` に集約した。`src/app.rs` は 9786 行から 9640 行へ、`src/ui.rs` は 3566 行から 3542 行へ、`src/test_support.rs` は 217 行から 221 行になった。差分は 3 ファイルで 35 insertions / 201 deletions、純減 166 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
+
+remaining Added-only hunk literal cleanup pass では、App fixture helper では置き換えられなかった raw `Hunk` 構築を `added_hunk` に寄せた。`src/app.rs` は 9640 行から 9619 行へ、`src/ui.rs` は 3542 行から 3535 行へ、`src/test_support.rs` は 221 行のままだった。差分は 2 ファイルで 15 insertions / 43 deletions、純減 28 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -789,6 +800,42 @@ added hunk app fixture pass 後の追加証拠は以下である。
 
     cargo test --all-targets --all-features scar_target -- --nocapture
     5 passed
+
+    cargo test --all-targets --all-features ui::tests -- --nocapture
+    63 passed
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
+remaining Added-only hunk literal cleanup pass 後の追加証拠は以下である。
+
+    src/app.rs           9619 lines
+    src/ui.rs            3535 lines
+    src/test_support.rs   221 lines
+
+    git diff --stat
+    src/app.rs | 41 ++++++++++-------------------------------
+    src/ui.rs  | 17 +++++------------
+    2 files changed, 15 insertions(+), 43 deletions(-)
+
+    cargo fmt --all -- --check
+
+    cargo test --all-targets --all-features refresh_anchor -- --nocapture
+    3 passed
+
+    cargo test --all-targets --all-features next_hunk -- --nocapture
+    4 passed
 
     cargo test --all-targets --all-features ui::tests -- --nocapture
     63 passed

@@ -1725,7 +1725,7 @@ mod tests {
     use crate::app::PickerState;
     use crate::git::{DiffContent, DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     use crate::test_support::{
-        added_hunk_app, app_with_file, app_with_files, app_with_hunks,
+        added_hunk, added_hunk_app, app_with_file, app_with_files, app_with_hunks,
         binary_file as timed_binary_file, diff_line, file_view_state, hunk, install_search,
         make_file, numbered_added_lines, single_added_app, single_added_file,
         single_added_hunk_file, single_hunk_app,
@@ -2766,11 +2766,7 @@ mod tests {
     }
 
     fn modified_file_status(name: &str, status: FileStatus, secs: u64) -> FileDiff {
-        let mut file = make_file(
-            name,
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            secs,
-        );
+        let mut file = make_file(name, vec![added_hunk(1, &["x"])], secs);
         file.status = status;
         file
     }
@@ -2964,10 +2960,7 @@ mod tests {
         // cell lookup doesn't collide.
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "~~~~")]),
-                hunk(20, vec![diff_line(LineKind::Added, "!!!!")]),
-            ],
+            vec![added_hunk(1, &["~~~~"]), added_hunk(20, &["!!!!"])],
             100,
         );
         // Snap to the first hunk so one hunk is focused and the other
@@ -3498,8 +3491,8 @@ mod tests {
         let mut app = app_with_hunks(
             "a.rs",
             vec![
-                hunk(1, vec![diff_line(LineKind::Added, "first foo")]),
-                hunk(50, vec![diff_line(LineKind::Added, "second foo")]),
+                added_hunk(1, &["first foo"]),
+                added_hunk(50, &["second foo"]),
             ],
             100,
         );

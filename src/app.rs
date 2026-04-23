@@ -4533,10 +4533,7 @@ mod tests {
             // a.rs: newest, 2 hunks
             make_file(
                 "a.rs",
-                vec![
-                    hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                    hunk(10, vec![diff_line(LineKind::Added, "y")]),
-                ],
+                vec![added_hunk(1, &["x"]), added_hunk(10, &["y"])],
                 200,
             ),
             // b.rs: older, 1 hunk
@@ -4563,10 +4560,7 @@ mod tests {
     fn prev_hunk_walks_backwards() {
         let app_files = vec![make_file(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(10, vec![diff_line(LineKind::Added, "y")]),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(10, &["y"])],
             100,
         )];
         let mut app = fake_app(app_files);
@@ -4588,10 +4582,7 @@ mod tests {
             single_added_file("older.rs", "c", 100),
             make_file(
                 "newest.rs",
-                vec![
-                    hunk(1, vec![diff_line(LineKind::Added, "a")]),
-                    hunk(20, vec![diff_line(LineKind::Added, "b")]),
-                ],
+                vec![added_hunk(1, &["a"]), added_hunk(20, &["b"])],
                 300,
             ),
         ]);
@@ -5038,10 +5029,7 @@ mod tests {
         let lines = numbered_added_lines(20);
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, lines),
-                hunk(100, vec![diff_line(LineKind::Added, "tail")]),
-            ],
+            vec![hunk(1, lines), added_hunk(100, &["tail"])],
             100,
         );
         app.last_body_height.set(15);
@@ -5463,7 +5451,7 @@ mod tests {
                 diff_line(LineKind::Added, "b"),
             ],
         );
-        let hunk2 = hunk(5000, vec![diff_line(LineKind::Added, "z")]);
+        let hunk2 = added_hunk(5000, &["z"]);
         let mut app = app_with_hunks("foo.rs", vec![hunk1, hunk2.clone()], 100);
         // Mark hunk2 seen so it collapses out of the layout.
         let path = app.files[0].path.clone();
@@ -5588,10 +5576,7 @@ mod tests {
     fn handle_key_f_restores_follow_mode_and_jumps_to_target() {
         let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(20, vec![diff_line(LineKind::Added, "y")]),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(20, &["y"])],
             100,
         );
         app.handle_key(key(KeyCode::Char('g'))); // jump to top, drops follow
@@ -6377,10 +6362,7 @@ mod tests {
         let newest = file_idx(&app, "newest.rs");
         app.files[newest] = make_file(
             "newest.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(30, vec![diff_line(LineKind::Added, "z")]),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(30, &["z"])],
             400,
         );
         app.files.sort_by_key(|a| a.mtime);
@@ -6487,10 +6469,7 @@ mod tests {
     fn refresh_anchor_prefers_nearest_hunk_within_same_file() {
         let mut app = app_with_hunks(
             "only.rs",
-            vec![
-                hunk(10, vec![diff_line(LineKind::Added, "first")]),
-                hunk(50, vec![diff_line(LineKind::Added, "second")]),
-            ],
+            vec![added_hunk(10, &["first"]), added_hunk(50, &["second"])],
             100,
         );
 
@@ -6515,8 +6494,8 @@ mod tests {
         app.files[0] = make_file(
             "only.rs",
             vec![
-                hunk(10, vec![diff_line(LineKind::Added, "first")]),
-                hunk(60, vec![diff_line(LineKind::Added, "second shifted")]),
+                added_hunk(10, &["first"]),
+                added_hunk(60, &["second shifted"]),
             ],
             100,
         );
