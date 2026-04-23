@@ -56,12 +56,33 @@ pub(crate) fn single_hunk_file(name: &str, lines: Vec<DiffLine>, secs: u64) -> F
     make_file(name, vec![hunk(1, lines)], secs)
 }
 
+pub(crate) fn single_added_hunk_file(
+    name: &str,
+    old_start: usize,
+    text: &str,
+    secs: u64,
+) -> FileDiff {
+    make_file(
+        name,
+        vec![hunk(old_start, vec![diff_line(LineKind::Added, text)])],
+        secs,
+    )
+}
+
 pub(crate) fn single_added_file(name: &str, text: &str, secs: u64) -> FileDiff {
-    single_hunk_file(name, vec![diff_line(LineKind::Added, text)], secs)
+    single_added_hunk_file(name, 1, text, secs)
 }
 
 pub(crate) fn single_added_app(name: &str, text: &str) -> App {
     app_with_files(vec![single_added_file(name, text, 100)])
+}
+
+pub(crate) fn app_with_file(file: FileDiff) -> App {
+    app_with_files(vec![file])
+}
+
+pub(crate) fn app_with_hunks(name: &str, hunks: Vec<Hunk>, secs: u64) -> App {
+    app_with_file(make_file(name, hunks, secs))
 }
 
 pub(crate) fn binary_file(name: &str, secs: u64) -> FileDiff {
