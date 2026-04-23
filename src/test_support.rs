@@ -17,9 +17,17 @@ pub(crate) fn diff_line(kind: LineKind, content: &str) -> DiffLine {
     }
 }
 
+pub(crate) fn diff_lines(kind: LineKind, lines: &[&str]) -> Vec<DiffLine> {
+    lines.iter().map(|line| diff_line(kind, line)).collect()
+}
+
 pub(crate) fn numbered_added_lines(count: usize) -> Vec<DiffLine> {
+    prefixed_diff_lines(LineKind::Added, "line ", count)
+}
+
+pub(crate) fn prefixed_diff_lines(kind: LineKind, prefix: &str, count: usize) -> Vec<DiffLine> {
     (0..count)
-        .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
+        .map(|i| diff_line(kind, &format!("{prefix}{i}")))
         .collect()
 }
 
@@ -37,13 +45,7 @@ pub(crate) fn hunk(old_start: usize, lines: Vec<DiffLine>) -> Hunk {
 }
 
 pub(crate) fn added_hunk(old_start: usize, lines: &[&str]) -> Hunk {
-    hunk(
-        old_start,
-        lines
-            .iter()
-            .map(|line| diff_line(LineKind::Added, line))
-            .collect(),
-    )
+    hunk(old_start, diff_lines(LineKind::Added, lines))
 }
 
 pub(crate) fn make_file(name: &str, hunks: Vec<Hunk>, secs: u64) -> FileDiff {
@@ -78,11 +80,7 @@ pub(crate) fn single_added_hunk_file(
     text: &str,
     secs: u64,
 ) -> FileDiff {
-    make_file(
-        name,
-        vec![hunk(old_start, vec![diff_line(LineKind::Added, text)])],
-        secs,
-    )
+    make_file(name, vec![added_hunk(old_start, &[text])], secs)
 }
 
 pub(crate) fn single_added_file(name: &str, text: &str, secs: u64) -> FileDiff {

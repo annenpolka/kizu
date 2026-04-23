@@ -4405,9 +4405,9 @@ mod tests {
     use crate::git::{DiffContent, DiffLine, LineKind};
     use crate::test_support::{
         added_hunk, added_hunk_app, app_with_files as fake_app, app_with_hunks, binary_file,
-        diff_line, file_view_state, hunk, install_search, make_file, numbered_added_lines,
-        single_added_app, single_added_file, single_added_hunk_file, single_deleted_file,
-        single_hunk_app, single_hunk_file,
+        diff_line, diff_lines, file_view_state, hunk, install_search, make_file,
+        numbered_added_lines, prefixed_diff_lines, single_added_app, single_added_file,
+        single_added_hunk_file, single_deleted_file, single_hunk_app, single_hunk_file,
     };
     use std::time::Duration;
 
@@ -5068,36 +5068,16 @@ mod tests {
                 "before.rs",
                 vec![hunk(
                     1,
-                    vec![
-                        diff_line(LineKind::Context, " a"),
-                        diff_line(LineKind::Context, " b"),
-                        diff_line(LineKind::Context, " c"),
-                        diff_line(LineKind::Context, " d"),
-                    ],
+                    diff_lines(LineKind::Context, &[" a", " b", " c", " d"]),
                 )],
                 100,
             ),
-            make_file(
-                "target.rs",
-                vec![hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "alpha"),
-                        diff_line(LineKind::Added, "beta"),
-                    ],
-                )],
-                200,
-            ),
+            make_file("target.rs", vec![added_hunk(1, &["alpha", "beta"])], 200),
             make_file(
                 "after.rs",
                 vec![hunk(
                     1,
-                    vec![
-                        diff_line(LineKind::Context, " a"),
-                        diff_line(LineKind::Context, " b"),
-                        diff_line(LineKind::Context, " c"),
-                        diff_line(LineKind::Context, " d"),
-                    ],
+                    diff_lines(LineKind::Context, &[" a", " b", " c", " d"]),
                 )],
                 300,
             ),
@@ -5161,36 +5141,16 @@ mod tests {
                 "before.rs",
                 vec![hunk(
                     1,
-                    vec![
-                        diff_line(LineKind::Context, " a"),
-                        diff_line(LineKind::Context, " b"),
-                        diff_line(LineKind::Context, " c"),
-                        diff_line(LineKind::Context, " d"),
-                    ],
+                    diff_lines(LineKind::Context, &[" a", " b", " c", " d"]),
                 )],
                 100,
             ),
-            make_file(
-                "target.rs",
-                vec![hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "alpha"),
-                        diff_line(LineKind::Added, "beta"),
-                    ],
-                )],
-                200,
-            ),
+            make_file("target.rs", vec![added_hunk(1, &["alpha", "beta"])], 200),
             make_file(
                 "after.rs",
                 vec![hunk(
                     1,
-                    vec![
-                        diff_line(LineKind::Context, " a"),
-                        diff_line(LineKind::Context, " b"),
-                        diff_line(LineKind::Context, " c"),
-                        diff_line(LineKind::Context, " d"),
-                    ],
+                    diff_lines(LineKind::Context, &[" a", " b", " c", " d"]),
                 )],
                 300,
             ),
@@ -6521,10 +6481,7 @@ mod tests {
         // Expected: cursor continues to point at the same hunk identity
         // AND the viewport top shifts so the cursor lands at the same
         // screen row as before the recompute.
-        let mut body_lines = Vec::new();
-        for i in 0..30 {
-            body_lines.push(diff_line(LineKind::Context, &format!("ctx {i}")));
-        }
+        let mut body_lines = prefixed_diff_lines(LineKind::Context, "ctx ", 30);
         body_lines.push(diff_line(LineKind::Added, "y"));
         let mut app = fake_app(vec![
             single_added_file("a.rs", "x", 200),
@@ -6785,22 +6742,12 @@ mod tests {
         let app = fake_app(vec![
             make_file(
                 "a.rs",
-                vec![hunk(
-                    1,
-                    (0..8)
-                        .map(|i| diff_line(LineKind::Added, &format!("a{i}")))
-                        .collect(),
-                )],
+                vec![hunk(1, prefixed_diff_lines(LineKind::Added, "a", 8))],
                 100,
             ),
             make_file(
                 "b.rs",
-                vec![hunk(
-                    1,
-                    (0..8)
-                        .map(|i| diff_line(LineKind::Added, &format!("b{i}")))
-                        .collect(),
-                )],
+                vec![hunk(1, prefixed_diff_lines(LineKind::Added, "b", 8))],
                 200,
             ),
         ]);
@@ -6815,22 +6762,12 @@ mod tests {
         let mut app = fake_app(vec![
             make_file(
                 "a.rs",
-                vec![hunk(
-                    1,
-                    (0..8)
-                        .map(|i| diff_line(LineKind::Added, &format!("a{i}")))
-                        .collect(),
-                )],
+                vec![hunk(1, prefixed_diff_lines(LineKind::Added, "a", 8))],
                 100,
             ),
             make_file(
                 "b.rs",
-                vec![hunk(
-                    1,
-                    (0..8)
-                        .map(|i| diff_line(LineKind::Added, &format!("b{i}")))
-                        .collect(),
-                )],
+                vec![hunk(1, prefixed_diff_lines(LineKind::Added, "b", 8))],
                 200,
             ),
         ]);
