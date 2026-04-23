@@ -7187,6 +7187,50 @@ mod tests {
         app
     }
 
+    fn scar_app_with_line(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        kind: LineKind,
+        line: &str,
+    ) -> App {
+        scar_app_with_real_fs(
+            tmp,
+            rel_path,
+            source,
+            hunk_new_start,
+            vec![diff_line(kind, line)],
+        )
+    }
+
+    fn scar_app_with_added_line(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        line: &str,
+    ) -> App {
+        scar_app_with_line(tmp, rel_path, source, hunk_new_start, LineKind::Added, line)
+    }
+
+    fn scar_app_with_context_line(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        line: &str,
+    ) -> App {
+        scar_app_with_line(
+            tmp,
+            rel_path,
+            source,
+            hunk_new_start,
+            LineKind::Context,
+            line,
+        )
+    }
+
     /// Park the cursor on the Nth DiffLine row in the layout (0-indexed
     /// across the whole scroll, not per file). Panics if there aren't
     /// enough DiffLine rows — the tests control the layout exactly so
@@ -7214,9 +7258,9 @@ mod tests {
         rel_path: &str,
         source: &str,
         hunk_new_start: usize,
-        lines: Vec<DiffLine>,
+        line: &str,
     ) -> App {
-        let mut app = scar_app_with_real_fs(tmp, rel_path, source, hunk_new_start, lines);
+        let mut app = scar_app_with_added_line(tmp, rel_path, source, hunk_new_start, line);
         cursor_on_nth_diff_line(&mut app, 0);
         app.handle_key(key(KeyCode::Char('c')));
         app
@@ -7228,12 +7272,12 @@ mod tests {
         // Simulate a diff where line 2 of main.rs was newly added. The
         // cursor lands on that added row, and pressing `a` should insert
         // the canned "ask" scar directly above it.
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_added_line(
             &tmp,
             "src/main.rs",
             "fn one() {}\nfn two() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn two() {}")],
+            "fn two() {}",
         );
         cursor_on_nth_diff_line(&mut app, 0);
 
@@ -7253,12 +7297,12 @@ mod tests {
     #[test]
     fn handle_key_r_inserts_reject_scar_above_cursor_line() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_added_line(
             &tmp,
             "auth.py",
             "def main():\n    return 1\n",
             2,
-            vec![diff_line(LineKind::Added, "    return 1")],
+            "    return 1",
         );
         cursor_on_nth_diff_line(&mut app, 0);
 
@@ -7278,13 +7322,7 @@ mod tests {
         // disk stays untouched and no error is recorded.
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\n";
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "lib.rs",
-            original,
-            1,
-            vec![diff_line(LineKind::Added, "fn one() {}")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "lib.rs", original, 1, "fn one() {}");
         // Park the cursor on the FileHeader row explicitly.
         let file_header_row = file_header_row(&app);
         app.scroll_to(file_header_row);
@@ -7364,13 +7402,7 @@ mod tests {
         // press `a`, and the source file should now carry the
         // canned ask scar directly above the first body line.
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/lib.rs",
-            "line_a\nline_b\n",
-            2,
-            vec![diff_line(LineKind::Added, "line_b")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "src/lib.rs", "line_a\nline_b\n", 2, "line_b");
         let header_row = hunk_header_row(&app, 0);
         app.scroll_to(header_row);
 
@@ -7393,7 +7425,7 @@ mod tests {
             "src/foo.rs",
             "fn alpha() {}\nfn beta() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn beta() {}")],
+            "fn beta() {}",
         );
 
         let state = app
@@ -7418,13 +7450,7 @@ mod tests {
     fn handle_key_c_is_noop_on_file_header_row() {
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\n";
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "lib.rs",
-            original,
-            1,
-            vec![diff_line(LineKind::Added, "fn one() {}")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "lib.rs", original, 1, "fn one() {}");
         let header_row = file_header_row(&app);
         app.scroll_to(header_row);
 
@@ -7439,13 +7465,7 @@ mod tests {
     #[test]
     fn scar_comment_typing_appends_characters_to_body() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = open_scar_comment_app(
-            &tmp,
-            "a.rs",
-            "x\ny\n",
-            2,
-            vec![diff_line(LineKind::Added, "y")],
-        );
+        let mut app = open_scar_comment_app(&tmp, "a.rs", "x\ny\n", 2, "y");
 
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
@@ -7458,13 +7478,7 @@ mod tests {
     #[test]
     fn scar_comment_backspace_deletes_last_character() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = open_scar_comment_app(
-            &tmp,
-            "a.rs",
-            "x\ny\n",
-            2,
-            vec![diff_line(LineKind::Added, "y")],
-        );
+        let mut app = open_scar_comment_app(&tmp, "a.rs", "x\ny\n", 2, "y");
         type_chars(&mut app, "ab");
 
         app.handle_key(key(KeyCode::Backspace));
@@ -7476,13 +7490,7 @@ mod tests {
     fn scar_comment_esc_cancels_without_writing_to_file() {
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\nfn two() {}\n";
-        let mut app = open_scar_comment_app(
-            &tmp,
-            "cancel.rs",
-            original,
-            2,
-            vec![diff_line(LineKind::Added, "fn two() {}")],
-        );
+        let mut app = open_scar_comment_app(&tmp, "cancel.rs", original, 2, "fn two() {}");
         type_chars(&mut app, "dont");
 
         app.handle_key(key(KeyCode::Esc));
@@ -7501,7 +7509,7 @@ mod tests {
             "commit.rs",
             "fn one() {}\nfn two() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn two() {}")],
+            "fn two() {}",
         );
         type_chars(&mut app, "why two?");
 
@@ -7519,13 +7527,7 @@ mod tests {
     fn scar_comment_enter_on_empty_body_is_cancel() {
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\nfn two() {}\n";
-        let mut app = open_scar_comment_app(
-            &tmp,
-            "empty.rs",
-            original,
-            2,
-            vec![diff_line(LineKind::Added, "fn two() {}")],
-        );
+        let mut app = open_scar_comment_app(&tmp, "empty.rs", original, 2, "fn two() {}");
         app.handle_key(key(KeyCode::Enter));
 
         assert!(
@@ -7542,13 +7544,7 @@ mod tests {
         // the body instead of quitting the app. Proves the router
         // correctly parks normal-mode dispatch behind the overlay.
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = open_scar_comment_app(
-            &tmp,
-            "quit.rs",
-            "x\ny\n",
-            2,
-            vec![diff_line(LineKind::Added, "y")],
-        );
+        let mut app = open_scar_comment_app(&tmp, "quit.rs", "x\ny\n", 2, "y");
 
         app.handle_key(key(KeyCode::Char('q')));
 
@@ -8104,13 +8100,7 @@ mod tests {
     #[test]
     fn open_in_editor_pairs_cursor_target_line_with_env_program() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/bar.rs",
-            "a\nb\n",
-            2,
-            vec![diff_line(LineKind::Added, "b")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "src/bar.rs", "a\nb\n", 2, "b");
         cursor_on_nth_diff_line(&mut app, 0);
 
         let inv = app.open_in_editor(Some("vim")).expect("invocation");
@@ -8126,13 +8116,7 @@ mod tests {
     #[test]
     fn open_in_editor_returns_none_when_cursor_is_on_file_header() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "lib.rs",
-            "x\n",
-            1,
-            vec![diff_line(LineKind::Added, "x")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "lib.rs", "x\n", 1, "x");
         let header = file_header_row(&app);
         app.scroll_to(header);
 
@@ -8142,13 +8126,7 @@ mod tests {
     #[test]
     fn open_in_editor_returns_none_when_env_is_empty() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "a.rs",
-            "x\n",
-            1,
-            vec![diff_line(LineKind::Added, "x")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "a.rs", "x\n", 1, "x");
         cursor_on_nth_diff_line(&mut app, 0);
         assert!(app.open_in_editor(None).is_none());
     }
@@ -8511,12 +8489,12 @@ mod tests {
     #[test]
     fn insert_canned_scar_pushes_entry_to_undo_stack() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_added_line(
             &tmp,
             "src/main.rs",
             "fn a() {}\nfn b() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn b() {}")],
+            "fn b() {}",
         );
         cursor_on_nth_diff_line(&mut app, 0);
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
@@ -8536,12 +8514,12 @@ mod tests {
         // phantom entry that would otherwise cause `u` to "undo" a
         // write that never happened).
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_context_line(
             &tmp,
             "src/main.rs",
             "fn a() {}\n// @kizu[ask]: explain this change\nfn b() {}\n",
             1,
-            vec![diff_line(LineKind::Context, "fn a() {}")],
+            "fn a() {}",
         );
         // Use file-view mode to target line 3 (where `fn b` lives)
         // deterministically — the line above is the pre-existing scar.
@@ -8565,13 +8543,8 @@ mod tests {
     #[test]
     fn undo_scar_on_empty_stack_is_noop() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            "fn a() {}\n",
-            1,
-            vec![diff_line(LineKind::Context, "fn a() {}")],
-        );
+        let mut app =
+            scar_app_with_context_line(&tmp, "src/main.rs", "fn a() {}\n", 1, "fn a() {}");
         app.undo_scar();
         assert!(app.last_error.is_none(), "empty undo must not error");
     }
@@ -8581,13 +8554,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let abs = tmp.path().join("src/main.rs");
         let before = "fn a() {}\nfn b() {}\n".to_string();
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            &before,
-            2,
-            vec![diff_line(LineKind::Added, "fn b() {}")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "src/main.rs", &before, 2, "fn b() {}");
         cursor_on_nth_diff_line(&mut app, 0);
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
         let inserted = std::fs::read_to_string(&abs).expect("read after insert");
@@ -8604,12 +8571,12 @@ mod tests {
     fn undo_scar_mismatch_surfaces_on_last_error_and_pops_stack() {
         let tmp = tempfile::tempdir().expect("tmp");
         let abs = tmp.path().join("src/main.rs");
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_added_line(
             &tmp,
             "src/main.rs",
             "fn a() {}\nfn b() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn b() {}")],
+            "fn b() {}",
         );
         cursor_on_nth_diff_line(&mut app, 0);
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
@@ -8634,13 +8601,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let abs = tmp.path().join("src/main.rs");
         let before = "fn a() {}\nfn b() {}\nfn c() {}\n".to_string();
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            &before,
-            2,
-            vec![diff_line(LineKind::Added, "fn b() {}")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "src/main.rs", &before, 2, "fn b() {}");
         cursor_on_nth_diff_line(&mut app, 0);
         // First insertion above line 2.
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
@@ -8662,13 +8623,8 @@ mod tests {
     #[test]
     fn file_view_scar_target_line_is_cursor_plus_one() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            "line1\nline2\nline3\n",
-            1,
-            vec![diff_line(LineKind::Added, "line1")],
-        );
+        let mut app =
+            scar_app_with_added_line(&tmp, "src/main.rs", "line1\nline2\nline3\n", 1, "line1");
         // Fake a file-view state directly (bypassing open_file_view's
         // hunk-centering logic). `cursor: 1` is 0-indexed → scar
         // targets 1-indexed line 2.
@@ -8688,13 +8644,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let abs = tmp.path().join("src/main.rs");
         let before = "line1\nline2\nline3\n".to_string();
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            &before,
-            1,
-            vec![diff_line(LineKind::Added, "line1")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "src/main.rs", &before, 1, "line1");
         // Enter file view programmatically (don't rely on the Enter
         // key, which requires the diff layout to have a hunk under
         // the cursor).
