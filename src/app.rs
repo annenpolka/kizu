@@ -2132,9 +2132,9 @@ impl App {
                 } else if ch == k.search {
                     self.open_search_input();
                 } else if ch == k.search_next {
-                    self.search_jump_next();
+                    self.search_jump_by(1);
                 } else if ch == k.search_prev {
-                    self.search_jump_prev();
+                    self.search_jump_by(-1);
                 } else if ch == k.editor {
                     // Read `$EDITOR` at dispatch time (not at bootstrap)
                     // so users who `export EDITOR=` mid-session pick up
@@ -2201,8 +2201,8 @@ impl App {
         // filter character.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('n') | KeyCode::Char('j') => self.picker_cursor_down(),
-                KeyCode::Char('p') | KeyCode::Char('k') => self.picker_cursor_up(),
+                KeyCode::Char('n') | KeyCode::Char('j') => self.move_picker_cursor(1),
+                KeyCode::Char('p') | KeyCode::Char('k') => self.move_picker_cursor(-1),
                 KeyCode::Char('c') => self.close_picker(),
                 _ => {}
             }
@@ -2226,8 +2226,8 @@ impl App {
                     self.jump_to_file_first_hunk(file_idx);
                 }
             }
-            KeyCode::Up => self.picker_cursor_up(),
-            KeyCode::Down => self.picker_cursor_down(),
+            KeyCode::Up => self.move_picker_cursor(-1),
+            KeyCode::Down => self.move_picker_cursor(1),
             KeyCode::Backspace => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.query.pop();
@@ -2297,14 +2297,6 @@ impl App {
         if let Some(picker) = self.picker.as_mut() {
             picker.cursor = new_cursor;
         }
-    }
-
-    fn picker_cursor_down(&mut self) {
-        self.move_picker_cursor(1);
-    }
-
-    fn picker_cursor_up(&mut self) {
-        self.move_picker_cursor(-1);
     }
 
     fn move_picker_cursor(&mut self, delta: isize) {
@@ -3419,8 +3411,7 @@ impl App {
     /// jump the cursor to the first match **after the current cursor
     /// position** (vim-style). Wraps around to the global first match
     /// when every hit is before the cursor, so the press always lands
-    /// somewhere as long as matches exist. `N` / `search_jump_prev`
-    /// is the way to step backward from there.
+    /// somewhere as long as matches exist. `N` steps backward from there.
     ///
     /// Empty queries close the composer without touching confirmed
     /// state so a stray `/` + `Enter` does not wipe an existing search.
@@ -3462,19 +3453,6 @@ impl App {
             TextInputKeyEffect::Commit => self.commit_search_input(),
             TextInputKeyEffect::Cancel => self.close_search_input(),
         }
-    }
-
-    /// `n` — advance to the next confirmed search hit and jump the
-    /// cursor to its row. Wraps around at the end. No-op when
-    /// there is no confirmed search or it has zero matches.
-    pub fn search_jump_next(&mut self) {
-        self.search_jump_by(1);
-    }
-
-    /// `N` — step back to the previous confirmed search hit,
-    /// wrapping to the tail at the start.
-    pub fn search_jump_prev(&mut self) {
-        self.search_jump_by(-1);
     }
 
     fn search_jump_by(&mut self, delta: isize) {

@@ -1731,14 +1731,6 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn binary_file(name: &str) -> FileDiff {
-        timed_binary_file(name, 0)
-    }
-
-    fn fake_app() -> App {
-        app_with_files(Vec::new())
-    }
-
     fn populated_app(files: Vec<FileDiff>) -> App {
         app_with_files(files)
     }
@@ -1796,7 +1788,7 @@ mod tests {
 
     #[test]
     fn render_empty_state_when_no_files() {
-        let app = fake_app();
+        let app = app_with_files(Vec::new());
         let view = render_to_string(&app, 70, 6);
         assert!(
             view.contains("No changes since baseline (baseline: abcdef1)"),
@@ -2573,7 +2565,7 @@ mod tests {
 
     #[test]
     fn responsive_footer_keeps_back_hint_when_file_view_path_is_long() {
-        let mut app = fake_app();
+        let mut app = app_with_files(Vec::new());
         app.file_view = Some(file_view_state(
             "src/extremely/long/path/that/would/otherwise/hide/the/back/hint/demo.rs",
             vec!["first".into(), "second".into(), "third".into()],
@@ -2637,7 +2629,7 @@ mod tests {
         // file view must draw `∅` at the end of the final line.
         // Non-last lines never get the marker, regardless of
         // `last_line_has_trailing_newline`.
-        let mut app = fake_app();
+        let mut app = app_with_files(Vec::new());
         app.file_view = Some(file_view_state(
             "foo.rs",
             vec!["first".into(), "tail-no-newline".into()],
@@ -2654,7 +2646,7 @@ mod tests {
 
     #[test]
     fn file_view_omits_marker_when_last_line_has_newline() {
-        let mut app = fake_app();
+        let mut app = app_with_files(Vec::new());
         app.file_view = Some(file_view_state(
             "foo.rs",
             vec!["first".into(), "last".into()],
@@ -2672,7 +2664,7 @@ mod tests {
     #[test]
     fn file_view_wrap_mode_renders_late_content_and_footer_indicator() {
         let long = format!("const DATA: &str = {:?};", "0123456789".repeat(12));
-        let mut app = fake_app();
+        let mut app = app_with_files(Vec::new());
         app.file_view = Some(file_view_state("src/demo.rs", vec![long.clone()], 0, true));
         app.wrap_lines = true;
 
@@ -2690,7 +2682,7 @@ mod tests {
 
     #[test]
     fn render_scroll_marks_binary_file_with_notice() {
-        let app = populated_app(vec![binary_file("assets/icon.png")]);
+        let app = populated_app(vec![timed_binary_file("assets/icon.png", 0)]);
         let view = render_to_string(&app, 80, 8);
         assert!(view.contains("assets/icon.png"));
         assert!(view.contains("[binary file - diff suppressed]"));
@@ -3208,7 +3200,7 @@ mod tests {
 
     #[test]
     fn binary_notice_cursor_displays_arrow_marker() {
-        let mut app = populated_app(vec![binary_file("assets/icon.png")]);
+        let mut app = populated_app(vec![timed_binary_file("assets/icon.png", 0)]);
         app.scroll_to(1);
 
         let view = render_to_string(&app, 80, 8);

@@ -30,6 +30,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 20:57:14Z) post-commit 削減後の full gate (`just ci`) を通す
 - [x] (2026-04-23 21:03:51Z) 共通 key dispatch / fixture 削減 pass: normal/file-view 共通 action key handler と `single_added_app` test fixture を追加
 - [x] (2026-04-23 21:03:51Z) 共通 key dispatch / fixture 削減後の full gate (`just ci`) を通す
+- [x] (2026-04-23 21:07:25Z) thin wrapper cleanup pass: picker/search navigation の薄い wrapper と UI test の local `fake_app` / `binary_file` wrapper を削除
+- [x] (2026-04-23 21:07:25Z) thin wrapper cleanup 後の full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -86,6 +88,12 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: app/ui のテストは、単一ファイル・単一 added 行の fixture を何十行も繰り返していた。
   Evidence: `single_added_app` を `src/test_support.rs` に追加し、app と ui の該当 fixture を置換した後、`src/app.rs` は 10386 行から 10281 行、`src/ui.rs` は 3730 行から 3661 行になり、`build_layout` 8 件、`search` 19 件、`ui::tests` 63 件、full `just ci` が成功した。
+
+- Observation: `picker_cursor_down` / `picker_cursor_up` と `search_jump_next` / `search_jump_prev` は、内部 helper に固定値を渡すだけの薄い wrapper だった。
+  Evidence: 呼び出し元を `move_picker_cursor(±1)` と `search_jump_by(±1)` に置換して wrapper を削除した後、`picker` 6 件、`search_jump` 4 件、full `just ci` が成功した。
+
+- Observation: UI test module の local `fake_app()` と `binary_file()` は、`test_support` の helper を薄く包むだけだった。
+  Evidence: `app_with_files(Vec::new())` と `timed_binary_file(..., 0)` を直接使う形にして wrapper を削除した後、`ui::tests` 63 件と full `just ci` が成功した。
 
 ## Decision Log
 
@@ -145,6 +153,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: fixture は app/ui の両方に同じ形で散っている。共有 test-only helper にすると production code を汚さず、各テストの本文を検証したい状態だけに寄せられる。
   Date/Author: 2026-04-23 21:03:51Z / Codex
 
+- Decision: ただの direction wrapper は削除し、呼び出し側で `±1` を明示する。
+  Rationale: `move_picker_cursor(1)` / `search_jump_by(-1)` は十分に読める。中間 wrapper があると分岐の実体を追うためにジャンプが増え、コード量も増える。
+  Date/Author: 2026-04-23 21:07:25Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -158,6 +170,8 @@ Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/fo
 post-commit 削減 pass では、`src/app.rs` と `src/ui.rs` の test-only boilerplate だけを削った。`src/app.rs` は 10441 行から 10386 行へ、`src/ui.rs` は 3830 行から 3730 行へ減った。差分は 2 ファイルで 153 insertions / 308 deletions、純減 155 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 共通 key dispatch / fixture 削減 pass では、normal/file-view の共通 action key を `handle_common_action_key` に寄せ、単一 added 行の fixture を `single_added_app` として共有化した。`src/app.rs` は 10386 行から 10281 行へ、`src/ui.rs` は 3730 行から 3661 行へ、`src/test_support.rs` は 153 行から 161 行になった。差分は 3 ファイルで 92 insertions / 258 deletions、純減 166 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
+
+thin wrapper cleanup pass では、picker/search navigation の direction wrapper と UI test module の local wrapper を削除した。`src/app.rs` は 10281 行から 10259 行へ、`src/ui.rs` は 3661 行から 3653 行へ減った。差分は 2 ファイルで 14 insertions / 44 deletions、純減 30 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -409,6 +423,36 @@ post-commit 削減 pass 後の追加証拠は以下である。
 
     cargo test --all-targets --all-features search -- --nocapture
     19 passed
+
+    cargo test --all-targets --all-features ui::tests -- --nocapture
+    63 passed
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
+thin wrapper cleanup pass 後の追加証拠は以下である。
+
+    src/app.rs 10259 lines
+    src/ui.rs   3653 lines
+
+    git diff --stat
+    src/app.rs | 36 +++++++-----------------------------
+    src/ui.rs  | 22 +++++++---------------
+    2 files changed, 14 insertions(+), 44 deletions(-)
+
+    cargo test --all-targets --all-features picker -- --nocapture
+    6 passed
+
+    cargo test --all-targets --all-features search_jump -- --nocapture
+    4 passed
 
     cargo test --all-targets --all-features ui::tests -- --nocapture
     63 passed
