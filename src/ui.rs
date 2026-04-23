@@ -1725,9 +1725,10 @@ mod tests {
     use crate::app::PickerState;
     use crate::git::{DiffContent, DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     use crate::test_support::{
-        app_with_file, app_with_files, app_with_hunks, binary_file as timed_binary_file, diff_line,
-        file_view_state, hunk, install_search, make_file, numbered_added_lines, single_added_app,
-        single_added_file, single_added_hunk_file, single_hunk_app,
+        added_hunk_app, app_with_file, app_with_files, app_with_hunks,
+        binary_file as timed_binary_file, diff_line, file_view_state, hunk, install_search,
+        make_file, numbered_added_lines, single_added_app, single_added_file,
+        single_added_hunk_file, single_hunk_app,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -3020,15 +3021,7 @@ mod tests {
         // Multi-line hunk so that *some* row exists that's selected but
         // not the cursor — proving the `▎` ribbon still gets drawn for
         // the rest of the hunk while only one row gets the `▶` arrow.
-        let mut app = single_hunk_app(
-            "src/foo.rs",
-            1,
-            vec![
-                diff_line(LineKind::Added, "first"),
-                diff_line(LineKind::Added, "second"),
-            ],
-            100,
-        );
+        let mut app = added_hunk_app("src/foo.rs", 1, &["first", "second"], 100);
         // Place the cursor on the hunk header so the `▎` (not `▶`) bar
         // covers both diff line rows.
         app.scroll_to(app.layout.hunk_starts[0]);
@@ -3048,15 +3041,7 @@ mod tests {
         // Two-line hunk: park the cursor on the first diff line. That row
         // should render `▶` in the left margin while the *other* diff row
         // of the same hunk still uses the plain `▎` ribbon.
-        let mut app = single_hunk_app(
-            "src/foo.rs",
-            1,
-            vec![
-                diff_line(LineKind::Added, "first"),
-                diff_line(LineKind::Added, "second"),
-            ],
-            100,
-        );
+        let mut app = added_hunk_app("src/foo.rs", 1, &["first", "second"], 100);
         // Layout: FileHeader, HunkHeader, DiffLine(0), DiffLine(1), Spacer
         // hunk_starts[0] = 1 (HunkHeader). First DiffLine is at row 2.
         app.scroll_to(app.layout.hunk_starts[0] + 1);
@@ -3486,16 +3471,7 @@ mod tests {
         // With an active `SearchState`, the footer must echo the query
         // and a `[current/total]` counter so the user can tell which
         // hit `n`/`N` is about to jump to without counting visually.
-        let mut app = single_hunk_app(
-            "a.rs",
-            1,
-            vec![
-                diff_line(LineKind::Added, "foo one"),
-                diff_line(LineKind::Added, "foo two"),
-                diff_line(LineKind::Added, "foo three"),
-            ],
-            100,
-        );
+        let mut app = added_hunk_app("a.rs", 1, &["foo one", "foo two", "foo three"], 100);
         let match_count = install_search(&mut app, "foo", 1); // 2/3
         assert_eq!(match_count, 3);
         app.follow_mode = false;

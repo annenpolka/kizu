@@ -108,6 +108,10 @@ pub(crate) fn single_hunk_app(
     app_with_hunks(name, vec![hunk(old_start, lines)], secs)
 }
 
+pub(crate) fn added_hunk_app(name: &str, old_start: usize, lines: &[&str], secs: u64) -> App {
+    app_with_hunks(name, vec![added_hunk(old_start, lines)], secs)
+}
+
 pub(crate) fn app_with_file(file: FileDiff) -> App {
     app_with_files(vec![file])
 }
