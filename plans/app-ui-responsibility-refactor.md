@@ -54,6 +54,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 22:07:29Z) UI buffer lookup 後の `ui::tests`、clippy、full gate (`just ci`) を通す
 - [x] (2026-04-23 22:10:48Z) scar real-fs fixture pass: 単一 added/context 行の tempdir-backed App 生成を helper に寄せる
 - [x] (2026-04-23 22:10:48Z) scar real-fs fixture 後の scar/editor/undo targeted tests、clippy、full gate (`just ci`) を通す
+- [x] (2026-04-23 22:13:40Z) deleted-row lookup pass: scar deleted-line tests の duplicated RowKind scan を helper に寄せる
+- [x] (2026-04-23 22:13:40Z) deleted-row lookup 後の targeted tests、clippy、full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -149,6 +151,9 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: scar/editor/undo tests は、tempdir に実ファイルを置いた上で単一 added/context 行 hunk を作る fixture を何度も展開していた。
   Evidence: `scar_app_with_added_line` / `scar_app_with_context_line` と simplified `open_scar_comment_app` に寄せた後、`src/app.rs` は 9556 行から 9506 行へ減った。差分は 1 ファイルで 76 insertions / 126 deletions、純減 50 行になり、`scar` 70 件、`scar_comment` 7 件、`scar_target` 5 件、`undo_scar` 3 件、`open_in_editor` 3 件、fmt check、clippy、full `just ci` が成功した。
+
+- Observation: deleted-line scar e2e tests は、layout から最初の Deleted `DiffLine` row を探す同じ closure を二重に持っていた。
+  Evidence: `first_diff_row_with_kind` に寄せた後、`src/app.rs` は 9506 行から 9480 行へ減った。差分は 1 ファイルで 26 insertions / 52 deletions、純減 26 行になり、`scar_on_` 3 件、fmt check、clippy、full `just ci` が成功した。
 
 ## Decision Log
 
@@ -256,6 +261,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: scar/editor/undo tests の主張は実ファイルへの挿入・undo・line mapping であり、`vec![diff_line(LineKind::Added, ...)]` の組み立てではない。added/context の単一行 helper に寄せると、実 FS setup の意味だけが残る。
   Date/Author: 2026-04-23 22:10:48Z / Codex
 
+- Decision: RowKind から実際の `DiffLine.kind` を引く test helper は、kind 指定の row lookup として共有する。
+  Rationale: scar deleted-line tests は、row の種類だけではなく `FileDiff` 側の line kind を見て対象行を決める必要がある。この lookup を closure の直書きにすると、テスト本文より探索手順の方が大きくなるため helper 化する。
+  Date/Author: 2026-04-23 22:13:40Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -293,6 +302,8 @@ numbered diff line fixture pass では、prefix 付き番号行と同種 line ve
 UI buffer lookup pass では、UI tests の rendered buffer text-run 探索を `first_text_run` / `row_containing` に寄せ、sticky header fixture の番号付き context 行も `prefixed_diff_lines` に寄せた。`src/ui.rs` は 3535 行から 3516 行へ減った。差分は 1 ファイルで 20 insertions / 39 deletions、純減 19 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 scar real-fs fixture pass では、tempdir-backed scar/editor/undo tests の単一 added/context 行 fixture を helper に寄せた。`src/app.rs` は 9556 行から 9506 行へ減った。差分は 1 ファイルで 76 insertions / 126 deletions、純減 50 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
+
+deleted-row lookup pass では、scar deleted-line tests の重複 RowKind scan を `first_diff_row_with_kind` に集約した。`src/app.rs` は 9506 行から 9480 行へ減った。差分は 1 ファイルで 26 insertions / 52 deletions、純減 26 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -972,6 +983,35 @@ scar real-fs fixture pass 後の追加証拠は以下である。
     3 passed
 
     cargo test --all-targets --all-features open_in_editor -- --nocapture
+    3 passed
+
+    cargo fmt --all -- --check
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
+deleted-row lookup pass 後の追加証拠は以下である。
+
+    src/app.rs           9480 lines
+    src/ui.rs            3516 lines
+    src/test_support.rs   219 lines
+
+    git diff --stat
+    src/app.rs | 78 +++++++++++++++++++++-----------------------------------------
+    1 file changed, 26 insertions(+), 52 deletions(-)
+
+    cargo test --all-targets --all-features scar_on_ -- --nocapture
     3 passed
 
     cargo fmt --all -- --check

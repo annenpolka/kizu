@@ -7749,6 +7749,30 @@ mod tests {
         )
     }
 
+    fn first_diff_row_with_kind(app: &App, kind: LineKind) -> usize {
+        find_first_row_matching(app, |r| {
+            if let RowKind::DiffLine {
+                file_idx,
+                hunk_idx,
+                line_idx,
+            } = r
+            {
+                app.files
+                    .get(*file_idx)
+                    .and_then(|f| match &f.content {
+                        DiffContent::Text(hunks) => hunks
+                            .get(*hunk_idx)
+                            .and_then(|h| h.lines.get(*line_idx))
+                            .map(|l| l.kind == kind),
+                        _ => None,
+                    })
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        })
+    }
+
     fn hunk_header_row(app: &App, hunk_idx: usize) -> usize {
         find_first_row_matching(
             app,
@@ -8401,32 +8425,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let (mut app, abs) = revert_app_with_real_repo(&tmp, "del.rs", "a\nb\nc\n", "a\nc\n");
         // Find the deleted row (LineKind::Deleted for "b").
-        let del_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                if let RowKind::DiffLine {
-                    file_idx,
-                    hunk_idx,
-                    line_idx,
-                } = r
-                {
-                    app.files
-                        .get(*file_idx)
-                        .and_then(|f| match &f.content {
-                            DiffContent::Text(hunks) => hunks
-                                .get(*hunk_idx)
-                                .and_then(|h| h.lines.get(*line_idx))
-                                .map(|l| l.kind == LineKind::Deleted),
-                            _ => None,
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            })
-            .expect("a deleted row exists");
+        let del_row = first_diff_row_with_kind(&app, LineKind::Deleted);
         app.scroll_to(del_row);
 
         app.handle_key(key(KeyCode::Char('a')));
@@ -8447,32 +8446,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let (mut app, abs) = revert_app_with_real_repo(&tmp, "gap.rs", "a\nb\nc\nd\n", "a\nd\n");
         // Park on the first deleted row.
-        let del_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                if let RowKind::DiffLine {
-                    file_idx,
-                    hunk_idx,
-                    line_idx,
-                } = r
-                {
-                    app.files
-                        .get(*file_idx)
-                        .and_then(|f| match &f.content {
-                            DiffContent::Text(hunks) => hunks
-                                .get(*hunk_idx)
-                                .and_then(|h| h.lines.get(*line_idx))
-                                .map(|l| l.kind == LineKind::Deleted),
-                            _ => None,
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            })
-            .expect("deleted row");
+        let del_row = first_diff_row_with_kind(&app, LineKind::Deleted);
         app.scroll_to(del_row);
 
         app.handle_key(key(KeyCode::Char('a')));
