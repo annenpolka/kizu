@@ -83,6 +83,15 @@ pub(crate) fn single_added_app(name: &str, text: &str) -> App {
     app_with_files(vec![single_added_file(name, text, 100)])
 }
 
+pub(crate) fn single_hunk_app(
+    name: &str,
+    old_start: usize,
+    lines: Vec<DiffLine>,
+    secs: u64,
+) -> App {
+    app_with_hunks(name, vec![hunk(old_start, lines)], secs)
+}
+
 pub(crate) fn app_with_file(file: FileDiff) -> App {
     app_with_files(vec![file])
 }

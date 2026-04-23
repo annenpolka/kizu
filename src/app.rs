@@ -4406,7 +4406,7 @@ mod tests {
     use crate::test_support::{
         app_with_files as fake_app, app_with_hunks, binary_file, diff_line, file_view_state, hunk,
         install_search, make_file, single_added_app, single_added_file, single_added_hunk_file,
-        single_deleted_file, single_hunk_file,
+        single_deleted_file, single_hunk_app, single_hunk_file,
     };
     use std::time::Duration;
 
@@ -5044,16 +5044,14 @@ mod tests {
         // v0.2 remap: `J` is a one-row forward cursor move, not a
         // hunk jump. Starting at the file header row, `J` walks one
         // row at a time (header → hunk header → first diff line).
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "one"),
-                    diff_line(LineKind::Added, "two"),
-                    diff_line(LineKind::Added, "three"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "one"),
+                diff_line(LineKind::Added, "two"),
+                diff_line(LineKind::Added, "three"),
+            ],
             100,
         );
         app.scroll_to(0);
@@ -5068,16 +5066,14 @@ mod tests {
     #[test]
     fn shift_k_moves_cursor_up_by_exactly_one_visual_row() {
         // v0.2 remap: `K` is a one-row backward cursor move.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "one"),
-                    diff_line(LineKind::Added, "two"),
-                    diff_line(LineKind::Added, "three"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "one"),
+                diff_line(LineKind::Added, "two"),
+                diff_line(LineKind::Added, "three"),
+            ],
             100,
         );
         app.scroll_to(3);
@@ -5305,15 +5301,13 @@ mod tests {
     fn viewport_top_clamps_short_hunk_centring_against_layout_edges() {
         // A short hunk near the very start of the layout: padding above
         // would push viewport_top below 0 → clamp at 0.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "alpha"),
-                    diff_line(LineKind::Added, "beta"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "alpha"),
+                diff_line(LineKind::Added, "beta"),
+            ],
             100,
         );
         let hunk_row = app.layout.hunk_starts[0];
@@ -5397,16 +5391,14 @@ mod tests {
     #[test]
     fn change_runs_collapse_consecutive_same_kind_lines_into_one_entry() {
         // Three contiguous +/- lines should be a single change run, not three.
-        let app = app_with_hunks(
+        let app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "a"),
-                    diff_line(LineKind::Added, "b"),
-                    diff_line(LineKind::Deleted, "c"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "a"),
+                diff_line(LineKind::Added, "b"),
+                diff_line(LineKind::Deleted, "c"),
+            ],
             100,
         );
         assert_eq!(
@@ -5457,15 +5449,13 @@ mod tests {
         // to `rows`. RowKind::DiffLine positions carry Some((old, new));
         // all other rows (FileHeader, HunkHeader, Spacer, BinaryNotice)
         // carry None.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "foo.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Added, "a"),
-                    diff_line(LineKind::Added, "b"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Added, "a"),
+                diff_line(LineKind::Added, "b"),
+            ],
             100,
         );
         app.build_layout();
@@ -5491,15 +5481,13 @@ mod tests {
         // hunk(10, [Added a, Added b]) under the fixture above uses
         // old_start=10, new_start=10, old_count=0, new_count=2.
         // Added #1 → (None, Some(10)); Added #2 → (None, Some(11)).
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "foo.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Added, "a"),
-                    diff_line(LineKind::Added, "b"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Added, "a"),
+                diff_line(LineKind::Added, "b"),
+            ],
             100,
         );
         app.build_layout();
@@ -5525,16 +5513,14 @@ mod tests {
     fn build_layout_max_line_number_covers_visible_rows() {
         // Single hunk with 3 rows starting at new_start=100 →
         // max_line_number must be >= 102.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "foo.rs",
-            vec![hunk(
-                100,
-                vec![
-                    diff_line(LineKind::Added, "a"),
-                    diff_line(LineKind::Added, "b"),
-                    diff_line(LineKind::Added, "c"),
-                ],
-            )],
+            100,
+            vec![
+                diff_line(LineKind::Added, "a"),
+                diff_line(LineKind::Added, "b"),
+                diff_line(LineKind::Added, "c"),
+            ],
             100,
         );
         app.build_layout();
@@ -5631,16 +5617,14 @@ mod tests {
 
     #[test]
     fn handle_key_g_and_capital_g_move_to_top_and_bottom() {
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "x"),
-                    diff_line(LineKind::Added, "y"),
-                    diff_line(LineKind::Added, "z"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "x"),
+                diff_line(LineKind::Added, "y"),
+                diff_line(LineKind::Added, "z"),
+            ],
             100,
         );
         app.handle_key(key(KeyCode::Char('G')));
@@ -5858,16 +5842,14 @@ mod tests {
         // v0.4: marking a hunk as seen must collapse its DiffLine
         // rows out of the layout so only the hunk header survives.
         // The file header and spacer stay put.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "x1"),
-                    diff_line(LineKind::Added, "x2"),
-                    diff_line(LineKind::Added, "x3"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "x1"),
+                diff_line(LineKind::Added, "x2"),
+                diff_line(LineKind::Added, "x3"),
+            ],
             100,
         );
         cursor_on_nth_diff_line(&mut app, 0);
@@ -7121,15 +7103,13 @@ mod tests {
         // then a short one the cursor sits on.
         let long_content: String = std::iter::repeat_n('x', 80).collect();
         let short_content = "short".to_string();
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, &long_content),
-                    diff_line(LineKind::Added, &short_content),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, &long_content),
+                diff_line(LineKind::Added, &short_content),
+            ],
             100,
         );
         // Park the cursor on the second (short) diff row.
@@ -7596,15 +7576,13 @@ mod tests {
     fn scar_target_line_maps_hunk_header_to_first_changed_line_no_context() {
         // Hunk starts immediately with Added lines (no leading context).
         // The first changed line IS new_start, so the result equals new_start.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                42,
-                vec![
-                    diff_line(LineKind::Added, "first"),
-                    diff_line(LineKind::Added, "second"),
-                ],
-            )],
+            42,
+            vec![
+                diff_line(LineKind::Added, "first"),
+                diff_line(LineKind::Added, "second"),
+            ],
             100,
         );
         let header_row = hunk_header_row(&app, 0);
@@ -7621,17 +7599,15 @@ mod tests {
         // Hunk has 2 leading Context lines before the first Added line.
         // The scar should land above the Added line, not above the context.
         // new_start=10, context, context, added → target = 10 + 2 = 12.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Context, "ctx1"),
-                    diff_line(LineKind::Context, "ctx2"),
-                    diff_line(LineKind::Added, "new_stuff"),
-                    diff_line(LineKind::Context, "ctx3"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Context, "ctx1"),
+                diff_line(LineKind::Context, "ctx2"),
+                diff_line(LineKind::Added, "new_stuff"),
+                diff_line(LineKind::Context, "ctx3"),
+            ],
             100,
         );
         let header_row = hunk_header_row(&app, 0);
@@ -8065,16 +8041,14 @@ mod tests {
 
     #[test]
     fn find_matches_finds_substring_case_insensitive_when_query_is_lowercase() {
-        let app = app_with_hunks(
+        let app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "Hello WORLD"),
-                    diff_line(LineKind::Context, "no match here"),
-                    diff_line(LineKind::Added, "World wide"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "Hello WORLD"),
+                diff_line(LineKind::Context, "no match here"),
+                diff_line(LineKind::Added, "World wide"),
+            ],
             100,
         );
         let m = find_matches(&app.layout, &app.files, "world");
@@ -8084,15 +8058,13 @@ mod tests {
 
     #[test]
     fn find_matches_is_case_sensitive_when_query_has_uppercase() {
-        let app = app_with_hunks(
+        let app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "hello World"),
-                    diff_line(LineKind::Added, "hello world"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "hello World"),
+                diff_line(LineKind::Added, "hello world"),
+            ],
             100,
         );
         let m = find_matches(&app.layout, &app.files, "World");
@@ -8141,16 +8113,14 @@ mod tests {
 
     #[test]
     fn search_input_enter_commits_and_jumps_cursor_to_first_match() {
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "alpha"),
-                    diff_line(LineKind::Added, "beta"),
-                    diff_line(LineKind::Added, "gamma"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "alpha"),
+                diff_line(LineKind::Added, "beta"),
+                diff_line(LineKind::Added, "gamma"),
+            ],
             100,
         );
         // Park the cursor on the first diff row (alpha).
@@ -8195,17 +8165,15 @@ mod tests {
 
     #[test]
     fn search_jump_next_walks_matches_in_order() {
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "bar"),
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "foo"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "foo"),
+                diff_line(LineKind::Added, "bar"),
+                diff_line(LineKind::Added, "foo"),
+                diff_line(LineKind::Added, "foo"),
+            ],
             100,
         );
         // Park the cursor on the file header (row 0) so commit picks
@@ -8224,15 +8192,13 @@ mod tests {
 
     #[test]
     fn search_jump_next_wraps_around_at_end() {
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "foo"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "foo"),
+                diff_line(LineKind::Added, "foo"),
+            ],
             100,
         );
         app.scroll = 0;
@@ -8246,16 +8212,14 @@ mod tests {
 
     #[test]
     fn search_jump_prev_wraps_around_at_start() {
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "foo"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "foo"),
+                diff_line(LineKind::Added, "foo"),
+                diff_line(LineKind::Added, "foo"),
+            ],
             100,
         );
         app.scroll = 0;
@@ -8325,17 +8289,15 @@ mod tests {
     fn search_commit_starts_from_first_match_after_cursor() {
         // vim-style `/`: commit jumps to the first match strictly
         // after the cursor position, not the global first match.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo one"),
-                    diff_line(LineKind::Added, "mid"),
-                    diff_line(LineKind::Added, "foo two"),
-                    diff_line(LineKind::Added, "foo three"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "foo one"),
+                diff_line(LineKind::Added, "mid"),
+                diff_line(LineKind::Added, "foo two"),
+                diff_line(LineKind::Added, "foo three"),
+            ],
             100,
         );
         // Cursor on the middle diff line (between first and third foo).
@@ -8364,16 +8326,14 @@ mod tests {
         // When no match lives after the cursor, wrap around to the
         // global first match so `/foo<Enter>` always lands on SOMETHING
         // (never a no-op with matches.len() > 0).
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo a"),
-                    diff_line(LineKind::Added, "foo b"),
-                    diff_line(LineKind::Added, "trailing"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "foo a"),
+                diff_line(LineKind::Added, "foo b"),
+                diff_line(LineKind::Added, "trailing"),
+            ],
             100,
         );
         // Cursor sits AFTER both matches.
@@ -8722,16 +8682,14 @@ mod tests {
         // hunk: Added "x" (new file line 10), Deleted "y" (no new pos),
         //       Added "z" (new file line 11). Cursor on the Deleted
         //       row should resolve to line 11 — the replacement.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Added, "x"),
-                    diff_line(LineKind::Deleted, "y"),
-                    diff_line(LineKind::Added, "z"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Added, "x"),
+                diff_line(LineKind::Deleted, "y"),
+                diff_line(LineKind::Added, "z"),
+            ],
             100,
         );
         // Cursor on the Deleted row (2nd diff line in the hunk = nth=1).
@@ -8751,16 +8709,14 @@ mod tests {
         // file where the deletion gap sits. The scar will land
         // above that line (which may be a surviving neighbour or
         // the end of the file).
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                5,
-                vec![
-                    diff_line(LineKind::Deleted, "gone_a"),
-                    diff_line(LineKind::Deleted, "gone_b"),
-                    diff_line(LineKind::Deleted, "gone_c"),
-                ],
-            )],
+            5,
+            vec![
+                diff_line(LineKind::Deleted, "gone_a"),
+                diff_line(LineKind::Deleted, "gone_b"),
+                diff_line(LineKind::Deleted, "gone_c"),
+            ],
             100,
         );
         // Cursor on the first deleted row.
@@ -9097,15 +9053,13 @@ mod tests {
         // the hunk header via `refresh_anchor`. A sticky `scar_focus`
         // pin should survive both that second recompute and any further
         // ones until the user explicitly navigates.
-        let mut app = app_with_hunks(
+        let mut app = single_hunk_app(
             "src/main.rs",
-            vec![hunk(
-                2,
-                vec![
-                    diff_line(LineKind::Added, "// @kizu[ask]: explain this change"),
-                    diff_line(LineKind::Added, "fn two() {}"),
-                ],
-            )],
+            2,
+            vec![
+                diff_line(LineKind::Added, "// @kizu[ask]: explain this change"),
+                diff_line(LineKind::Added, "fn two() {}"),
+            ],
             100,
         );
         app.scar_focus = Some((PathBuf::from("/tmp/fake/src/main.rs"), 2));

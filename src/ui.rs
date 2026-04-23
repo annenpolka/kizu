@@ -1725,9 +1725,9 @@ mod tests {
     use crate::app::PickerState;
     use crate::git::{DiffContent, DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     use crate::test_support::{
-        app_with_file, app_with_files, binary_file as timed_binary_file, diff_line,
+        app_with_file, app_with_files, app_with_hunks, binary_file as timed_binary_file, diff_line,
         file_view_state, hunk, install_search, make_file, single_added_app, single_added_file,
-        single_added_hunk_file,
+        single_added_hunk_file, single_hunk_app,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1971,18 +1971,16 @@ mod tests {
         // an explicit fix the pinned header sits 4 cells left of the
         // scrolling DiffLine bodies whenever LN is on and the cursor
         // is deep enough inside a hunk to activate stickiness.
-        let mut app = app_with_file(make_file(
+        let mut app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                10,
-                // Enough DiffLines that the cursor will scroll past
-                // the hunk header and stickiness kicks in.
-                (0..30)
-                    .map(|i| diff_line(LineKind::Context, &format!("line {i}")))
-                    .collect(),
-            )],
+            10,
+            // Enough DiffLines that the cursor will scroll past
+            // the hunk header and stickiness kicks in.
+            (0..30)
+                .map(|i| diff_line(LineKind::Context, &format!("line {i}")))
+                .collect(),
             100,
-        ));
+        );
         app.show_line_numbers = true;
         app.build_layout();
         // Move cursor deep into the hunk so the header becomes sticky.
@@ -2030,17 +2028,15 @@ mod tests {
         // first body glyph must match between LN OFF and LN ON —
         // turning the gutter on shifts *both* by the same amount.
         let make_app = |show_ln: bool| {
-            let mut app = app_with_file(make_file(
+            let mut app = single_hunk_app(
                 "src/foo.rs",
-                vec![hunk(
-                    10,
-                    vec![
-                        diff_line(LineKind::Context, "fn ok()"),
-                        diff_line(LineKind::Added, "x"),
-                    ],
-                )],
+                10,
+                vec![
+                    diff_line(LineKind::Context, "fn ok()"),
+                    diff_line(LineKind::Added, "x"),
+                ],
                 100,
-            ));
+            );
             app.show_line_numbers = show_ln;
             app.build_layout();
             app
@@ -2083,17 +2079,15 @@ mod tests {
         // v0.5 end-to-end: `show_line_numbers=true` must put a
         // right-aligned worktree line number in the gutter of every
         // Context / Added row.
-        let mut app = app_with_file(make_file(
+        let mut app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Context, "fn ok()"),
-                    diff_line(LineKind::Added, "let x = 1;"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Context, "fn ok()"),
+                diff_line(LineKind::Added, "let x = 1;"),
+            ],
             100,
-        ));
+        );
         app.show_line_numbers = true;
         app.build_layout();
         let view = render_to_string(&app, 80, 12);
@@ -2111,14 +2105,12 @@ mod tests {
         // Codex review §Critical-2: Stream mode FileDiffs carry
         // synthetic old_start/new_start values that are not real file
         // line numbers. The renderer must suppress the gutter.
-        let mut app = app_with_file(make_file(
+        let mut app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                100, // new_start=100 so any LN artifact would be visible
-                vec![diff_line(LineKind::Added, "x")],
-            )],
+            100, // new_start=100 so any LN artifact would be visible
+            vec![diff_line(LineKind::Added, "x")],
             100,
-        ));
+        );
         app.show_line_numbers = true;
         app.view_mode = crate::app::ViewMode::Stream;
         app.build_layout();
@@ -2167,18 +2159,16 @@ mod tests {
 
     #[test]
     fn render_scroll_shows_file_header_hunk_header_and_diff_line() {
-        let app = app_with_file(make_file(
+        let app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Context, "fn ok()"),
-                    diff_line(LineKind::Added, "let x = 1;"),
-                    diff_line(LineKind::Deleted, "let y = 2;"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Context, "fn ok()"),
+                diff_line(LineKind::Added, "let x = 1;"),
+                diff_line(LineKind::Deleted, "let y = 2;"),
+            ],
             100,
-        ));
+        );
         let view = render_to_string(&app, 80, 12);
         assert!(view.contains("src/foo.rs"), "missing file header:\n{view}");
         // New hunk header format: @@ L<range> +N/-M
@@ -2204,17 +2194,15 @@ mod tests {
         // identified purely by their background color. We assert that
         // (a) the body text carries a green or red `bg` Style and
         // (b) no literal `+`/`-` prefix cell appears on the row body.
-        let app = app_with_file(make_file(
+        let app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "x"),
-                    diff_line(LineKind::Deleted, "y"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "x"),
+                diff_line(LineKind::Deleted, "y"),
+            ],
             100,
-        ));
+        );
         let buffer = render_buffer(&app, 80, 12);
 
         let found_added_bg = buffer_has_cell(&buffer, |cell| {
@@ -2274,17 +2262,15 @@ mod tests {
         // ADR-0014: there must be no `+`/`-` prefix cells in the diff
         // body region (rows past the 5-char bar margin). The background
         // color encodes add/delete instead.
-        let app = app_with_file(make_file(
+        let app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "ADDED_LINE"),
-                    diff_line(LineKind::Deleted, "DELETED_LINE"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "ADDED_LINE"),
+                diff_line(LineKind::Deleted, "DELETED_LINE"),
+            ],
             100,
-        ));
+        );
         let view = render_to_string(&app, 80, 12);
         assert!(
             !view.contains("+ADDED_LINE"),
@@ -2841,7 +2827,7 @@ mod tests {
 
     #[test]
     fn hunk_header_uses_function_context_when_available() {
-        let app = app_with_file(make_file(
+        let app = app_with_hunks(
             "src/auth.rs",
             vec![hunk_with_context(
                 10,
@@ -2849,7 +2835,7 @@ mod tests {
                 vec![diff_line(LineKind::Added, "let x = 1;")],
             )],
             100,
-        ));
+        );
         let view = render_to_string(&app, 100, 14);
         assert!(
             view.contains("@@ fn verify_token(claims: &Claims) -> Result<bool> {"),
@@ -2867,7 +2853,7 @@ mod tests {
     fn hunk_header_shows_line_range_and_counts() {
         // Hunk header should display line number range and +/-
         // counts alongside the function context.
-        let app = app_with_file(make_file(
+        let app = app_with_hunks(
             "a.rs",
             vec![Hunk {
                 old_start: 10,
@@ -2884,7 +2870,7 @@ mod tests {
                 context: Some("fn example()".to_string()),
             }],
             100,
-        ));
+        );
         let view = render_to_string(&app, 100, 14);
         // Should contain the line range.
         assert!(
@@ -2907,7 +2893,7 @@ mod tests {
         // Deleted DiffLine rows have a blank gutter, the header was
         // the only positional signal left. Fall back to the baseline
         // range so the reader can still locate the removal.
-        let app = app_with_file(make_file(
+        let app = app_with_hunks(
             "a.rs",
             vec![Hunk {
                 old_start: 1,
@@ -2922,7 +2908,7 @@ mod tests {
                 context: None,
             }],
             100,
-        ));
+        );
         let view = render_to_string(&app, 100, 14);
         assert!(
             !view.contains("L0"),
@@ -2939,7 +2925,7 @@ mod tests {
     fn hunk_header_shows_range_in_fallback_format() {
         // When no function context is available, the header should
         // still show line range and counts.
-        let app = app_with_file(make_file(
+        let app = app_with_hunks(
             "a.rs",
             vec![Hunk {
                 old_start: 5,
@@ -2954,7 +2940,7 @@ mod tests {
                 context: None,
             }],
             100,
-        ));
+        );
         let view = render_to_string(&app, 100, 14);
         assert!(view.contains("L5"), "expected line range L5, got:\n{view}");
         assert!(
@@ -2975,14 +2961,14 @@ mod tests {
         // We use content-only characters ('~', '!') that don't appear
         // in file paths, hunk headers (`@@`), or scroll chrome so the
         // cell lookup doesn't collide.
-        let mut app = app_with_file(make_file(
+        let mut app = app_with_hunks(
             "a.rs",
             vec![
                 hunk(1, vec![diff_line(LineKind::Added, "~~~~")]),
                 hunk(20, vec![diff_line(LineKind::Added, "!!!!")]),
             ],
             100,
-        ));
+        );
         // Snap to the first hunk so one hunk is focused and the other
         // is not.
         app.scroll_to(app.layout.hunk_starts[0]);
@@ -3034,17 +3020,15 @@ mod tests {
         // Multi-line hunk so that *some* row exists that's selected but
         // not the cursor — proving the `▎` ribbon still gets drawn for
         // the rest of the hunk while only one row gets the `▶` arrow.
-        let mut app = app_with_file(make_file(
+        let mut app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "first"),
-                    diff_line(LineKind::Added, "second"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "first"),
+                diff_line(LineKind::Added, "second"),
+            ],
             100,
-        ));
+        );
         // Place the cursor on the hunk header so the `▎` (not `▶`) bar
         // covers both diff line rows.
         app.scroll_to(app.layout.hunk_starts[0]);
@@ -3064,17 +3048,15 @@ mod tests {
         // Two-line hunk: park the cursor on the first diff line. That row
         // should render `▶` in the left margin while the *other* diff row
         // of the same hunk still uses the plain `▎` ribbon.
-        let mut app = app_with_file(make_file(
+        let mut app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "first"),
-                    diff_line(LineKind::Added, "second"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "first"),
+                diff_line(LineKind::Added, "second"),
+            ],
             100,
-        ));
+        );
         // Layout: FileHeader, HunkHeader, DiffLine(0), DiffLine(1), Spacer
         // hunk_starts[0] = 1 (HunkHeader). First DiffLine is at row 2.
         app.scroll_to(app.layout.hunk_starts[0] + 1);
@@ -3179,12 +3161,7 @@ mod tests {
         let lines: Vec<DiffLine> = (0..40)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
-        let mut app = app_with_file(make_file_with_context(
-            "src/foo.rs",
-            "fn long_function() {",
-            lines,
-            100,
-        ));
+        let mut app = app_with_context_hunk("src/foo.rs", "fn long_function() {", lines, 100);
         let header = app.layout.hunk_starts[0];
         // Park the cursor 20 rows past the hunk header (well inside the
         // hunk). Settle the scroll animation so this test asserts on
@@ -3216,12 +3193,7 @@ mod tests {
         let lines: Vec<DiffLine> = (0..40)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
-        let mut app = app_with_file(make_file_with_context(
-            "src/foo.rs",
-            "fn long_function() {",
-            lines,
-            100,
-        ));
+        let mut app = app_with_context_hunk("src/foo.rs", "fn long_function() {", lines, 100);
         let header = app.layout.hunk_starts[0];
         app.scroll_to(header + 20);
         app.anim = None;
@@ -3264,12 +3236,7 @@ mod tests {
         let lines: Vec<DiffLine> = (0..20)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
-        let mut app = app_with_file(make_file_with_context(
-            "src/foo.rs",
-            "fn boundary() {",
-            lines,
-            100,
-        ));
+        let mut app = app_with_context_hunk("src/foo.rs", "fn boundary() {", lines, 100);
         // Jump into the middle of the hunk so any sticky reservation
         // would definitely push the header off-screen.
         let header_row = app.layout.hunk_starts[0];
@@ -3298,12 +3265,7 @@ mod tests {
         let lines: Vec<DiffLine> = (0..40)
             .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
             .collect();
-        let mut app = app_with_file(make_file_with_context(
-            "src/foo.rs",
-            "fn long_function() {",
-            lines,
-            100,
-        ));
+        let mut app = app_with_context_hunk("src/foo.rs", "fn long_function() {", lines, 100);
         // Skip past the hunk header so the renderer has to pin it.
         let header_row = app.layout.hunk_starts[0];
         app.scroll_to(header_row + 10);
@@ -3321,8 +3283,8 @@ mod tests {
         );
     }
 
-    fn make_file_with_context(name: &str, ctx: &str, lines: Vec<DiffLine>, secs: u64) -> FileDiff {
-        make_file(name, vec![hunk_with_context(1, ctx, lines)], secs)
+    fn app_with_context_hunk(name: &str, ctx: &str, lines: Vec<DiffLine>, secs: u64) -> App {
+        app_with_hunks(name, vec![hunk_with_context(1, ctx, lines)], secs)
     }
 
     // ---- v0.4 slash-search in-body highlight ------------------------
@@ -3532,18 +3494,16 @@ mod tests {
         // With an active `SearchState`, the footer must echo the query
         // and a `[current/total]` counter so the user can tell which
         // hit `n`/`N` is about to jump to without counting visually.
-        let mut app = app_with_file(make_file(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo one"),
-                    diff_line(LineKind::Added, "foo two"),
-                    diff_line(LineKind::Added, "foo three"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "foo one"),
+                diff_line(LineKind::Added, "foo two"),
+                diff_line(LineKind::Added, "foo three"),
+            ],
             100,
-        ));
+        );
         let match_count = install_search(&mut app, "foo", 1); // 2/3
         assert_eq!(match_count, 3);
         app.follow_mode = false;
@@ -3567,14 +3527,14 @@ mod tests {
         // overlay must strip DIM so matches stay loud regardless of
         // which hunk the cursor is in — otherwise every non-focus
         // match looks "dark" even though underline + bold are set.
-        let mut app = app_with_file(make_file(
+        let mut app = app_with_hunks(
             "a.rs",
             vec![
                 hunk(1, vec![diff_line(LineKind::Added, "first foo")]),
                 hunk(50, vec![diff_line(LineKind::Added, "second foo")]),
             ],
             100,
-        ));
+        );
         let match_count = install_search(&mut app, "foo", 0);
         assert_eq!(match_count, 2, "test fixture precondition");
         // `current = 0` -> first hunk's `foo` is current; the cursor

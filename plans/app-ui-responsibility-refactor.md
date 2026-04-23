@@ -38,6 +38,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 21:32:22Z) app-under-10k fixture 削減後の targeted tests、clippy、full gate (`just ci`) を通す
 - [x] (2026-04-23 21:37:09Z) legacy fixture cleanup pass: 残った direct `FileDiff` 構築と `RowKind` 探索 closure を test helper に寄せる
 - [x] (2026-04-23 21:37:09Z) legacy fixture cleanup 後の targeted tests、fmt/clippy、full gate (`just ci`) を通す
+- [x] (2026-04-23 21:44:02Z) single-hunk app fixture pass: app/ui tests の `app_with_file(make_file(vec![hunk(...)]))` と単一 hunk `app_with_hunks` を `single_hunk_app` に寄せる
+- [x] (2026-04-23 21:44:02Z) single-hunk app fixture 後の targeted tests、clippy、full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -109,6 +111,9 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: app tests には、削除ファイルや reset 後の単純な追加ファイルを表すためだけに raw `FileDiff { ... }` を直書きする箇所と、file header / diff line row を探す closure が残っていた。
   Evidence: `single_deleted_file`、`file_header_row`、`diff_line_row` に寄せた後、`src/app.rs` は 9945 行から 9929 行へ減り、差分は 2 ファイルで 34 insertions / 44 deletions、純減 10 行になった。`scar_target` 5 件、`revert_confirm` 6 件、`populate_mtimes` 1 件、fmt、clippy、full `just ci` が成功した。
+
+- Observation: app/ui tests には、単一 hunk だけを持つ `App` を作るために `app_with_file(make_file(...))` や `app_with_hunks(..., vec![hunk(...)])` を重ねる箇所が残っていた。
+  Evidence: `single_hunk_app` を `src/test_support.rs` に追加し、該当 fixture を置換した後、`src/app.rs` は 9929 行から 9883 行へ、`src/ui.rs` は 3614 行から 3574 行へ減った。差分は 3 ファイルで 256 insertions / 333 deletions、純減 77 行になり、`ui::tests` 63 件、`search` 19 件、`scar_target` 5 件、`line_number` 27 件、clippy、full `just ci` が成功した。
 
 ## Decision Log
 
@@ -184,6 +189,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: 直書きの `FileDiff { content: DiffContent::Text(...), status: ... }` はテストの主張ではなく、状態を作るための配管だった。`single_deleted_file` のような helper 名にすると、テスト本文は「削除ファイルがある」という振る舞いだけを読める。
   Date/Author: 2026-04-23 21:37:09Z / Codex
 
+- Decision: 単一 hunk の `App` fixture は `single_hunk_app` で直接作る。
+  Rationale: `app_with_file(make_file(...))` と `app_with_hunks(..., vec![hunk(...)])` はテスト本文で一番頻出する構築儀式だった。単一 hunk がテストの前提なら helper 名に明示し、hunk vector の包装は test support に閉じる。
+  Date/Author: 2026-04-23 21:44:02Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -205,6 +214,8 @@ one-hunk fixture 削減 pass では、app/ui tests の単一 hunk / 単一 added
 app-under-10k fixture 削減 pass では、単一ファイル app fixture と hunk header row assertion を共有 helper に寄せた。`src/app.rs` は 10111 行から 9945 行へ、`src/ui.rs` は 3621 行から 3614 行へ、`src/test_support.rs` は 165 行から 186 行になった。差分は 3 ファイルで 198 insertions / 350 deletions、純減 152 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 legacy fixture cleanup pass では、削除ファイル fixture と file/diff row lookup helper を追加し、テスト本文に残った raw `FileDiff` 構築と `RowKind` closure を削った。`src/app.rs` は 9945 行から 9929 行へ、`src/test_support.rs` は 186 行から 192 行になった。差分は 2 ファイルで 34 insertions / 44 deletions、純減 10 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
+
+single-hunk app fixture pass では、app/ui tests の単一 hunk app 構築を `single_hunk_app` に集約した。`src/app.rs` は 9929 行から 9883 行へ、`src/ui.rs` は 3614 行から 3574 行へ、`src/test_support.rs` は 192 行から 201 行になった。差分は 3 ファイルで 256 insertions / 333 deletions、純減 77 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -621,6 +632,44 @@ legacy fixture cleanup pass 後の追加証拠は以下である。
     35 pass
     0 fail
 
+single-hunk app fixture pass 後の追加証拠は以下である。
+
+    src/app.rs           9883 lines
+    src/ui.rs            3574 lines
+    src/test_support.rs   201 lines
+
+    git diff --stat
+    src/app.rs          | 360 +++++++++++++++++++++++-----------------------------
+    src/test_support.rs |   9 ++
+    src/ui.rs           | 220 +++++++++++++-------------------
+    3 files changed, 256 insertions(+), 333 deletions(-)
+
+    cargo test --all-targets --all-features ui::tests -- --nocapture
+    63 passed
+
+    cargo test --all-targets --all-features search -- --nocapture
+    19 passed
+
+    cargo test --all-targets --all-features scar_target -- --nocapture
+    5 passed
+
+    cargo test --all-targets --all-features line_number -- --nocapture
+    27 passed
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
 ## Interfaces and Dependencies
 
 `/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/stream.rs` は次の interface を提供する。
@@ -644,4 +693,4 @@ legacy fixture cleanup pass 後の追加証拠は以下である。
 
 help overlay は `app.config.keys` を読んでキー表示を組み立てる。picker overlay は `app.picker_results()`、`app.files`、`format_mtime` を使い、表示だけを担当する。状態更新やキー入力処理は引き続き `src/app.rs` に残す。
 
-`/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/test_support.rs` は `#[cfg(test)]` の test-only module である。`src/app.rs` と `src/ui.rs` の test module からだけ使い、production code からは参照しない。主な helper は `diff_line`、`hunk`、`make_file`、`single_hunk_file`、`single_added_file`、`single_added_hunk_file`、`single_deleted_file`、`binary_file`、`app_with_file`、`app_with_hunks`、`app_with_files`、`file_view_state`、`install_search` で、同じ fixture 生成を複数 test module に置かないためのもの。
+`/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/test_support.rs` は `#[cfg(test)]` の test-only module である。`src/app.rs` と `src/ui.rs` の test module からだけ使い、production code からは参照しない。主な helper は `diff_line`、`hunk`、`make_file`、`single_hunk_file`、`single_added_file`、`single_added_hunk_file`、`single_deleted_file`、`binary_file`、`app_with_file`、`app_with_hunks`、`single_hunk_app`、`app_with_files`、`file_view_state`、`install_search` で、同じ fixture 生成を複数 test module に置かないためのもの。
