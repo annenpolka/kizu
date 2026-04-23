@@ -52,6 +52,14 @@ pub(crate) fn make_file(name: &str, hunks: Vec<Hunk>, secs: u64) -> FileDiff {
     }
 }
 
+pub(crate) fn single_added_app(name: &str, text: &str) -> App {
+    app_with_files(vec![make_file(
+        name,
+        vec![hunk(1, vec![diff_line(LineKind::Added, text)])],
+        100,
+    )])
+}
+
 pub(crate) fn binary_file(name: &str, secs: u64) -> FileDiff {
     FileDiff {
         path: PathBuf::from(name),

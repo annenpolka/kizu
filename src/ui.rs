@@ -1726,7 +1726,7 @@ mod tests {
     use crate::git::{DiffContent, DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     use crate::test_support::{
         app_with_files, binary_file as timed_binary_file, diff_line, file_view_state, hunk,
-        install_search, make_file,
+        install_search, make_file, single_added_app,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2256,11 +2256,7 @@ mod tests {
         // tests nowrap mode (the default). If the padding logic
         // breaks, the right edge of a short added row will fall
         // back to the terminal default background.
-        let app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "tiny")])],
-            100,
-        )]);
+        let app = single_added_app("a.rs", "tiny");
         let width: u16 = 40;
         let buffer = render_buffer(&app, width, 12);
 
@@ -2480,11 +2476,7 @@ mod tests {
     fn nowrap_mode_omits_marker_for_normal_line() {
         // Symmetric to the wrap "normal row" test: no marker on a
         // has_trailing_newline=true nowrap row.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "short")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "short");
         app.wrap_lines = false;
         let view = render_to_string(&app, 80, 10);
         assert!(
@@ -2497,11 +2489,7 @@ mod tests {
     fn line_numbers_hint_appears_in_footer_and_marks_state() {
         // v0.5 plan §Important-4 (Codex): wrap/`z` hints are already
         // visible in the footer, so the LN toggle must be too.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         // OFF by default → still shows a hint (just without bold).
         let off_view = render_to_string(&app, 80, 8);
         assert!(
@@ -2524,11 +2512,7 @@ mod tests {
         // Stream mode always suppresses the gutter, so the footer
         // should make that explicit with an `(off)` marker no matter
         // what `show_line_numbers` is.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.show_line_numbers = true;
         app.view_mode = crate::app::ViewMode::Stream;
         app.build_layout();
@@ -2541,11 +2525,7 @@ mod tests {
 
     #[test]
     fn wrap_nowrap_indicator_appears_in_footer() {
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         let nowrap_view = render_to_string(&app, 80, 8);
         assert!(nowrap_view.contains("nowrap"));
 
@@ -2557,11 +2537,10 @@ mod tests {
 
     #[test]
     fn responsive_footer_keeps_state_not_keymap_when_normal_mode_is_narrow() {
-        let mut app = populated_app(vec![make_file(
+        let mut app = single_added_app(
             "src/extremely/long/path/that/pushes/status/content/out/of/sight/component.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+            "x",
+        );
         app.follow_mode = false;
         app.wrap_lines = true;
         app.show_line_numbers = true;
@@ -2625,11 +2604,7 @@ mod tests {
 
     #[test]
     fn help_overlay_uses_configured_key_labels() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.follow_mode = false;
         app.config.keys.cursor_placement = 'Z';
         app.config.keys.wrap_toggle = 'W';
@@ -2767,11 +2742,7 @@ mod tests {
 
     #[test]
     fn render_footer_shows_last_error_in_red_when_set() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.last_error = Some("git diff exploded".into());
 
         // Wide enough that the footer's body + error message both fit.
@@ -2795,11 +2766,7 @@ mod tests {
 
     #[test]
     fn render_footer_shows_source_aware_watcher_failures() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.watcher_health.record_failure(
             crate::watcher::WatchSource::GitRefs,
             "watcher [git.refs]: refs watcher dead".into(),
@@ -2829,11 +2796,7 @@ mod tests {
 
     #[test]
     fn render_footer_shows_input_health_warning() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.input_health = Some("input: stream hiccup".into());
 
         let view = render_to_string(&app, 140, 6);
@@ -2846,11 +2809,7 @@ mod tests {
 
     #[test]
     fn render_footer_switches_to_manual_when_follow_mode_off() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.follow_mode = false;
         let view = render_to_string(&app, 80, 6);
         assert!(view.contains("[manual]"), "expected [manual]:\n{view}");
@@ -3183,11 +3142,7 @@ mod tests {
 
     #[test]
     fn hunk_header_cursor_displays_arrow_marker() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "first");
         app.scroll_to(app.layout.hunk_starts[0]);
 
         let view = render_to_string(&app, 80, 10);
@@ -3204,11 +3159,7 @@ mod tests {
         // Paint its `▶` with the same Yellow + Bold style DiffLine
         // rows use so the cursor stays visible across the hand-off
         // between expanded and collapsed hunks.
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "first");
         app.scroll_to(app.layout.hunk_starts[0]);
 
         let buffer = render_buffer(&app, 80, 10);
@@ -3230,11 +3181,7 @@ mod tests {
         // v0.4: seen hunks render with a ▸ fold glyph in the hunk
         // header so the reader can tell "this hunk is collapsed,
         // not empty" at a glance. Unseen hunks have no such glyph.
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "first");
         app.scroll_to(app.layout.hunk_starts[0] + 1); // onto the DiffLine
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char(' '),
@@ -3250,11 +3197,7 @@ mod tests {
 
     #[test]
     fn file_header_cursor_displays_arrow_marker() {
-        let app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
-            100,
-        )]);
+        let app = single_added_app("src/foo.rs", "first");
 
         let view = render_to_string(&app, 80, 10);
         assert!(
@@ -3475,11 +3418,7 @@ mod tests {
         // paint the 3 cells of `foo` with Yellow bg + Black fg + Bold.
         // Before this slice the matched cells inherit the diff bg_added
         // green, so the test fails loudly until the overlay lands.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "let foo = 1;")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "let foo = 1;");
         let match_count = install_search(&mut app, "foo", 0);
         assert_eq!(match_count, 1, "test fixture precondition");
 
@@ -3523,11 +3462,7 @@ mod tests {
         // match) wears the Yellow reversal; the second one still gets a
         // visual cue (UNDERLINED + BOLD) while keeping the diff bg_added
         // green so the add/delete signal survives the overlay.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar foo")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "foo bar foo");
         let match_count = install_search(&mut app, "foo", 0);
         assert_eq!(match_count, 2, "test fixture precondition");
 
@@ -3604,11 +3539,7 @@ mod tests {
         // colors, the Yellow reversal collapses into `DEFAULT_DIM`
         // (Rgb(30,30,36)) and the user perceives the highlight as
         // "dark". This test pins the carve-out.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "let foo = 1;")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "let foo = 1;");
         install_search(&mut app, "foo", 0);
         let match_row = app.search.as_ref().unwrap().matches[0].row;
         // Force the cursor onto the match row (mirrors the

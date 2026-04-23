@@ -2117,19 +2117,14 @@ impl App {
                 // keys (j/k/J/K/h/l/g/G) are handled above; these
                 // are the action keys that users can remap in
                 // ~/.config/kizu/config.toml.
+                if self.handle_common_action_key(ch) {
+                    return KeyEffect::None;
+                }
                 let k = &self.config.keys;
-                if ch == '?' {
-                    self.help_overlay = true;
-                } else if ch == k.follow {
+                if ch == k.follow {
                     self.follow_restore();
                 } else if ch == k.picker {
                     self.open_picker();
-                } else if ch == k.ask {
-                    self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
-                } else if ch == k.reject {
-                    self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
-                } else if ch == k.comment {
-                    self.open_scar_comment();
                 } else if ch == k.revert {
                     self.open_revert_confirm();
                 } else if ch == k.seen {
@@ -2156,17 +2151,32 @@ impl App {
                     return self.reset_baseline();
                 } else if ch == k.cursor_placement {
                     self.toggle_cursor_placement();
-                } else if ch == k.wrap_toggle {
-                    self.toggle_wrap_lines();
-                } else if ch == k.line_numbers_toggle {
-                    self.toggle_line_numbers();
-                } else if ch == k.undo {
-                    self.undo_scar();
                 }
             }
             _ => {}
         }
         KeyEffect::None
+    }
+
+    fn handle_common_action_key(&mut self, ch: char) -> bool {
+        if ch == '?' {
+            self.help_overlay = true;
+        } else if ch == self.config.keys.ask {
+            self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        } else if ch == self.config.keys.reject {
+            self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+        } else if ch == self.config.keys.comment {
+            self.open_scar_comment();
+        } else if ch == self.config.keys.wrap_toggle {
+            self.toggle_wrap_lines();
+        } else if ch == self.config.keys.line_numbers_toggle {
+            self.toggle_line_numbers();
+        } else if ch == self.config.keys.undo {
+            self.undo_scar();
+        } else {
+            return false;
+        }
+        true
     }
 
     // ---- help-overlay keys --------------------------------------------
@@ -3295,22 +3305,7 @@ impl App {
             // is now file-view aware. Config bindings apply (so a user
             // who remaps `ask` to `A` gets the new key here too).
             KeyCode::Char(ch) => {
-                let k = &self.config.keys;
-                if ch == '?' {
-                    self.help_overlay = true;
-                } else if ch == k.ask {
-                    self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
-                } else if ch == k.reject {
-                    self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
-                } else if ch == k.comment {
-                    self.open_scar_comment();
-                } else if ch == k.wrap_toggle {
-                    self.toggle_wrap_lines();
-                } else if ch == k.line_numbers_toggle {
-                    self.toggle_line_numbers();
-                } else if ch == k.undo {
-                    self.undo_scar();
-                }
+                self.handle_common_action_key(ch);
             }
             _ => {}
         }
@@ -4432,7 +4427,7 @@ mod tests {
     use crate::git::{DiffContent, DiffLine, FileStatus, LineKind};
     use crate::test_support::{
         app_with_files as fake_app, binary_file, diff_line, file_view_state, hunk, install_search,
-        make_file,
+        make_file, single_added_app,
     };
     use std::time::Duration;
 
@@ -4495,6 +4490,12 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    fn type_chars(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
     fn file_idx(app: &App, name: &str) -> usize {
         app.files
             .iter()
@@ -4504,11 +4505,7 @@ mod tests {
 
     #[test]
     fn build_layout_produces_header_then_hunks_then_spacer_per_file() {
-        let app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let app = single_added_app("a.rs", "x");
 
         // Expected sequence:
         //   FileHeader, HunkHeader, DiffLine, Spacer
@@ -5604,11 +5601,7 @@ mod tests {
     fn build_layout_max_line_number_has_lower_bound_of_10() {
         // Tiny file with line numbers 1-3 should still clamp to 10 so
         // the gutter width stays at a stable minimum of 2 digits.
-        let mut app = fake_app(vec![make_file(
-            "foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
-            100,
-        )]);
+        let mut app = single_added_app("foo.rs", "a");
         app.build_layout();
         assert!(
             app.layout.max_line_number >= 10,
@@ -5816,11 +5809,7 @@ mod tests {
 
     #[test]
     fn question_mark_opens_help_overlay_and_esc_closes_it() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         assert!(!app.help_overlay);
 
         app.handle_key(key(KeyCode::Char('?')));
@@ -5832,11 +5821,7 @@ mod tests {
 
     #[test]
     fn help_overlay_shadows_normal_keys_until_closed() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.handle_key(key(KeyCode::Char('?')));
         app.handle_key(key(KeyCode::Char('s')));
         assert!(
@@ -5854,11 +5839,7 @@ mod tests {
         // v0.2 remap: picker trigger moved from `Space` to `s` so
         // `Space` is free for the scar "seen" mark (wired up in a
         // later M4 slice).
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.handle_key(key(KeyCode::Char('s')));
         assert!(app.picker.is_some());
 
@@ -5873,11 +5854,7 @@ mod tests {
         // state — no file write, no picker. In v0.4 Space also
         // collapses the DiffLine rows and snaps the cursor to the
         // hunk header when its old row disappears from the layout.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         cursor_on_nth_diff_line(&mut app, 0);
 
         app.handle_key(key(KeyCode::Char(' ')));
@@ -5915,11 +5892,7 @@ mod tests {
 
     #[test]
     fn space_on_file_header_row_is_noop() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
         app.scroll_to(header_row);
 
@@ -6458,9 +6431,7 @@ mod tests {
             ),
         ]);
         app.open_picker();
-        for c in "auth".chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
+        type_chars(&mut app, "auth");
         let results = app.picker_results();
         // src/Auth.rs and tests/auth_test.rs match; src/handler.rs does not.
         assert_eq!(results.len(), 2);
@@ -6637,11 +6608,7 @@ mod tests {
         // branch tracking needs to move with it. Otherwise the
         // watcher stays pinned to the startup branch and silently
         // stops firing `GitHead` for future commits.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         assert_eq!(
             app.current_branch_ref.as_deref(),
             Some("refs/heads/main"),
@@ -6673,11 +6640,7 @@ mod tests {
         // and only the per-worktree HEAD file matters. The reset
         // path must surface that so the watcher drops the stale
         // branch ref.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
 
         // main → detached
         let effect = app.apply_reset(
@@ -6703,11 +6666,7 @@ mod tests {
         // Dual of the above: the happy path must still swap the
         // baseline, clear head_dirty, and install the new file set so
         // a successful reset is visibly a reset and not a no-op.
-        let mut app = fake_app(vec![make_file(
-            "old.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "stale")])],
-            100,
-        )]);
+        let mut app = single_added_app("old.rs", "stale");
         app.head_dirty = true;
         app.last_error = Some("stale error".into());
 
@@ -7320,11 +7279,7 @@ mod tests {
 
     #[test]
     fn scroll_to_does_not_start_animation_on_noop() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.anim = None;
         let current = app.scroll;
         app.scroll_to(current);
@@ -7357,11 +7312,7 @@ mod tests {
 
     #[test]
     fn tick_anim_clears_anim_once_duration_elapsed() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         let start = Instant::now() - Duration::from_millis(500);
         app.anim = Some(ScrollAnim {
             from: 0.0,
@@ -7375,11 +7326,7 @@ mod tests {
 
     #[test]
     fn tick_anim_keeps_anim_while_still_running() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         let start = Instant::now();
         app.anim = Some(ScrollAnim {
             from: 0.0,
@@ -8174,9 +8121,7 @@ mod tests {
             2,
             vec![diff_line(LineKind::Added, "y")],
         );
-        for ch in "ab".chars() {
-            app.handle_key(key(KeyCode::Char(ch)));
-        }
+        type_chars(&mut app, "ab");
 
         app.handle_key(key(KeyCode::Backspace));
         let state = app.scar_comment.as_ref().expect("still open");
@@ -8194,9 +8139,7 @@ mod tests {
             2,
             vec![diff_line(LineKind::Added, "fn two() {}")],
         );
-        for ch in "dont".chars() {
-            app.handle_key(key(KeyCode::Char(ch)));
-        }
+        type_chars(&mut app, "dont");
 
         app.handle_key(key(KeyCode::Esc));
 
@@ -8216,9 +8159,7 @@ mod tests {
             2,
             vec![diff_line(LineKind::Added, "fn two() {}")],
         );
-        for ch in "why two?".chars() {
-            app.handle_key(key(KeyCode::Char(ch)));
-        }
+        type_chars(&mut app, "why two?");
 
         app.handle_key(key(KeyCode::Enter));
 
@@ -8459,11 +8400,7 @@ mod tests {
 
     #[test]
     fn find_matches_returns_empty_for_empty_query() {
-        let app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "hello world")])],
-            100,
-        )]);
+        let app = single_added_app("a.rs", "hello world");
         let m = find_matches(&app.layout, &app.files, "");
         assert!(m.is_empty());
     }
@@ -8506,11 +8443,7 @@ mod tests {
 
     #[test]
     fn find_matches_captures_multiple_hits_on_one_row() {
-        let app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo foo foo")])],
-            100,
-        )]);
+        let app = single_added_app("a.rs", "foo foo foo");
         let m = find_matches(&app.layout, &app.files, "foo");
         assert_eq!(m.len(), 3);
         assert_eq!(m[0].byte_start, 0);
@@ -8520,11 +8453,7 @@ mod tests {
 
     #[test]
     fn slash_opens_search_input_composer() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
 
         app.handle_key(key(KeyCode::Char('/')));
 
@@ -8534,15 +8463,9 @@ mod tests {
 
     #[test]
     fn search_input_typing_appends_to_query_and_backspace_deletes() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.handle_key(key(KeyCode::Char('/')));
-        for c in "foo".chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
+        type_chars(&mut app, "foo");
         assert_eq!(app.search_input.as_ref().unwrap().query, "foo");
         app.handle_key(key(KeyCode::Backspace));
         assert_eq!(app.search_input.as_ref().unwrap().query, "fo");
@@ -8550,11 +8473,7 @@ mod tests {
 
     #[test]
     fn search_input_esc_cancels_without_installing_search_state() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "foo");
         app.handle_key(key(KeyCode::Char('/')));
         app.handle_key(key(KeyCode::Char('f')));
         app.handle_key(key(KeyCode::Esc));
@@ -8580,9 +8499,7 @@ mod tests {
         cursor_on_nth_diff_line(&mut app, 0);
 
         app.handle_key(key(KeyCode::Char('/')));
-        for c in "beta".chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
+        type_chars(&mut app, "beta");
         app.handle_key(key(KeyCode::Enter));
 
         assert!(app.search_input.is_none(), "composer closed on commit");
@@ -8598,11 +8515,7 @@ mod tests {
 
     #[test]
     fn search_input_enter_with_empty_query_does_not_wipe_existing_search() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "alpha")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "alpha");
         // Pre-install a fake confirmed search state.
         install_search(&mut app, "alpha", 0);
 
@@ -8619,9 +8532,7 @@ mod tests {
 
     fn commit_search(app: &mut App, query: &str) {
         app.handle_key(key(KeyCode::Char('/')));
-        for c in query.chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
+        type_chars(app, query);
         app.handle_key(key(KeyCode::Enter));
     }
 
@@ -8700,11 +8611,7 @@ mod tests {
 
     #[test]
     fn search_jump_next_is_noop_when_no_search_state() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "foo");
         cursor_on_nth_diff_line(&mut app, 0);
         let before = app.scroll;
 
@@ -8721,11 +8628,7 @@ mod tests {
         // the wrong content. After `apply_computed_files`, the search
         // must re-run `find_matches` against the fresh layout, and the
         // confirmed query must survive so `n`/`N` still work.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "foo bar");
         install_search(&mut app, "foo", 0);
         let pre_row = app.search.as_ref().unwrap().matches[0].row;
 
@@ -8835,11 +8738,7 @@ mod tests {
         // Before recompute: 2 matches, current=1. After recompute the
         // underlying file drops one match. `current` must clamp into
         // range so `n`/`N` never panic.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo foo")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "foo foo");
         let match_count = install_search(&mut app, "foo", 1);
         assert_eq!(match_count, 2);
 
@@ -9590,11 +9489,7 @@ mod tests {
         // After any user navigation in normal mode, the sticky focus
         // pin is released so subsequent recomputes follow normal
         // anchoring rules (the user has explicitly moved elsewhere).
-        let mut app = fake_app(vec![make_file(
-            "src/main.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/main.rs", "a");
         app.scar_focus = Some((PathBuf::from("/tmp/fake/src/main.rs"), 1));
         app.handle_key(key(KeyCode::Char('j')));
         assert!(
