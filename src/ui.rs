@@ -1727,7 +1727,7 @@ mod tests {
     use crate::test_support::{
         added_hunk, added_hunk_app, app_with_file, app_with_files, app_with_hunks,
         binary_file as timed_binary_file, diff_line, file_view_state, hunk, install_search,
-        make_file, numbered_added_lines, single_added_app, single_added_file,
+        make_file, numbered_added_lines, prefixed_diff_lines, single_added_app, single_added_file,
         single_added_hunk_file, single_hunk_app,
     };
     use ratatui::Terminal;
@@ -1977,9 +1977,7 @@ mod tests {
             10,
             // Enough DiffLines that the cursor will scroll past
             // the hunk header and stickiness kicks in.
-            (0..30)
-                .map(|i| diff_line(LineKind::Context, &format!("line {i}")))
-                .collect(),
+            prefixed_diff_lines(LineKind::Context, "line ", 30),
             100,
         );
         app.show_line_numbers = true;
@@ -2044,22 +2042,10 @@ mod tests {
         };
         let probe = |app: &App| -> (usize, usize) {
             let buffer = render_buffer(app, 80, 12);
-            let mut header_x: Option<usize> = None;
-            let mut body_x: Option<usize> = None;
-            for y in 0..buffer.area().height {
-                let row = buffer_row_text(&buffer, y);
-                if header_x.is_none()
-                    && let Some(col) = row.find("@@")
-                {
-                    header_x = Some(col);
-                }
-                if body_x.is_none()
-                    && let Some(col) = row.find("fn ok()")
-                {
-                    body_x = Some(col);
-                }
-            }
-            (header_x.expect("@@"), body_x.expect("fn ok()"))
+            (
+                first_text_run(&buffer, "@@").0 as usize,
+                first_text_run(&buffer, "fn ok()").0 as usize,
+            )
         };
         let (off_h, off_b) = probe(&make_app(false));
         let (on_h, on_b) = probe(&make_app(true));
@@ -2106,12 +2092,7 @@ mod tests {
         // Codex review §Critical-2: Stream mode FileDiffs carry
         // synthetic old_start/new_start values that are not real file
         // line numbers. The renderer must suppress the gutter.
-        let mut app = single_hunk_app(
-            "src/foo.rs",
-            100, // new_start=100 so any LN artifact would be visible
-            vec![diff_line(LineKind::Added, "x")],
-            100,
-        );
+        let mut app = added_hunk_app("src/foo.rs", 100, &["x"], 100);
         app.show_line_numbers = true;
         app.view_mode = crate::app::ViewMode::Stream;
         app.build_layout();
@@ -2235,15 +2216,7 @@ mod tests {
         let buffer = render_buffer(&app, width, 12);
 
         // Find the row that contains the "tiny" body text.
-        let mut tiny_y: Option<u16> = None;
-        for y in 0..buffer.area().height {
-            let row = buffer_row_text(&buffer, y);
-            if row.contains("tiny") {
-                tiny_y = Some(y);
-                break;
-            }
-        }
-        let y = tiny_y.expect("tiny row must render somewhere");
+        let y = row_containing(&buffer, "tiny");
 
         // Every cell from the start of the body region (x = 5) to
         // the last column must carry BG_ADDED.
@@ -2793,10 +2766,7 @@ mod tests {
             ("d.rs", Color::Yellow),
         ];
         for (name, expected) in want {
-            let (x, y, _) = find_text_runs(&buffer, name)
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| panic!("{name} not found in buffer"));
+            let (x, y, _) = first_text_run(&buffer, name);
             assert_eq!(
                 buffer[(x, y)].style().fg,
                 Some(expected),
@@ -3295,6 +3265,17 @@ mod tests {
             }
         }
         out
+    }
+
+    fn first_text_run(buf: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16, usize) {
+        find_text_runs(buf, needle)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{needle} not found in buffer"))
+    }
+
+    fn row_containing(buf: &ratatui::buffer::Buffer, needle: &str) -> u16 {
+        first_text_run(buf, needle).1
     }
 
     #[test]

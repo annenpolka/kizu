@@ -50,6 +50,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 21:59:34Z) remaining Added-only hunk literal cleanup 後の targeted tests、clippy、full gate (`just ci`) を通す
 - [x] (2026-04-23 22:04:11Z) numbered diff line fixture pass: prefix 付き / 同種 line vector 生成を `prefixed_diff_lines` と `diff_lines` に寄せる
 - [x] (2026-04-23 22:04:11Z) numbered diff line fixture 後の targeted tests、clippy、full gate (`just ci`) を通す
+- [x] (2026-04-23 22:07:29Z) UI buffer lookup pass: row/text run 探索と sticky header fixture を helper に寄せる
+- [x] (2026-04-23 22:07:29Z) UI buffer lookup 後の `ui::tests`、clippy、full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -139,6 +141,9 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: app tests には、`a0..a7` / `b0..b7` / `ctx 0..ctx 29` のような番号付き DiffLine 生成と、同種 line vector の手組みが残っていた。
   Evidence: `prefixed_diff_lines` と `diff_lines` に寄せた後、`src/app.rs` は 9619 行から 9556 行へ、`src/test_support.rs` は 221 行から 219 行へ減った。差分は 2 ファイルで 25 insertions / 90 deletions、純減 65 行になり、`viewport_top` 6 件、`apply_computed_files` 3 件、fmt check、clippy、full `just ci` が成功した。
+
+- Observation: UI tests の buffer 探索は、同じ text-run lookup と row scan を複数箇所で手書きしていた。
+  Evidence: `first_text_run` / `row_containing` と既存 `prefixed_diff_lines` に寄せた後、`src/ui.rs` は 3535 行から 3516 行へ減った。差分は 1 ファイルで 20 insertions / 39 deletions、純減 19 行になり、`ui::tests` 63 件、fmt check、clippy、full `just ci` が成功した。
 
 ## Decision Log
 
@@ -238,6 +243,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: これらのテストは viewport や anchor の挙動を見ており、`(0..N).map(...)` や `vec![diff_line(Context, ...)]` の展開自体は主張ではない。test support に寄せると、fixture の意味だけを残して生成手順を消せる。
   Date/Author: 2026-04-23 22:04:11Z / Codex
 
+- Decision: UI test の rendered buffer 探索は、text-run 単位の helper で扱う。
+  Rationale: `buffer_row_text(...).find(...)` のループは assertion の主張ではなく、描画済み terminal buffer から座標を拾う儀式だった。`first_text_run` / `row_containing` に寄せると、個々のテストは色や gutter の期待だけを読める。
+  Date/Author: 2026-04-23 22:07:29Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -271,6 +280,8 @@ added hunk app fixture pass では、Added 行だけの single-hunk app fixture 
 remaining Added-only hunk literal cleanup pass では、App fixture helper では置き換えられなかった raw `Hunk` 構築を `added_hunk` に寄せた。`src/app.rs` は 9640 行から 9619 行へ、`src/ui.rs` は 3542 行から 3535 行へ、`src/test_support.rs` は 221 行のままだった。差分は 2 ファイルで 15 insertions / 43 deletions、純減 28 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 numbered diff line fixture pass では、prefix 付き番号行と同種 line vector fixture を `prefixed_diff_lines` / `diff_lines` に集約した。`src/app.rs` は 9619 行から 9556 行へ、`src/test_support.rs` は 221 行から 219 行へ減った。差分は 2 ファイルで 25 insertions / 90 deletions、純減 65 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
+
+UI buffer lookup pass では、UI tests の rendered buffer text-run 探索を `first_text_run` / `row_containing` に寄せ、sticky header fixture の番号付き context 行も `prefixed_diff_lines` に寄せた。`src/ui.rs` は 3535 行から 3516 行へ減った。差分は 1 ファイルで 20 insertions / 39 deletions、純減 19 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -881,6 +892,35 @@ numbered diff line fixture pass 後の追加証拠は以下である。
 
     cargo test --all-targets --all-features apply_computed_files -- --nocapture
     3 passed
+
+    cargo fmt --all -- --check
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
+UI buffer lookup pass 後の追加証拠は以下である。
+
+    src/app.rs           9556 lines
+    src/ui.rs            3516 lines
+    src/test_support.rs   219 lines
+
+    git diff --stat
+    src/ui.rs | 59 ++++++++++++++++++++---------------------------------------
+    1 file changed, 20 insertions(+), 39 deletions(-)
+
+    cargo test --all-targets --all-features ui::tests -- --nocapture
+    63 passed
 
     cargo fmt --all -- --check
 
