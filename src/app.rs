@@ -4402,11 +4402,11 @@ fn run_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::{DiffContent, DiffLine, FileStatus, LineKind};
+    use crate::git::{DiffContent, DiffLine, LineKind};
     use crate::test_support::{
         app_with_files as fake_app, app_with_hunks, binary_file, diff_line, file_view_state, hunk,
         install_search, make_file, single_added_app, single_added_file, single_added_hunk_file,
-        single_hunk_file,
+        single_deleted_file, single_hunk_file,
     };
     use std::time::Duration;
 
@@ -5820,7 +5820,7 @@ mod tests {
     #[test]
     fn space_on_file_header_row_is_noop() {
         let mut app = single_added_app("a.rs", "x");
-        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
+        let header_row = file_header_row(&app);
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Char(' ')));
@@ -6240,24 +6240,8 @@ mod tests {
             .expect("reopen kept for mtime set");
         f.set_modified(ancient).expect("backdate kept.rs");
 
-        let kept = FileDiff {
-            path: PathBuf::from("kept.rs"),
-            status: FileStatus::Modified,
-            added: 1,
-            deleted: 0,
-            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "hi2")])]),
-            mtime: SystemTime::UNIX_EPOCH,
-            header_prefix: None,
-        };
-        let gone = FileDiff {
-            path: PathBuf::from("gone.rs"),
-            status: FileStatus::Deleted,
-            added: 0,
-            deleted: 1,
-            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Deleted, "bye")])]),
-            mtime: SystemTime::UNIX_EPOCH,
-            header_prefix: None,
-        };
+        let kept = single_added_file("kept.rs", "hi2", 0);
+        let gone = single_deleted_file("gone.rs", "bye", 0);
 
         let app = App::bootstrap_with_diff(
             tmp.path().to_path_buf(),
@@ -6412,15 +6396,7 @@ mod tests {
         app.head_dirty = true;
         app.last_error = Some("stale error".into());
 
-        let new_file = FileDiff {
-            path: PathBuf::from("fresh.rs"),
-            status: FileStatus::Modified,
-            added: 1,
-            deleted: 0,
-            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "fresh")])]),
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(500),
-            header_prefix: None,
-        };
+        let new_file = single_added_file("fresh.rs", "fresh", 500);
         let new_sha = "feedfacefeedfacefeedfacefeedfacefeedface".to_string();
         // Same branch as the existing fake_app default — a successful
         // reset that does NOT switch branches should report
@@ -7115,7 +7091,7 @@ mod tests {
         let vi = VisualIndex::build(&app.layout, &app.files, Some(10));
 
         // Find the one DiffLine row in the layout.
-        let diff_row = find_first_row_matching(&app, |r| matches!(r, RowKind::DiffLine { .. }));
+        let diff_row = diff_line_row(&app, 0);
         assert_eq!(
             vi.visual_height(diff_row),
             4,
@@ -7247,7 +7223,7 @@ mod tests {
         app.follow_mode = false;
 
         // Find the diff row and park on its first visual line.
-        let diff_row = find_first_row_matching(&app, |r| matches!(r, RowKind::DiffLine { .. }));
+        let diff_row = diff_line_row(&app, 0);
         app.scroll = diff_row;
         app.cursor_sub_row = 0;
 
@@ -7583,8 +7559,7 @@ mod tests {
             vec![diff_line(LineKind::Added, "fn one() {}")],
         );
         // Park the cursor on the FileHeader row explicitly.
-        let file_header_row =
-            find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
+        let file_header_row = file_header_row(&app);
         app.scroll_to(file_header_row);
 
         app.handle_key(key(KeyCode::Char('a')));
@@ -7632,7 +7607,7 @@ mod tests {
             )],
             100,
         );
-        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::HunkHeader { .. }));
+        let header_row = hunk_header_row(&app, 0);
         app.scroll_to(header_row);
         let (_, line) = app.scar_target_line().expect("target");
         assert_eq!(
@@ -7659,7 +7634,7 @@ mod tests {
             )],
             100,
         );
-        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::HunkHeader { .. }));
+        let header_row = hunk_header_row(&app, 0);
         app.scroll_to(header_row);
         let (_, line) = app.scar_target_line().expect("target");
         assert_eq!(
@@ -7681,7 +7656,7 @@ mod tests {
             2,
             vec![diff_line(LineKind::Added, "line_b")],
         );
-        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::HunkHeader { .. }));
+        let header_row = hunk_header_row(&app, 0);
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Char('a')));
@@ -7735,7 +7710,7 @@ mod tests {
             1,
             vec![diff_line(LineKind::Added, "fn one() {}")],
         );
-        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
+        let header_row = file_header_row(&app);
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Char('c')));
@@ -8039,7 +8014,7 @@ mod tests {
             "fn one() {}\n",
             "fn one() {}\nfn two() {}\n",
         );
-        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
+        let header_row = file_header_row(&app);
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Enter));
@@ -8050,6 +8025,17 @@ mod tests {
 
     fn find_first_row_matching<F: Fn(&RowKind) -> bool>(app: &App, f: F) -> usize {
         app.layout.rows.iter().position(f).expect("row exists")
+    }
+
+    fn file_header_row(app: &App) -> usize {
+        find_first_row_matching(app, |r| matches!(r, RowKind::FileHeader { .. }))
+    }
+
+    fn diff_line_row(app: &App, line_idx: usize) -> usize {
+        find_first_row_matching(
+            app,
+            |r| matches!(r, RowKind::DiffLine { line_idx: idx, .. } if *idx == line_idx),
+        )
     }
 
     fn hunk_header_row(app: &App, hunk_idx: usize) -> usize {
@@ -8179,8 +8165,7 @@ mod tests {
         assert_eq!(state.matches.len(), 1);
         assert_eq!(state.current, 0);
         // Cursor landed on the "beta" row — not the first diff row.
-        let beta_row =
-            find_first_row_matching(&app, |r| matches!(r, RowKind::DiffLine { line_idx: 1, .. }));
+        let beta_row = diff_line_row(&app, 1);
         assert_eq!(app.scroll, beta_row);
         assert!(!app.follow_mode, "manual jump drops follow mode");
     }
@@ -8512,7 +8497,7 @@ mod tests {
             1,
             vec![diff_line(LineKind::Added, "x")],
         );
-        let header = find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
+        let header = file_header_row(&app);
         app.scroll_to(header);
 
         assert!(app.open_in_editor(Some("vim")).is_none());
@@ -8699,8 +8684,7 @@ mod tests {
             "fn one() {}\n",
             "fn one() {}\nfn two() {}\n",
         );
-        let file_header_row =
-            find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
+        let file_header_row = file_header_row(&app);
         app.scroll_to(file_header_row);
 
         app.handle_key(key(KeyCode::Char('x')));

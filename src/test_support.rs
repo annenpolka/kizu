@@ -73,6 +73,12 @@ pub(crate) fn single_added_file(name: &str, text: &str, secs: u64) -> FileDiff {
     single_added_hunk_file(name, 1, text, secs)
 }
 
+pub(crate) fn single_deleted_file(name: &str, text: &str, secs: u64) -> FileDiff {
+    let mut file = single_hunk_file(name, vec![diff_line(LineKind::Deleted, text)], secs);
+    file.status = FileStatus::Deleted;
+    file
+}
+
 pub(crate) fn single_added_app(name: &str, text: &str) -> App {
     app_with_files(vec![single_added_file(name, text, 100)])
 }
