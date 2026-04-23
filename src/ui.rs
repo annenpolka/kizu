@@ -1743,32 +1743,55 @@ mod tests {
         app_with_files(files)
     }
 
-    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+    fn render_buffer(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| render(f, app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+        let buffer = render_buffer(app, w, h);
         let mut out = String::new();
         for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                out.push_str(buffer[(x, y)].symbol());
-            }
+            out.push_str(&buffer_row_text(&buffer, y));
             out.push('\n');
         }
         out
     }
 
     fn render_footer_text(app: &App, w: u16, h: u16) -> String {
-        let backend = TestBackend::new(w, h);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
-        let footer_y = buffer.area().height - 1;
+        let buffer = render_buffer(app, w, h);
+        buffer_row_text(&buffer, buffer.area().height - 1)
+    }
+
+    fn buffer_row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
         let mut out = String::new();
         for x in 0..buffer.area().width {
-            out.push_str(buffer[(x, footer_y)].symbol());
+            out.push_str(buffer[(x, y)].symbol());
         }
         out
+    }
+
+    fn first_cell_matching<F>(buffer: &ratatui::buffer::Buffer, f: F) -> Option<(u16, u16)>
+    where
+        F: Fn(&ratatui::buffer::Cell) -> bool,
+    {
+        for y in 0..buffer.area().height {
+            for x in 0..buffer.area().width {
+                if f(&buffer[(x, y)]) {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    fn buffer_has_cell<F>(buffer: &ratatui::buffer::Buffer, f: F) -> bool
+    where
+        F: Fn(&ratatui::buffer::Cell) -> bool,
+    {
+        first_cell_matching(buffer, f).is_some()
     }
 
     #[test]
@@ -1975,10 +1998,7 @@ mod tests {
         app.build_layout();
         // Move cursor deep into the hunk so the header becomes sticky.
         app.scroll = 20;
-        let backend = TestBackend::new(80, 10);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 10);
 
         // Sticky header lives at y=0. Its `@@` must share its x with
         // the DiffLine `line` bodies below.
@@ -2037,16 +2057,11 @@ mod tests {
             app
         };
         let probe = |app: &App| -> (usize, usize) {
-            let backend = TestBackend::new(80, 12);
-            let mut terminal = Terminal::new(backend).expect("terminal");
-            terminal.draw(|f| render(f, app)).expect("draw");
-            let buffer = terminal.backend().buffer().clone();
+            let buffer = render_buffer(app, 80, 12);
             let mut header_x: Option<usize> = None;
             let mut body_x: Option<usize> = None;
             for y in 0..buffer.area().height {
-                let row: String = (0..buffer.area().width)
-                    .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect();
+                let row = buffer_row_text(&buffer, y);
                 if header_x.is_none()
                     && let Some(col) = row.find("@@")
                 {
@@ -2215,24 +2230,14 @@ mod tests {
             )],
             100,
         )]);
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 12);
 
-        let mut found_added_bg = false;
-        let mut found_deleted_bg = false;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "x" && cell.style().bg == Some(BG_ADDED) {
-                    found_added_bg = true;
-                }
-                if cell.symbol() == "y" && cell.style().bg == Some(BG_DELETED) {
-                    found_deleted_bg = true;
-                }
-            }
-        }
+        let found_added_bg = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "x" && cell.style().bg == Some(BG_ADDED)
+        });
+        let found_deleted_bg = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "y" && cell.style().bg == Some(BG_DELETED)
+        });
         assert!(
             found_added_bg,
             "expected an added 'x' cell with green background"
@@ -2257,17 +2262,12 @@ mod tests {
             100,
         )]);
         let width: u16 = 40;
-        let backend = TestBackend::new(width, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, width, 12);
 
         // Find the row that contains the "tiny" body text.
         let mut tiny_y: Option<u16> = None;
         for y in 0..buffer.area().height {
-            let row: String = (0..width)
-                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
-                .collect();
+            let row = buffer_row_text(&buffer, y);
             if row.contains("tiny") {
                 tiny_y = Some(y);
                 break;
@@ -2775,21 +2775,14 @@ mod tests {
         app.last_error = Some("git diff exploded".into());
 
         // Wide enough that the footer's body + error message both fit.
-        let backend = TestBackend::new(140, 6);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 140, 6);
 
         let footer_y = buffer.area().height - 1;
-        let mut footer_text = String::new();
-        let mut had_red_x = false;
-        for x in 0..buffer.area().width {
+        let footer_text = buffer_row_text(&buffer, footer_y);
+        let had_red_x = (0..buffer.area().width).any(|x| {
             let cell = &buffer[(x, footer_y)];
-            footer_text.push_str(cell.symbol());
-            if cell.symbol() == "×" && cell.style().fg == Some(Color::Red) {
-                had_red_x = true;
-            }
-        }
+            cell.symbol() == "×" && cell.style().fg == Some(Color::Red)
+        });
         assert!(
             footer_text.contains("git diff exploded"),
             "footer:\n{footer_text}"
@@ -2890,10 +2883,7 @@ mod tests {
         // Bootstrap parks scroll on the follow target (bottom). Reset to 0
         // so every file header sits inside the viewport for inspection.
         app.scroll_to(0);
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 30);
 
         // For each path, find its first cell (the 'a'/'b'/'c'/'d') and
         // assert the foreground color matches the status mapping.
@@ -2904,27 +2894,15 @@ mod tests {
             ("d.rs", Color::Yellow),
         ];
         for (name, expected) in want {
-            let mut found = false;
-            'outer: for y in 0..buffer.area().height {
-                for x in 0..buffer.area().width {
-                    if buffer[(x, y)].symbol() == &name[..1] {
-                        // Walk forward to make sure this is the start of `name`.
-                        let chars: String = (0..name.len())
-                            .map(|i| buffer[(x + i as u16, y)].symbol().to_string())
-                            .collect();
-                        if chars == name {
-                            assert_eq!(
-                                buffer[(x, y)].style().fg,
-                                Some(expected),
-                                "{name} should be in {expected:?}"
-                            );
-                            found = true;
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-            assert!(found, "{name} not found in buffer");
+            let (x, y, _) = find_text_runs(&buffer, name)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("{name} not found in buffer"));
+            assert_eq!(
+                buffer[(x, y)].style().fg,
+                Some(expected),
+                "{name} should be in {expected:?}"
+            );
         }
     }
 
@@ -2939,15 +2917,10 @@ mod tests {
         let mut app = populated_app(vec![file]);
         app.scroll = 0;
 
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10))
-            .expect("test terminal");
-        terminal.draw(|frame| render(frame, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 60, 10);
 
         // The prefix "14:03:22 Write" should appear in the header line.
-        let first_line: String = (0..buffer.area().width)
-            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
-            .collect();
+        let first_line = buffer_row_text(&buffer, 0);
         assert!(
             first_line.contains("14:03:22 Write"),
             "header should contain prefix, got: {first_line:?}"
@@ -3101,10 +3074,7 @@ mod tests {
         // Snap to the first hunk so one hunk is focused and the other
         // is not.
         app.scroll_to(app.layout.hunk_starts[0]);
-        let backend = TestBackend::new(100, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 100, 14);
 
         // Both body characters must sit on BG_ADDED (the colored
         // band never disappears), but the unfocused row must also
@@ -3166,20 +3136,11 @@ mod tests {
         // Place the cursor on the hunk header so the `▎` (not `▶`) bar
         // covers both diff line rows.
         app.scroll_to(app.layout.hunk_starts[0]);
-        let backend = TestBackend::new(80, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 14);
 
-        let mut had_yellow_bar = false;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▎" && cell.style().fg == Some(Color::Yellow) {
-                    had_yellow_bar = true;
-                }
-            }
-        }
+        let had_yellow_bar = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "▎" && cell.style().fg == Some(Color::Yellow)
+        });
         assert!(
             had_yellow_bar,
             "expected a yellow '▎' on the selected hunk row"
@@ -3205,24 +3166,14 @@ mod tests {
         // Layout: FileHeader, HunkHeader, DiffLine(0), DiffLine(1), Spacer
         // hunk_starts[0] = 1 (HunkHeader). First DiffLine is at row 2.
         app.scroll_to(app.layout.hunk_starts[0] + 1);
-        let backend = TestBackend::new(80, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 14);
 
-        let mut had_arrow = false;
-        let mut had_plain_bar = false;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow) {
-                    had_arrow = true;
-                }
-                if cell.symbol() == "▎" && cell.style().fg == Some(Color::Yellow) {
-                    had_plain_bar = true;
-                }
-            }
-        }
+        let had_arrow = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow)
+        });
+        let had_plain_bar = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "▎" && cell.style().fg == Some(Color::Yellow)
+        });
         assert!(had_arrow, "expected a yellow '▶' arrow at the cursor row");
         assert!(
             had_plain_bar,
@@ -3260,23 +3211,14 @@ mod tests {
         )]);
         app.scroll_to(app.layout.hunk_starts[0]);
 
-        let backend = TestBackend::new(80, 10);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 10);
 
-        let mut found = false;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▶" {
-                    let st = cell.style();
-                    if st.fg == Some(Color::Yellow) && st.add_modifier.contains(Modifier::BOLD) {
-                        found = true;
-                    }
-                }
-            }
-        }
+        let found = buffer_has_cell(&buffer, |cell| {
+            let st = cell.style();
+            cell.symbol() == "▶"
+                && st.fg == Some(Color::Yellow)
+                && st.add_modifier.contains(Modifier::BOLD)
+        });
         assert!(
             found,
             "cursor `▶` on a hunk header must be Yellow + Bold, not Cyan"
@@ -3354,22 +3296,13 @@ mod tests {
         app.scroll_to(header + 20);
         app.anim = None;
 
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 12);
 
         // Find the row that holds the yellow `▶` marker.
-        let mut cursor_y: Option<u16> = None;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow) {
-                    cursor_y = Some(y);
-                }
-            }
-        }
-        let y = cursor_y.expect("expected the cursor `▶` to be drawn");
+        let (_, y) = first_cell_matching(&buffer, |cell| {
+            cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow)
+        })
+        .expect("expected the cursor `▶` to be drawn");
         // Sticky takes row 0, so the body height is 11. We expect the
         // cursor near the middle of the body — between rows 4 and 8 of
         // the full buffer, well within tolerance.
@@ -3398,21 +3331,12 @@ mod tests {
         app.anim = None;
         app.cursor_placement = crate::app::CursorPlacement::Top;
 
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 12);
 
-        let mut cursor_y: Option<u16> = None;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow) {
-                    cursor_y = Some(y);
-                }
-            }
-        }
-        let y = cursor_y.expect("expected the cursor `▶` to be drawn");
+        let (_, y) = first_cell_matching(&buffer, |cell| {
+            cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow)
+        })
+        .expect("expected the cursor `▶` to be drawn");
         // Top mode + sticky header (row 0): the cursor should sit at
         // the first body row, which is y=1 (right below the sticky
         // header).
@@ -3456,20 +3380,14 @@ mod tests {
         app.scroll_to(header_row + 5);
         app.anim = None;
 
-        let backend = TestBackend::new(80, 8);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 8);
 
         // Pin: whichever branch the new decision flow picks, row 0
         // must either be the sticky header (contains `boundary`) OR
         // be the actual hunk header / a row on or after header_row
         // but never a row from later in the hunk with the header
         // silently dropped.
-        let mut row0 = String::new();
-        for x in 0..buffer.area().width {
-            row0.push_str(buffer[(x, 0)].symbol());
-        }
+        let row0 = buffer_row_text(&buffer, 0);
         assert!(
             row0.contains("boundary") || row0.contains("@@"),
             "row 0 must show the hunk header (sticky or inline), got:\n{row0}"
@@ -3496,17 +3414,11 @@ mod tests {
         app.anim = None;
 
         // Tight viewport so the original header row really is off-screen.
-        let backend = TestBackend::new(80, 8);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 8);
 
         // The very first row of the main area must contain the function
         // name from the sticky header.
-        let mut row0 = String::new();
-        for x in 0..buffer.area().width {
-            row0.push_str(buffer[(x, 0)].symbol());
-        }
+        let row0 = buffer_row_text(&buffer, 0);
         assert!(
             row0.contains("long_function"),
             "row 0 should be the pinned hunk header, got:\n{row0}"
@@ -3571,10 +3483,7 @@ mod tests {
         let match_count = install_search(&mut app, "foo", 0);
         assert_eq!(match_count, 1, "test fixture precondition");
 
-        let backend = TestBackend::new(80, 6);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 6);
 
         let runs = find_text_runs(&buffer, "foo");
         assert_eq!(runs.len(), 1, "rendered buffer should contain one `foo`");
@@ -3622,10 +3531,7 @@ mod tests {
         let match_count = install_search(&mut app, "foo", 0);
         assert_eq!(match_count, 2, "test fixture precondition");
 
-        let backend = TestBackend::new(80, 6);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 6);
 
         let runs = find_text_runs(&buffer, "foo");
         assert_eq!(runs.len(), 2, "expected two `foo` runs in the buffer");
@@ -3710,10 +3616,7 @@ mod tests {
         app.scroll = match_row;
         app.follow_mode = false;
 
-        let backend = TestBackend::new(80, 6);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 6);
 
         let runs = find_text_runs(&buffer, "foo");
         assert_eq!(runs.len(), 1, "rendered buffer should contain one `foo`");
@@ -3798,10 +3701,7 @@ mod tests {
         // `current_hunk()` resolves to hunk 0 and hunk 1 is unfocused.
         app.scroll = first_row;
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 20);
 
         let runs = find_text_runs(&buffer, "foo");
         assert_eq!(runs.len(), 2, "both `foo` runs must render in the viewport");

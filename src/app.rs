@@ -5920,12 +5920,7 @@ mod tests {
             vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
             100,
         )]);
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("header");
+        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Char(' ')));
@@ -6188,12 +6183,10 @@ mod tests {
             100,
         )]);
         for i in 0..3 {
-            let row = app
-                .layout
-                .rows
-                .iter()
-                .position(|r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i))
-                .expect("hh");
+            let row = find_first_row_matching(
+                &app,
+                |r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i),
+            );
             app.scroll_to(row);
             app.handle_key(key(KeyCode::Char(' ')));
         }
@@ -6248,12 +6241,10 @@ mod tests {
         )]);
         // Seen all three.
         for i in 0..3 {
-            let row = app
-                .layout
-                .rows
-                .iter()
-                .position(|r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i))
-                .expect("hh");
+            let row = find_first_row_matching(
+                &app,
+                |r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i),
+            );
             app.scroll_to(row);
             app.handle_key(key(KeyCode::Char(' ')));
         }
@@ -7511,12 +7502,7 @@ mod tests {
         let vi = VisualIndex::build(&app.layout, &app.files, Some(10));
 
         // Find the one DiffLine row in the layout.
-        let diff_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::DiffLine { .. }))
-            .expect("layout must contain a DiffLine");
+        let diff_row = find_first_row_matching(&app, |r| matches!(r, RowKind::DiffLine { .. }));
         assert_eq!(
             vi.visual_height(diff_row),
             4,
@@ -7648,12 +7634,7 @@ mod tests {
         app.follow_mode = false;
 
         // Find the diff row and park on its first visual line.
-        let diff_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::DiffLine { .. }))
-            .expect("layout has a DiffLine");
+        let diff_row = find_first_row_matching(&app, |r| matches!(r, RowKind::DiffLine { .. }));
         app.scroll = diff_row;
         app.cursor_sub_row = 0;
 
@@ -7916,6 +7897,23 @@ mod tests {
         panic!("layout has fewer than {} DiffLine rows", n + 1);
     }
 
+    fn read_temp_file(tmp: &tempfile::TempDir, rel_path: &str) -> String {
+        std::fs::read_to_string(tmp.path().join(rel_path)).expect("read")
+    }
+
+    fn open_scar_comment_app(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        lines: Vec<DiffLine>,
+    ) -> App {
+        let mut app = scar_app_with_real_fs(tmp, rel_path, source, hunk_new_start, lines);
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        app
+    }
+
     #[test]
     fn handle_key_a_inserts_ask_scar_above_cursor_line() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -7933,7 +7931,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('a')));
 
-        let after = std::fs::read_to_string(tmp.path().join("src/main.rs")).expect("read back");
+        let after = read_temp_file(&tmp, "src/main.rs");
         assert_eq!(
             after, "fn one() {}\n// @kizu[ask]: explain this change\nfn two() {}\n",
             "`a` key must insert the canned ask scar above the cursor row",
@@ -7958,7 +7956,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('r')));
 
-        let after = std::fs::read_to_string(tmp.path().join("auth.py")).expect("read back");
+        let after = read_temp_file(&tmp, "auth.py");
         assert_eq!(
             after, "def main():\n    # @kizu[reject]: revert this change\n    return 1\n",
             "`r` key must insert the canned reject scar using python # syntax",
@@ -7980,17 +7978,13 @@ mod tests {
             vec![diff_line(LineKind::Added, "fn one() {}")],
         );
         // Park the cursor on the FileHeader row explicitly.
-        let file_header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("file header exists");
+        let file_header_row =
+            find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
         app.scroll_to(file_header_row);
 
         app.handle_key(key(KeyCode::Char('a')));
 
-        let after = std::fs::read_to_string(tmp.path().join("lib.rs")).expect("read back");
+        let after = read_temp_file(&tmp, "lib.rs");
         assert_eq!(after, original, "header-row `a` must not touch the file");
         assert!(app.last_error.is_none(), "header-row `a` is a clean no-op");
     }
@@ -8037,12 +8031,7 @@ mod tests {
             )],
             100,
         )]);
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
-            .expect("hunk header row exists");
+        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::HunkHeader { .. }));
         app.scroll_to(header_row);
         let (_, line) = app.scar_target_line().expect("target");
         assert_eq!(
@@ -8069,12 +8058,7 @@ mod tests {
             )],
             100,
         )]);
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
-            .expect("hunk header row exists");
+        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::HunkHeader { .. }));
         app.scroll_to(header_row);
         let (_, line) = app.scar_target_line().expect("target");
         assert_eq!(
@@ -8096,17 +8080,12 @@ mod tests {
             2,
             vec![diff_line(LineKind::Added, "line_b")],
         );
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
-            .expect("hunk header row exists");
+        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::HunkHeader { .. }));
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Char('a')));
 
-        let after = std::fs::read_to_string(tmp.path().join("src/lib.rs")).expect("read back");
+        let after = read_temp_file(&tmp, "src/lib.rs");
         assert_eq!(
             after, "line_a\n// @kizu[ask]: explain this change\nline_b\n",
             "`a` on a hunk header must drop the scar above hunk.new_start",
@@ -8118,16 +8097,13 @@ mod tests {
     #[test]
     fn handle_key_c_opens_scar_comment_overlay_with_captured_target() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let app = open_scar_comment_app(
             &tmp,
             "src/foo.rs",
             "fn alpha() {}\nfn beta() {}\n",
             2,
             vec![diff_line(LineKind::Added, "fn beta() {}")],
         );
-        cursor_on_nth_diff_line(&mut app, 0);
-
-        app.handle_key(key(KeyCode::Char('c')));
 
         let state = app
             .scar_comment
@@ -8140,7 +8116,7 @@ mod tests {
             tmp.path().join("src/foo.rs"),
             "captures absolute target path"
         );
-        let after = std::fs::read_to_string(tmp.path().join("src/foo.rs")).expect("read");
+        let after = read_temp_file(&tmp, "src/foo.rs");
         assert_eq!(
             after, "fn alpha() {}\nfn beta() {}\n",
             "`c` must not touch the file until `Enter` commits"
@@ -8158,12 +8134,7 @@ mod tests {
             1,
             vec![diff_line(LineKind::Added, "fn one() {}")],
         );
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("file header exists");
+        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Char('c')));
@@ -8177,15 +8148,13 @@ mod tests {
     #[test]
     fn scar_comment_typing_appends_characters_to_body() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = open_scar_comment_app(
             &tmp,
             "a.rs",
             "x\ny\n",
             2,
             vec![diff_line(LineKind::Added, "y")],
         );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
 
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
@@ -8198,15 +8167,13 @@ mod tests {
     #[test]
     fn scar_comment_backspace_deletes_last_character() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = open_scar_comment_app(
             &tmp,
             "a.rs",
             "x\ny\n",
             2,
             vec![diff_line(LineKind::Added, "y")],
         );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
         for ch in "ab".chars() {
             app.handle_key(key(KeyCode::Char(ch)));
         }
@@ -8220,15 +8187,13 @@ mod tests {
     fn scar_comment_esc_cancels_without_writing_to_file() {
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\nfn two() {}\n";
-        let mut app = scar_app_with_real_fs(
+        let mut app = open_scar_comment_app(
             &tmp,
             "cancel.rs",
             original,
             2,
             vec![diff_line(LineKind::Added, "fn two() {}")],
         );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
         for ch in "dont".chars() {
             app.handle_key(key(KeyCode::Char(ch)));
         }
@@ -8236,7 +8201,7 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
 
         assert!(app.scar_comment.is_none(), "Esc closes the overlay");
-        let after = std::fs::read_to_string(tmp.path().join("cancel.rs")).expect("read");
+        let after = read_temp_file(&tmp, "cancel.rs");
         assert_eq!(after, original, "cancel must not touch the file");
         assert!(app.last_error.is_none(), "cancel is not an error");
     }
@@ -8244,15 +8209,13 @@ mod tests {
     #[test]
     fn scar_comment_enter_commits_free_scar_above_target_line() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = open_scar_comment_app(
             &tmp,
             "commit.rs",
             "fn one() {}\nfn two() {}\n",
             2,
             vec![diff_line(LineKind::Added, "fn two() {}")],
         );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
         for ch in "why two?".chars() {
             app.handle_key(key(KeyCode::Char(ch)));
         }
@@ -8260,7 +8223,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert!(app.scar_comment.is_none(), "commit closes the overlay");
-        let after = std::fs::read_to_string(tmp.path().join("commit.rs")).expect("read");
+        let after = read_temp_file(&tmp, "commit.rs");
         assert_eq!(
             after, "fn one() {}\n// @kizu[free]: why two?\nfn two() {}\n",
             "Enter must write a free-scar above the captured target line"
@@ -8271,22 +8234,20 @@ mod tests {
     fn scar_comment_enter_on_empty_body_is_cancel() {
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\nfn two() {}\n";
-        let mut app = scar_app_with_real_fs(
+        let mut app = open_scar_comment_app(
             &tmp,
             "empty.rs",
             original,
             2,
             vec![diff_line(LineKind::Added, "fn two() {}")],
         );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
         app.handle_key(key(KeyCode::Enter));
 
         assert!(
             app.scar_comment.is_none(),
             "empty commit closes the overlay"
         );
-        let after = std::fs::read_to_string(tmp.path().join("empty.rs")).expect("read");
+        let after = read_temp_file(&tmp, "empty.rs");
         assert_eq!(after, original, "empty body must not write a blank scar");
     }
 
@@ -8296,15 +8257,13 @@ mod tests {
         // the body instead of quitting the app. Proves the router
         // correctly parks normal-mode dispatch behind the overlay.
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = open_scar_comment_app(
             &tmp,
             "quit.rs",
             "x\ny\n",
             2,
             vec![diff_line(LineKind::Added, "y")],
         );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
 
         app.handle_key(key(KeyCode::Char('q')));
 
@@ -8485,12 +8444,7 @@ mod tests {
             "fn one() {}\n",
             "fn one() {}\nfn two() {}\n",
         );
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("header");
+        let header_row = find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Enter));
@@ -8995,12 +8949,7 @@ mod tests {
             1,
             vec![diff_line(LineKind::Added, "x")],
         );
-        let header = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("header");
+        let header = find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
         app.scroll_to(header);
 
         assert!(app.open_in_editor(Some("vim")).is_none());
@@ -9187,12 +9136,8 @@ mod tests {
             "fn one() {}\n",
             "fn one() {}\nfn two() {}\n",
         );
-        let file_header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("file header exists");
+        let file_header_row =
+            find_first_row_matching(&app, |r| matches!(r, RowKind::FileHeader { .. }));
         app.scroll_to(file_header_row);
 
         app.handle_key(key(KeyCode::Char('x')));

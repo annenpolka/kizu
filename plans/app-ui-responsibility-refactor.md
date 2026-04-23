@@ -26,6 +26,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 20:36:04Z) 追加削減後の full gate (`just ci`) を通す
 - [x] (2026-04-23 20:46:07Z) 仕上げ削減 pass: file-view scroll helper、`file_view_state` / `install_search` test fixture helper を追加し、行数を増やした候補 helper は撤回
 - [x] (2026-04-23 20:46:07Z) 仕上げ後の full gate (`just ci`) を通す
+- [x] (2026-04-23 20:57:14Z) post-commit 削減 pass: UI test render buffer / row text / cell search helper、scar comment test helper、RowKind row lookup helper を追加して test fixture 重複を削除
+- [x] (2026-04-23 20:57:14Z) post-commit 削減後の full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -70,6 +72,12 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: test-only fixture helper は、追加行数を差し引いても app/ui の重複を削れた。
   Evidence: `file_view_state` と `install_search` を `src/test_support.rs` に追加した後、`src/app.rs` は 10486 行から 10441 行、`src/ui.rs` は 3890 行から 3830 行になり、`file_view` 16 件、`search` 19 件、full `just ci` が成功した。
+
+- Observation: UI test の terminal rendering と buffer 走査は、各 assertion が低レベルの `TestBackend` 構築や nested loop を持つことで、実際に検証したい UI 条件を読みにくくしていた。
+  Evidence: `render_buffer`、`buffer_row_text`、`first_cell_matching`、`buffer_has_cell` へ寄せた後、`src/ui.rs` は 3830 行から 3730 行になり、`ui::tests` 63 件と full `just ci` が成功した。
+
+- Observation: scar comment と header-row 系の app tests は、同じ一時ファイル読み取り、scar overlay 起動、`RowKind` 探索を繰り返していた。
+  Evidence: `read_temp_file`、`open_scar_comment_app`、既存 `find_first_row_matching` 利用へ寄せた後、`src/app.rs` は 10441 行から 10386 行になり、`scar_comment` 7 件、`file_header` 10 件、`hunk_header` 25 件、full `just ci` が成功した。
 
 ## Decision Log
 
@@ -117,6 +125,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: app/ui の test module が同じ `FileViewState` / `SearchState` fixture を繰り返していた。test-only helper に閉じると production code の依存を増やさず、テストの儀式だけを削れる。
   Date/Author: 2026-04-23 20:46:07Z / Codex
 
+- Decision: post-commit pass は production 挙動に触れず、test-only boilerplate の削減に限定する。
+  Rationale: 直前のコミットで production の大きな重複削除は full gate 済みだった。次の安全な削減余地は、UI buffer rendering、scar temp file setup、row lookup といったテスト儀式であり、ここを先に畳むと後続の production refactor をレビューしやすくできる。
+  Date/Author: 2026-04-23 20:57:14Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -126,6 +138,8 @@ Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/fo
 自律削減 pass では、search/scar 入力編集、normal/file-view の共通キー、picker/search navigation、Cline hook 判定、app/ui test fixture をまとめた。`src/test_support.rs` は test-only の共有 fixture として追加した。2nd pass 完了時点からさらに `src/app.rs` は 10650 行から 10441 行へ、`src/ui.rs` は 4017 行から 3830 行へ、`src/init.rs` は 2130 行から 2116 行へ減った。`src/test_support.rs` 153 行と `src/main.rs` の test-only module 宣言 2 行を差し引いても、この pass だけで約 255 行の純減になった。
 
 検証は `just ci` が成功した。Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗。残る課題は、まだ `src/app.rs` が 1 万行を超えていること、`src/ui.rs` も diff 行描画と file view 描画を抱えていることである。次の削減候補は file view state の module 化、diff/file view renderer の境界整理、`init.rs` の Cursor / Cline install/teardown の schema 別 adapter 化である。
+
+post-commit 削減 pass では、`src/app.rs` と `src/ui.rs` の test-only boilerplate だけを削った。`src/app.rs` は 10441 行から 10386 行へ、`src/ui.rs` は 3830 行から 3730 行へ減った。差分は 2 ファイルで 153 insertions / 308 deletions、純減 155 行。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -311,6 +325,40 @@ Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/fo
 
     src/test_support.rs
     153 lines added as a new test-only fixture module
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
+post-commit 削減 pass 後の追加証拠は以下である。
+
+    src/app.rs          10386 lines
+    src/ui.rs            3730 lines
+    src/test_support.rs   153 lines
+
+    git diff --stat
+    src/app.rs | 161 +++++++++++----------------------
+    src/ui.rs  | 300 +++++++++++++++++++++----------------------------------------
+    2 files changed, 153 insertions(+), 308 deletions(-)
+
+    cargo test --all-targets --all-features scar_comment -- --nocapture
+    7 passed
+
+    cargo test --all-targets --all-features file_header -- --nocapture
+    10 passed
+
+    cargo test --all-targets --all-features hunk_header -- --nocapture
+    25 passed
+
+    cargo test --all-targets --all-features ui::tests -- --nocapture
+    63 passed
 
     just ci
     cargo fmt --all -- --check
