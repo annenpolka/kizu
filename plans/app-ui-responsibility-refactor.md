@@ -63,6 +63,8 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 - [x] (2026-04-23 22:25:36Z) performance pass 後の targeted tests、clippy、full gate (`just ci`) を通す
 - [x] (2026-04-23 22:30:54Z) navigation performance pass: hunk/run navigation の線形探索と nowrap `VisualIndex` 再構築を削る
 - [x] (2026-04-23 22:30:54Z) navigation performance pass 後の targeted tests、clippy、full gate (`just ci`) を通す
+- [x] (2026-04-23 22:34:18Z) search highlight performance pass: row ごとの search match projection を全 match scan から range lookup に変える
+- [x] (2026-04-23 22:34:18Z) search highlight performance pass 後の targeted tests、clippy、full gate (`just ci`) を通す
 
 ## Surprises & Discoveries
 
@@ -173,6 +175,9 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
 
 - Observation: 描画 hot path を軽くした後も、`j` / `k` / `h` / `l` / follow mode の navigation は sorted な `hunk_starts` / `change_runs` を線形探索していた。
   Evidence: `next_hunk`、`prev_hunk`、`next_change`、`prev_change` は `.iter().find(...)` / `.iter().rev().find(...)` を持ち、`follow_target_row` は layout rows を前後に scan していた。`partition_point` helper と `hunk_ranges` / `file_first_hunk` 参照へ置換後、`handle_key_j`、`lowercase_j` 5 件、`lowercase_k` 3 件、`follow_target` 2 件、clippy が成功した。
+
+- Observation: search highlight rendering は `SearchState.matches` が row 順であるにもかかわらず、可視 DiffLine ごとに全 match を scan していた。
+  Evidence: `row_search_matches` は `state.matches.iter().enumerate().filter(|(_, m)| m.row == row_idx)` だった。`partition_point` で対象 row の contiguous range だけを見る形にした後、`search` 19 件、`ui::tests::search` 4 件、clippy が成功した。
 
 ## Decision Log
 
@@ -296,6 +301,10 @@ kizu の主要な振る舞いは既に動いているが、`/Users/annenpolka/gh
   Rationale: `hunk_starts` と `change_runs` は `build_layout` が昇順で作る index なので、次/前の候補探索は `partition_point` で十分である。nowrap では 1 logical row = 1 visual row のため、long-run 判定に prefix-sum index を作る必要がない。
   Date/Author: 2026-04-23 22:30:54Z / Codex
 
+- Decision: search matches は sorted invariant を使って row-local range として読む。
+  Rationale: `find_matches` は layout row order で `MatchLocation` を push するため、同じ `row` の match は contiguous である。row render ごとに全 match を filter すると、match 数が多い検索で viewport 描画コストが膨らむ。
+  Date/Author: 2026-04-23 22:34:18Z / Codex
+
 ## Outcomes & Retrospective
 
 Stream mode の差分構築を `src/stream.rs` へ、footer 描画を `src/ui/footer.rs` へ、help/picker overlay 描画を `src/ui/overlays.rs` へ切り出した。`src/app.rs` は 10820 行から 10690 行へ、`src/ui.rs` は 4989 行から 4195 行へ減った。v0.5 行番号まわりの既存未コミット差分は巻き戻さず、責務分割だけを重ねた。
@@ -341,6 +350,8 @@ hunk file fixture pass では、single-hunk `FileDiff` wrapper を `file_with_hu
 performance pass では、`current_hunk_range` の render-time scan を `ScrollLayout::hunk_ranges` lookup に置換し、seen hunk fingerprint を該当 mark がある hunk だけ計算するようにした。さらに wrap mode の `viewport_placement` が毎回 `VisualIndex::build` する経路を、body width keyed cache にした。`src/app.rs` は 9449 行から 9482 行へ、`src/ui.rs` は 3516 行から 3530 行へ、`src/test_support.rs` は 240 行から 241 行になった。差分は 3 ファイルで 109 insertions / 61 deletions、純増 48 行だが、4,000 hunk probe では wrap placement が約 85 倍、hunk range lookup が約 10,000 倍軽くなった。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 navigation performance pass では、hunk/run の前後候補探索を `partition_point` helper に寄せ、follow target を `hunk_ranges` / `file_first_hunk` から直接読むようにした。nowrap の long-run 判定では visual height を row span から直接計算し、wrap 時だけ cached `VisualIndex` を使う。`src/app.rs` は 9482 行から 9480 行へ減り、差分は 1 ファイルで 65 insertions / 67 deletions、純減 2 行になった。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
+
+search highlight performance pass では、`row_search_matches` を全 match scan から `partition_point` による row-local range lookup に変えた。`src/ui.rs` は 3530 行から 3533 行になり、差分は 1 ファイルで 7 insertions / 4 deletions、純増 3 行。match 数が多い検索でも、可視行あたりの projection が O(total matches) から O(log total matches + matches on row) になる。検証は `just ci` が成功し、Rust unit tests は 467 件成功、release build 成功、e2e は 35 件成功 / 0 件失敗だった。
 
 ## Context and Orientation
 
@@ -1184,6 +1195,36 @@ navigation performance pass 後の追加証拠は以下である。
     35 pass
     0 fail
 
+search highlight performance pass 後の追加証拠は以下である。
+
+    src/app.rs           9480 lines
+    src/ui.rs            3533 lines
+    src/test_support.rs   241 lines
+
+    git diff --stat
+    src/ui.rs | 11 +++++++----
+    1 file changed, 7 insertions(+), 4 deletions(-)
+
+    cargo test --all-targets --all-features search -- --nocapture
+    19 passed
+
+    cargo test --all-targets --all-features ui::tests::search -- --nocapture
+    4 passed
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile
+
+    just ci
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-targets --all-features
+    test result: ok. 467 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    cargo build --release --locked
+    cd tests/e2e && bun install --frozen-lockfile
+    cd tests/e2e && KIZU_BIN="$(pwd)/../../target/release/kizu" bun test
+    35 pass
+    0 fail
+
 ## Interfaces and Dependencies
 
 `/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/stream.rs` は次の interface を提供する。
@@ -1212,3 +1253,5 @@ help overlay は `app.config.keys` を読んでキー表示を組み立てる。
 `/Users/annenpolka/ghq/github.com/annenpolka/kizu/src/app.rs` の `ScrollLayout` は render hot path 用に `hunk_ranges` と `hunk_fingerprints` を持つ。`hunk_ranges[file_idx][hunk_idx]` は `(start, end_exclusive)` の row span、`hunk_fingerprints[file_idx][hunk_idx]` は seen mark のある hunk だけ `Some(current_fp)` になる。`App` は wrap mode の `VisualIndex` を `visual_index_cache` に body width keyed で保持し、`build_layout` で無効化する。
 
 `next_sorted_after`、`prev_sorted_before`、`change_run_at`、`next_change_run_start_after`、`prev_change_run_start_before` は、`build_layout` が昇順に作る `hunk_starts` / `change_runs` を `partition_point` で読む navigation helper である。これらは `src/app.rs` 内部専用で、外部 interface は増やさない。
+
+`row_search_matches` は `SearchState.matches` が row order で並ぶ invariant に依存し、`partition_point` で該当 row の match slice だけを返す。`SearchState` の public shape は変えない。

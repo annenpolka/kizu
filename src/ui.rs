@@ -781,12 +781,15 @@ fn row_search_matches(
     let Some(state) = search else {
         return Vec::new();
     };
-    state
-        .matches
+    let start = state.matches.partition_point(|m| m.row < row_idx);
+    let end = start + state.matches[start..].partition_point(|m| m.row == row_idx);
+    state.matches[start..end]
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.row == row_idx)
-        .map(|(i, m)| (m.byte_start, m.byte_end, i == state.current))
+        .map(|(offset, m)| {
+            let match_idx = start + offset;
+            (m.byte_start, m.byte_end, match_idx == state.current)
+        })
         .collect()
 }
 
