@@ -358,6 +358,7 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             search: app.search.as_ref(),
             effective_show_ln,
             diff_line_numbers: &app.layout.diff_line_numbers,
+            hunk_fingerprints: &app.layout.hunk_fingerprints,
             ln_gutter,
         };
         let row_lines = render_row(row_idx, &app.layout.rows[row_idx], &ctx);
@@ -530,6 +531,9 @@ struct RowRenderCtx<'a> {
     /// Per-row cached `(old, new)` line numbers. Parallel to
     /// `app.layout.rows`; `None` for non-DiffLine rows.
     diff_line_numbers: &'a [Option<(Option<usize>, Option<usize>)>],
+    /// Per-hunk cached fingerprints, computed only for hunk anchors
+    /// that currently have a seen mark.
+    hunk_fingerprints: &'a [Vec<Option<u64>>],
     /// Gutter geometry. Fields are all zero when `effective_show_ln`
     /// is false (either because the flag is off or because the
     /// viewport is too narrow to reserve a gutter).
@@ -604,16 +608,26 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
                 return vec![Line::raw("")];
             };
             let is_selected = selected_hunk == Some((*file_idx, *hunk_idx));
+            let marked_fp = crate::app::seen_hunk_fingerprint(
+                seen_hunks,
+                &files[*file_idx].path,
+                hunks[*hunk_idx].old_start,
+            );
+            let is_seen = marked_fp.is_some_and(|marked| {
+                let current = ctx
+                    .hunk_fingerprints
+                    .get(*file_idx)
+                    .and_then(|fps| fps.get(*hunk_idx))
+                    .copied()
+                    .flatten()
+                    .unwrap_or_else(|| crate::app::hunk_fingerprint(&hunks[*hunk_idx]));
+                marked == current
+            });
             let line = render_hunk_header(
                 &hunks[*hunk_idx],
                 is_selected,
                 cursor_sub.is_some(),
-                crate::app::is_hunk_seen(
-                    seen_hunks,
-                    &files[*file_idx].path,
-                    hunks[*hunk_idx].old_start,
-                    crate::app::hunk_fingerprint(&hunks[*hunk_idx]),
-                ),
+                is_seen,
             );
             if ctx.effective_show_ln {
                 vec![insert_blank_gutter(line, &ctx.ln_gutter)]

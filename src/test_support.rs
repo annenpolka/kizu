@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -214,6 +214,7 @@ pub(crate) fn app_with_files(files: Vec<FileDiff>) -> App {
         last_body_height: Cell::new(24),
         last_body_width: Cell::new(None),
         visual_top: Cell::new(0.0),
+        visual_index_cache: RefCell::new(None),
         anim: None,
         wrap_lines: false,
         show_line_numbers: false,

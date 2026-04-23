@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -161,6 +161,12 @@ pub(crate) const SCAR_TEXT_ASK: &str = "explain this change";
 /// Canned scar body bound to the `r` key — "reject".
 pub(crate) const SCAR_TEXT_REJECT: &str = "revert this change";
 
+#[derive(Debug, Clone)]
+pub(crate) struct CachedVisualIndex {
+    body_width: Option<usize>,
+    index: VisualIndex,
+}
+
 /// Top-level application state. Single-threaded, mutated by the event loop
 /// via `&mut self` (we run on tokio's `current_thread` flavor — see ADR-0003).
 pub struct App {
@@ -266,6 +272,11 @@ pub struct App {
     /// snap — the next tween picks up from wherever the current one
     /// happened to be).
     pub visual_top: Cell<f32>,
+    /// Wrap-mode visual coordinate cache. `VisualIndex` is O(layout rows)
+    /// to build because it measures every logical row. Rendering may ask
+    /// for placement more than once per frame (sticky-header decision),
+    /// so cache the current width until `build_layout` invalidates it.
+    pub(crate) visual_index_cache: RefCell<Option<CachedVisualIndex>>,
     /// Active viewport-top tween. `None` when the renderer should
     /// draw at the logical target.
     pub anim: Option<ScrollAnim>,
@@ -515,14 +526,14 @@ fn uses_plus_line_format(basename: &str) -> bool {
 /// mismatched fingerprint means the hunk has been edited since it
 /// was marked seen — in that case the mark is considered stale and
 /// the hunk behaves as if it were unmarked (auto-expand).
-pub fn is_hunk_seen(
+pub fn seen_hunk_fingerprint(
     seen: &BTreeMap<(PathBuf, usize), u64>,
     path: &Path,
     old_start: usize,
-    current_fp: u64,
-) -> bool {
+) -> Option<u64> {
     seen.iter()
-        .any(|((p, o), fp)| *o == old_start && *fp == current_fp && p.as_path() == path)
+        .find(|((p, o), _)| *o == old_start && p.as_path() == path)
+        .map(|(_, fp)| *fp)
 }
 
 /// v0.4 adaptive-navigation helper: given the nearest "run start"
@@ -756,6 +767,14 @@ pub struct ScrollLayout {
     /// `rows` indices that point at a `HunkHeader` — used by `j/k` to jump
     /// hunk-by-hunk regardless of how many context lines sit in between.
     pub hunk_starts: Vec<usize>,
+    /// Per-file, per-hunk `(start, end_exclusive)` spans in `rows`.
+    /// Used by viewport anchoring so every render can find the
+    /// selected hunk's extent without scanning the whole layout.
+    pub hunk_ranges: Vec<Vec<(usize, usize)>>,
+    /// Per-file, per-hunk content fingerprints. `None` means no seen
+    /// mark existed for that `(path, old_start)` during `build_layout`,
+    /// so callers can avoid hashing untouched hunks on hot render paths.
+    pub hunk_fingerprints: Vec<Vec<Option<u64>>>,
     /// For each file in `App.files`, the row index of its first hunk header
     /// (or the file header for binaries / empty hunks). `None` only when the
     /// layout build couldn't produce any anchorable row for that file.
@@ -1335,6 +1354,7 @@ impl App {
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
             last_body_width: Cell::new(None),
             visual_top: Cell::new(0.0),
+            visual_index_cache: RefCell::new(None),
             anim: None,
             wrap_lines: false,
             show_line_numbers: config.line_numbers.enabled,
@@ -2467,6 +2487,24 @@ impl App {
         visual.round().max(0.0) as usize
     }
 
+    fn with_visual_index<R>(
+        &self,
+        body_width: Option<usize>,
+        f: impl FnOnce(&VisualIndex) -> R,
+    ) -> R {
+        let needs_rebuild = !matches!(
+            self.visual_index_cache.borrow().as_ref(),
+            Some(cached) if cached.body_width == body_width
+        );
+        if needs_rebuild {
+            let index = VisualIndex::build(&self.layout, &self.files, body_width);
+            *self.visual_index_cache.borrow_mut() = Some(CachedVisualIndex { body_width, index });
+        }
+        let cache = self.visual_index_cache.borrow();
+        let index = &cache.as_ref().expect("visual index cache populated").index;
+        f(index)
+    }
+
     /// Compute the viewport's top position for the current render,
     /// returning `(top_row, skip_visual)` where `top_row` is the first
     /// logical layout row to draw and `skip_visual` is the number of
@@ -2494,15 +2532,16 @@ impl App {
             // Nowrap fast path — identical to the old visual_viewport_top.
             return (self.visual_viewport_top(viewport_height, now), 0);
         };
-        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-        let target_y = self.placement_target_visual_y(viewport_height, &vi);
-        let sampled_y = match self.anim.as_ref() {
-            Some(anim) => anim.sample(target_y as f32, now).0,
-            None => target_y as f32,
-        };
-        self.visual_top.set(sampled_y);
-        let y = sampled_y.round().max(0.0) as usize;
-        vi.logical_at(y)
+        self.with_visual_index(body_width, |vi| {
+            let target_y = self.placement_target_visual_y(viewport_height, vi);
+            let sampled_y = match self.anim.as_ref() {
+                Some(anim) => anim.sample(target_y as f32, now).0,
+                None => target_y as f32,
+            };
+            self.visual_top.set(sampled_y);
+            let y = sampled_y.round().max(0.0) as usize;
+            vi.logical_at(y)
+        })
     }
 
     /// Visual-y coordinate of the viewport's top edge under wrap mode,
@@ -3482,12 +3521,19 @@ impl App {
         let Some(hunk) = hunks.get(hunk_idx) else {
             return false;
         };
-        is_hunk_seen(
-            &self.seen_hunks,
-            &file.path,
-            hunk.old_start,
-            hunk_fingerprint(hunk),
-        )
+        let Some(marked_fp) = seen_hunk_fingerprint(&self.seen_hunks, &file.path, hunk.old_start)
+        else {
+            return false;
+        };
+        let current_fp = self
+            .layout
+            .hunk_fingerprints
+            .get(file_idx)
+            .and_then(|fps| fps.get(hunk_idx))
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| hunk_fingerprint(hunk));
+        marked_fp == current_fp
     }
 
     /// Resolve the cursor's current target (path + 1-indexed line)
@@ -3690,37 +3736,16 @@ impl App {
     }
 
     /// `(start, end_exclusive)` row range of the cursor's current hunk.
-    /// Walks `layout.rows` from the start of the hunk header through
-    /// every consecutive `DiffLine` belonging to the same hunk. Returns
-    /// `None` when the cursor is not inside a hunk.
+    /// Reads the range cached by `build_layout`, so render-time hunk
+    /// anchoring stays O(1) even when a diff contains thousands of hunks.
+    /// Returns `None` when the cursor is not inside a hunk.
     pub fn current_hunk_range(&self) -> Option<(usize, usize)> {
         let (file_idx, hunk_idx) = self.current_hunk()?;
-        let mut start = None;
-        let mut end = None;
-        for (i, row) in self.layout.rows.iter().enumerate() {
-            let belongs = match row {
-                RowKind::HunkHeader {
-                    file_idx: f,
-                    hunk_idx: h,
-                } => *f == file_idx && *h == hunk_idx,
-                RowKind::DiffLine {
-                    file_idx: f,
-                    hunk_idx: h,
-                    ..
-                } => *f == file_idx && *h == hunk_idx,
-                _ => false,
-            };
-            if belongs {
-                if start.is_none() {
-                    start = Some(i);
-                }
-                end = Some(i + 1);
-            } else if start.is_some() {
-                // Already walked past the hunk's last row.
-                break;
-            }
-        }
-        Some((start?, end?))
+        self.layout
+            .hunk_ranges
+            .get(file_idx)?
+            .get(hunk_idx)
+            .copied()
     }
 
     /// Where the renderer should park the viewport top, given a body
@@ -3804,6 +3829,8 @@ impl App {
         let mut max_line_number: usize = 0;
 
         for (file_idx, file) in self.files.iter().enumerate() {
+            let mut file_hunk_ranges = Vec::new();
+            let mut file_hunk_fingerprints = Vec::new();
             let header_row = layout.rows.len();
             layout.rows.push(RowKind::FileHeader { file_idx });
             layout.diff_line_numbers.push(None);
@@ -3834,11 +3861,13 @@ impl App {
                             // the hunk header is visible. The mark
                             // auto-clears (below, in the fingerprint
                             // check) once the hunk content drifts.
-                            let is_seen = is_hunk_seen(
-                                &self.seen_hunks,
-                                &file.path,
-                                hunk.old_start,
-                                hunk_fingerprint(hunk),
+                            let marked_fp =
+                                seen_hunk_fingerprint(&self.seen_hunks, &file.path, hunk.old_start);
+                            let current_fp = marked_fp.map(|_| hunk_fingerprint(hunk));
+                            file_hunk_fingerprints.push(current_fp);
+                            let is_seen = matches!(
+                                (marked_fp, current_fp),
+                                (Some(marked), Some(current)) if marked == current
                             );
                             if !is_seen {
                                 // v0.5: inline the old/new counter walk
@@ -3886,11 +3915,14 @@ impl App {
                                     layout.diff_line_numbers.push(Some(pair));
                                 }
                             }
+                            file_hunk_ranges.push((row, layout.rows.len()));
                         }
                     }
                 }
             }
 
+            layout.hunk_ranges.push(file_hunk_ranges);
+            layout.hunk_fingerprints.push(file_hunk_fingerprints);
             layout.rows.push(RowKind::Spacer);
             layout.diff_line_numbers.push(None);
         }
@@ -3953,6 +3985,7 @@ impl App {
         }
 
         self.layout = layout;
+        self.visual_index_cache.get_mut().take();
     }
 
     /// Slide `scroll` to the row of `self.anchor` in the new layout.
