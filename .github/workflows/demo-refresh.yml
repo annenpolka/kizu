@@ -17,27 +17,43 @@ jobs:
     name: vhs / refresh demo.gif
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry & target
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-      - name: Install tmux (vhs tape dependency)
-        run: sudo apt-get update && sudo apt-get install -y tmux
+      # vhs-action is still Node 20-only; install the CLI directly so this
+      # workflow stays clear of GitHub Actions' Node runtime deprecation.
+      - name: Install VHS demo dependencies
+        shell: bash
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://repo.charm.sh/apt/gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" \
+            | sudo tee /etc/apt/sources.list.d/charm.list
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg tmux ttyd vhs
 
       - name: Install kizu on PATH
         run: cargo install --path . --locked
 
       - name: Record demo with vhs
-        uses: charmbracelet/vhs-action@v2
-        with:
-          path: docs/media/demo.tape
+        run: PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" vhs docs/media/demo.tape
 
       - name: Open PR with refreshed demo.gif
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: chore/demo-refresh
           title: 'chore: refresh demo.gif via CI'
