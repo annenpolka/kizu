@@ -12,6 +12,9 @@ mod paths;
 mod prompt;
 mod scar;
 mod session;
+mod stream;
+#[cfg(test)]
+mod test_support;
 mod ui;
 mod watcher;
 

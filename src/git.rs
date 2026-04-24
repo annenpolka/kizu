@@ -78,18 +78,14 @@ pub enum LineKind {
     Deleted,
 }
 
-/// Return the 1-indexed `(old, new)` line numbers for the DiffLine at
-/// `line_idx` inside `hunk`. `old` is `None` for Added rows, `new` is
-/// `None` for Deleted rows, both sides are `Some` for Context rows.
-/// Out-of-range `line_idx` returns `(None, None)` so callers can treat
-/// it as "no line number available" without panicking.
-///
-/// v0.5 `build_layout` inlines an equivalent cumulative walk for O(n)
-/// performance on large hunks (Codex 3rd-round Important-4), but this
-/// standalone helper is kept public for single-line lookups (tests /
-/// future call sites that don't already hold a cursor).
-#[allow(dead_code)]
-pub fn line_numbers_for(hunk: &Hunk, line_idx: usize) -> (Option<usize>, Option<usize>) {
+/// Test-only reference implementation of per-line number resolution.
+/// Pins the semantics (Context → both sides, Added → new only,
+/// Deleted → old only) as a single-line spec that the inline
+/// cumulative walk in `App::build_layout` must match. Production
+/// rendering uses that inline O(n) walk instead of calling this
+/// O(line_idx) helper per line (see Codex 3rd-round Important-4).
+#[cfg(test)]
+pub(crate) fn line_numbers_for(hunk: &Hunk, line_idx: usize) -> (Option<usize>, Option<usize>) {
     let mut old = hunk.old_start;
     let mut new = hunk.new_start;
     for (i, line) in hunk.lines.iter().enumerate() {

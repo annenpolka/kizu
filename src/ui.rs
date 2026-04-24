@@ -5,8 +5,13 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::Paragraph,
 };
+
+mod footer;
+mod overlays;
+
+pub(crate) use footer::format_local_time;
 
 use crate::app::{App, RowKind};
 use crate::git::{DiffContent, FileDiff, FileStatus, Hunk, LineKind};
@@ -97,14 +102,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         render_input_line(frame, input_area, prefix, &text, cursor_pos);
     }
 
-    render_footer(frame, footer, app);
+    footer::render_footer(frame, footer, app);
 
     if app.picker.is_some() {
-        render_picker(frame, area, app);
+        overlays::render_picker(frame, area, app);
     }
 
     if app.help_overlay {
-        render_help_overlay(frame, area, app);
+        overlays::render_help_overlay(frame, area, app);
     }
 }
 
@@ -201,28 +206,13 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // numbered renderers — receives the exact same width this block
     // computes.
     let aw = area.width as usize;
-    let mut effective_show_ln =
-        app.show_line_numbers && app.view_mode != crate::app::ViewMode::Stream;
-    let digits = line_number_digits(app.layout.max_line_number);
     // Single-column gutter for both diff and file view (2026-04-21
-    // feedback: two columns read as "duplicated").
-    let mut ln_gutter_width = if effective_show_ln {
-        LineNumberGutter::single(digits).total_width
-    } else {
-        0
-    };
-    // Extreme-narrow fallback: if the viewport can't even fit the
-    // gutter + 4 body cells, drop the gutter so the user still gets
-    // diff content instead of an empty body strip.
-    if effective_show_ln && aw < 5 + ln_gutter_width + 4 {
-        effective_show_ln = false;
-        ln_gutter_width = 0;
-    }
-    let ln_gutter = if effective_show_ln {
-        LineNumberGutter::single(digits)
-    } else {
-        LineNumberGutter::single(0)
-    };
+    // feedback: two columns read as "duplicated"). `resolve_ln_gutter`
+    // also applies the extreme-narrow fallback so the body never
+    // collapses below 4 cells.
+    let wants_ln = app.show_line_numbers && app.view_mode != crate::app::ViewMode::Stream;
+    let (effective_show_ln, ln_gutter_width, ln_gutter) =
+        resolve_ln_gutter(wants_ln, app.layout.max_line_number, aw);
 
     // v0.5 M2: wrap mode reserves 5 cells for the left bar only. The
     // legacy `¶` marker column took another cell on every row, but
@@ -368,6 +358,7 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             search: app.search.as_ref(),
             effective_show_ln,
             diff_line_numbers: &app.layout.diff_line_numbers,
+            hunk_fingerprints: &app.layout.hunk_fingerprints,
             ln_gutter,
         };
         let row_lines = render_row(row_idx, &app.layout.rows[row_idx], &ctx);
@@ -540,6 +531,9 @@ struct RowRenderCtx<'a> {
     /// Per-row cached `(old, new)` line numbers. Parallel to
     /// `app.layout.rows`; `None` for non-DiffLine rows.
     diff_line_numbers: &'a [Option<(Option<usize>, Option<usize>)>],
+    /// Per-hunk cached fingerprints, computed only for hunk anchors
+    /// that currently have a seen mark.
+    hunk_fingerprints: &'a [Vec<Option<u64>>],
     /// Gutter geometry. Fields are all zero when `effective_show_ln`
     /// is false (either because the flag is off or because the
     /// viewport is too narrow to reserve a gutter).
@@ -553,6 +547,21 @@ enum SearchHl {
     None,
     Other,
     Current,
+}
+
+fn cursor_bar(is_cursor: bool, is_selected: bool) -> Span<'static> {
+    if is_cursor {
+        Span::styled(
+            "  ▶  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if is_selected {
+        Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
+    } else {
+        Span::raw("     ")
+    }
 }
 
 /// Build the styled visual `Line`s for a single logical layout row.
@@ -599,16 +608,26 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
                 return vec![Line::raw("")];
             };
             let is_selected = selected_hunk == Some((*file_idx, *hunk_idx));
+            let marked_fp = crate::app::seen_hunk_fingerprint(
+                seen_hunks,
+                &files[*file_idx].path,
+                hunks[*hunk_idx].old_start,
+            );
+            let is_seen = marked_fp.is_some_and(|marked| {
+                let current = ctx
+                    .hunk_fingerprints
+                    .get(*file_idx)
+                    .and_then(|fps| fps.get(*hunk_idx))
+                    .copied()
+                    .flatten()
+                    .unwrap_or_else(|| crate::app::hunk_fingerprint(&hunks[*hunk_idx]));
+                marked == current
+            });
             let line = render_hunk_header(
                 &hunks[*hunk_idx],
                 is_selected,
                 cursor_sub.is_some(),
-                crate::app::is_hunk_seen(
-                    seen_hunks,
-                    &files[*file_idx].path,
-                    hunks[*hunk_idx].old_start,
-                    crate::app::hunk_fingerprint(&hunks[*hunk_idx]),
-                ),
+                is_seen,
             );
             if ctx.effective_show_ln {
                 vec![insert_blank_gutter(line, &ctx.ln_gutter)]
@@ -631,71 +650,47 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
             // is_current) tuples so the renderer doesn't need to walk
             // SearchState.current for every span.
             let search_matches = row_search_matches(ctx.search, row_idx);
-            // v0.5: route through the *_numbered variants when the
-            // line-number gutter is on. The cache built by
-            // build_layout (`diff_line_numbers[row_idx]`) is Some for
-            // every DiffLine row so the unwrap_or fallback is just
-            // defensive.
-            if ctx.effective_show_ln {
+            let rendered = match wrap_body_width {
+                Some(width) => render_diff_line_wrapped(
+                    line,
+                    is_selected,
+                    cursor_sub,
+                    width,
+                    hl,
+                    Some(&files[*file_idx].path),
+                    ctx.bg_added,
+                    ctx.bg_deleted,
+                    &search_matches,
+                ),
+                None => vec![render_diff_line(
+                    line,
+                    is_selected,
+                    is_cursor,
+                    nowrap_body_width,
+                    hl,
+                    Some(&files[*file_idx].path),
+                    ctx.bg_added,
+                    ctx.bg_deleted,
+                    &search_matches,
+                )],
+            };
+            if !ctx.effective_show_ln {
+                rendered
+            } else {
+                // The cache built by build_layout
+                // (`diff_line_numbers[row_idx]`) is Some for every
+                // DiffLine row; unwrap_or is defensive.
                 let pair = ctx
                     .diff_line_numbers
                     .get(row_idx)
                     .copied()
                     .flatten()
                     .unwrap_or((None, None));
-                match wrap_body_width {
-                    Some(width) => render_diff_line_wrapped_numbered(
-                        line,
-                        is_selected,
-                        cursor_sub,
-                        width,
-                        hl,
-                        Some(&files[*file_idx].path),
-                        ctx.bg_added,
-                        ctx.bg_deleted,
-                        &search_matches,
-                        pair,
-                        &ctx.ln_gutter,
-                    ),
-                    None => vec![render_diff_line_numbered(
-                        line,
-                        is_selected,
-                        is_cursor,
-                        nowrap_body_width,
-                        hl,
-                        Some(&files[*file_idx].path),
-                        ctx.bg_added,
-                        ctx.bg_deleted,
-                        &search_matches,
-                        pair,
-                        &ctx.ln_gutter,
-                    )],
-                }
-            } else {
-                match wrap_body_width {
-                    Some(width) => render_diff_line_wrapped(
-                        line,
-                        is_selected,
-                        cursor_sub,
-                        width,
-                        hl,
-                        Some(&files[*file_idx].path),
-                        ctx.bg_added,
-                        ctx.bg_deleted,
-                        &search_matches,
-                    ),
-                    None => vec![render_diff_line(
-                        line,
-                        is_selected,
-                        is_cursor,
-                        nowrap_body_width,
-                        hl,
-                        Some(&files[*file_idx].path),
-                        ctx.bg_added,
-                        ctx.bg_deleted,
-                        &search_matches,
-                    )],
-                }
+                add_line_number_gutters(
+                    rendered,
+                    diff_ln_span(pair, &ctx.ln_gutter),
+                    &ctx.ln_gutter,
+                )
             }
         }
         RowKind::BinaryNotice { .. } => {
@@ -720,23 +715,35 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
     }
 }
 
-/// Insert a blank line-number gutter span directly after the first
-/// span of `line` (which is the 5-cell cursor bar for DiffLine /
-/// HunkHeader rows, or the 2-cell bar for FileHeader rows). Keeps
-/// the non-DiffLine row bodies horizontally aligned with DiffLine
-/// bodies when the gutter is on.
-fn insert_blank_gutter(line: Line<'static>, gutter: &LineNumberGutter) -> Line<'static> {
+/// Splice `gutter_span` directly after the first span of `line`
+/// (which is the bar — 5-cell for DiffLine / HunkHeader rows,
+/// 2-cell for FileHeader rows). Used to keep non-DiffLine row bodies
+/// horizontally aligned with DiffLine bodies when the gutter is on.
+/// `bar_fallback` is the span to emit when the line has no spans at
+/// all; callers pass a matching-width blank bar so downstream
+/// measurements stay consistent.
+fn insert_gutter_span(
+    line: Line<'static>,
+    gutter_span: Span<'static>,
+    bar_fallback: Span<'static>,
+) -> Line<'static> {
     let mut spans = line.spans;
-    let head = if spans.is_empty() {
-        Span::raw("")
+    let bar = if spans.is_empty() {
+        bar_fallback
     } else {
         spans.remove(0)
     };
     let mut new_spans = Vec::with_capacity(spans.len() + 2);
-    new_spans.push(head);
-    new_spans.push(gutter.blank_span());
+    new_spans.push(bar);
+    new_spans.push(gutter_span);
     new_spans.extend(spans);
     Line::from(new_spans)
+}
+
+/// Shorthand for splicing a blank gutter after the head span of a
+/// line that already has its own bar (or no bar at all, for Spacer).
+fn insert_blank_gutter(line: Line<'static>, gutter: &LineNumberGutter) -> Line<'static> {
+    insert_gutter_span(line, gutter.blank_span(), Span::raw(""))
 }
 
 /// Splice a blank gutter span after the first `split_at` cells of
@@ -774,12 +781,15 @@ fn row_search_matches(
     let Some(state) = search else {
         return Vec::new();
     };
-    state
-        .matches
+    let start = state.matches.partition_point(|m| m.row < row_idx);
+    let end = start + state.matches[start..].partition_point(|m| m.row == row_idx);
+    state.matches[start..end]
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.row == row_idx)
-        .map(|(i, m)| (m.byte_start, m.byte_end, i == state.current))
+        .map(|(offset, m)| {
+            let match_idx = start + offset;
+            (m.byte_start, m.byte_end, match_idx == state.current)
+        })
         .collect()
 }
 
@@ -944,25 +954,14 @@ fn render_diff_line_wrapped(
     let chunks = wrap_at_chars(&line.content, body_width.max(1));
     let last_idx = chunks.len().saturating_sub(1);
     let mut char_offset = 0usize;
+    let cursor_line = cursor_sub.map(|s| s.min(last_idx));
 
     chunks
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
             let is_last = i == last_idx;
-            let cursor_line = cursor_sub.map(|s| s.min(last_idx));
-            let bar = if cursor_line == Some(i) {
-                Span::styled(
-                    "  ▶  ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else if is_selected {
-                Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
-            } else {
-                Span::raw("     ")
-            };
+            let bar = cursor_bar(cursor_line == Some(i), is_selected);
             // v0.5 M2: reserve 1 cell only when this is the last
             // visual row AND the DiffLine is EOF-no-newline (the `∅`
             // marker case). Normal newline-terminated rows get no
@@ -1114,12 +1113,13 @@ impl LineNumberGutter {
 /// looking at". Showing only the worktree side keeps the column
 /// monotonic.
 fn diff_ln_span(pair: (Option<usize>, Option<usize>), gutter: &LineNumberGutter) -> Span<'static> {
-    let num = match pair.1 {
-        Some(v) => format!("{v:>w$}", w = gutter.col_width),
-        None => " ".repeat(gutter.col_width),
+    let w = gutter.col_width;
+    let content = match pair.1 {
+        Some(v) => format!(" {v:>w$} "),
+        None => " ".repeat(gutter.total_width),
     };
     Span::styled(
-        format!(" {num} "),
+        content,
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
@@ -1129,185 +1129,32 @@ fn diff_ln_span(pair: (Option<usize>, Option<usize>), gutter: &LineNumberGutter)
 /// File-view single-column line-number gutter span.
 fn file_ln_span(line_number: usize, gutter: &LineNumberGutter) -> Span<'static> {
     Span::styled(
-        format!(" {n:>w$} ", n = line_number, w = gutter.col_width),
+        format!(" {line_number:>w$} ", w = gutter.col_width),
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
     )
 }
 
-/// Wrap an existing diff-line render with a line-number gutter span
-/// inserted directly after the 5-cell cursor bar. Keeps the existing
-/// [`render_diff_line`] as the single source of truth for body
-/// rendering (ADR-style rule: no code duplication for syntax / search
-/// overlay / background padding).
-#[allow(clippy::too_many_arguments)]
-fn render_diff_line_numbered(
-    line: &crate::git::DiffLine,
-    is_selected: bool,
-    is_cursor: bool,
-    body_width: usize,
-    hl: Option<&crate::highlight::Highlighter>,
-    file_path: Option<&std::path::Path>,
-    bg_added: Color,
-    bg_deleted: Color,
-    search_matches: &[(usize, usize, bool)],
-    line_numbers: (Option<usize>, Option<usize>),
-    gutter: &LineNumberGutter,
-) -> Line<'static> {
-    let base = render_diff_line(
-        line,
-        is_selected,
-        is_cursor,
-        body_width,
-        hl,
-        file_path,
-        bg_added,
-        bg_deleted,
-        search_matches,
-    );
-    let mut spans = base.spans;
-    let bar = if spans.is_empty() {
-        Span::raw("     ")
-    } else {
-        spans.remove(0)
-    };
-    let ln = diff_ln_span(line_numbers, gutter);
-    let mut new_spans = Vec::with_capacity(spans.len() + 2);
-    new_spans.push(bar);
-    new_spans.push(ln);
-    new_spans.extend(spans);
-    Line::from(new_spans)
-}
-
-/// Wrap-mode variant. Continuation rows (`i > 0`) get a blank gutter
-/// so the number isn't repeated on every visual sub-row (plan
-/// Decision Log: Codex review alignment with delta / bat).
-#[allow(clippy::too_many_arguments)]
-fn render_diff_line_wrapped_numbered(
-    line: &crate::git::DiffLine,
-    is_selected: bool,
-    cursor_sub: Option<usize>,
-    body_width: usize,
-    hl: Option<&crate::highlight::Highlighter>,
-    file_path: Option<&std::path::Path>,
-    bg_added: Color,
-    bg_deleted: Color,
-    search_matches: &[(usize, usize, bool)],
-    line_numbers: (Option<usize>, Option<usize>),
+/// Insert a line-number gutter after the 5-cell cursor bar on every
+/// rendered visual line. The first visual row gets the supplied
+/// number span; wrap continuation rows get blanks so the number is
+/// not repeated down the screen.
+fn add_line_number_gutters(
+    lines: Vec<Line<'static>>,
+    first_gutter: Span<'static>,
     gutter: &LineNumberGutter,
 ) -> Vec<Line<'static>> {
-    let base = render_diff_line_wrapped(
-        line,
-        is_selected,
-        cursor_sub,
-        body_width,
-        hl,
-        file_path,
-        bg_added,
-        bg_deleted,
-        search_matches,
-    );
-    base.into_iter()
+    lines
+        .into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let mut spans = line.spans;
-            let bar = if spans.is_empty() {
-                Span::raw("     ")
-            } else {
-                spans.remove(0)
-            };
             let ln = if i == 0 {
-                diff_ln_span(line_numbers, gutter)
+                first_gutter.clone()
             } else {
                 gutter.blank_span()
             };
-            let mut new_spans = Vec::with_capacity(spans.len() + 2);
-            new_spans.push(bar);
-            new_spans.push(ln);
-            new_spans.extend(spans);
-            Line::from(new_spans)
-        })
-        .collect()
-}
-
-/// File-view line with a single-column line-number gutter.
-#[allow(clippy::too_many_arguments)]
-fn render_file_view_line_numbered(
-    content: &str,
-    is_cursor: bool,
-    body_width: usize,
-    base_style: Style,
-    hl: Option<&crate::highlight::Highlighter>,
-    file_path: &std::path::Path,
-    line_number: usize,
-    gutter: &LineNumberGutter,
-    show_eof_marker: bool,
-) -> Line<'static> {
-    let base = render_file_view_line(
-        content,
-        is_cursor,
-        body_width,
-        base_style,
-        hl,
-        file_path,
-        show_eof_marker,
-    );
-    let mut spans = base.spans;
-    let bar = if spans.is_empty() {
-        Span::raw("     ")
-    } else {
-        spans.remove(0)
-    };
-    let ln = file_ln_span(line_number, gutter);
-    let mut new_spans = Vec::with_capacity(spans.len() + 2);
-    new_spans.push(bar);
-    new_spans.push(ln);
-    new_spans.extend(spans);
-    Line::from(new_spans)
-}
-
-/// Wrap-mode file-view variant. Continuation rows get a blank gutter.
-#[allow(clippy::too_many_arguments)]
-fn render_file_view_line_wrapped_numbered(
-    content: &str,
-    cursor_sub: Option<usize>,
-    body_width: usize,
-    base_style: Style,
-    hl: Option<&crate::highlight::Highlighter>,
-    file_path: &std::path::Path,
-    line_number: usize,
-    gutter: &LineNumberGutter,
-    show_eof_marker: bool,
-) -> Vec<Line<'static>> {
-    let base = render_file_view_line_wrapped(
-        content,
-        cursor_sub,
-        body_width,
-        base_style,
-        hl,
-        file_path,
-        show_eof_marker,
-    );
-    base.into_iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let mut spans = line.spans;
-            let bar = if spans.is_empty() {
-                Span::raw("     ")
-            } else {
-                spans.remove(0)
-            };
-            let ln = if i == 0 {
-                file_ln_span(line_number, gutter)
-            } else {
-                gutter.blank_span()
-            };
-            let mut new_spans = Vec::with_capacity(spans.len() + 2);
-            new_spans.push(bar);
-            new_spans.push(ln);
-            new_spans.extend(spans);
-            Line::from(new_spans)
+            insert_gutter_span(line, ln, Span::raw("     "))
         })
         .collect()
 }
@@ -1315,7 +1162,38 @@ fn render_file_view_line_wrapped_numbered(
 /// Compute the line-number gutter width for a given max line number.
 /// 10 is the lower bound so tiny files stay at a stable 2 digits.
 pub(crate) fn line_number_digits(max: usize) -> usize {
-    max.max(10).to_string().len()
+    let mut n = max.max(10);
+    let mut digits = 0;
+    while n > 0 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// Resolve the effective line-number gutter: apply the
+/// extreme-narrow fallback so the caller doesn't have to. Returns
+/// `(effective_show_ln, ln_gutter_width, ln_gutter)` where
+/// `ln_gutter` uses a zero col-width when the gutter is suppressed
+/// so blank-slot helpers keep working without separate nil handling.
+fn resolve_ln_gutter(
+    show_ln: bool,
+    max_line_number: usize,
+    viewport_width: usize,
+) -> (bool, usize, LineNumberGutter) {
+    let digits = line_number_digits(max_line_number);
+    let raw_width = if show_ln {
+        LineNumberGutter::single(digits).total_width
+    } else {
+        0
+    };
+    // Fallback: if the gutter would leave < 4 cells of body width,
+    // drop it entirely so the user still gets diff content.
+    if show_ln && viewport_width >= 5 + raw_width + 4 {
+        (true, raw_width, LineNumberGutter::single(digits))
+    } else {
+        (false, 0, LineNumberGutter::single(0))
+    }
 }
 
 fn render_hunk_header(
@@ -1330,17 +1208,18 @@ fn render_hunk_header(
     // mistaken for each other.
     let seen_mark = if is_seen { "▸ " } else { "  " };
 
-    // Count added/deleted lines from the actual hunk content.
-    let added: usize = hunk
+    // Count added/deleted lines from the actual hunk content in a
+    // single pass — render_hunk_header is called once per visible
+    // hunk header and a second time for the sticky copy, so even one
+    // extra iteration compounds across large hunks.
+    let (added, deleted) = hunk
         .lines
         .iter()
-        .filter(|l| l.kind == LineKind::Added)
-        .count();
-    let deleted: usize = hunk
-        .lines
-        .iter()
-        .filter(|l| l.kind == LineKind::Deleted)
-        .count();
+        .fold((0usize, 0usize), |(a, d), l| match l.kind {
+            LineKind::Added => (a + 1, d),
+            LineKind::Deleted => (a, d + 1),
+            _ => (a, d),
+        });
     let counts = format!("+{added}/-{deleted}");
 
     // Line range: show new_start (where the change lands in the
@@ -1384,21 +1263,9 @@ fn render_hunk_header(
     // weight) so the eye can track the cursor across the
     // expanded/collapsed boundary without losing it in the Cyan
     // header body.
-    let gutter = if is_cursor {
-        Span::styled(
-            "  ▶  ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else if is_selected {
-        // Selected (but not cursor) hunk header — match the DiffLine
-        // ribbon color so the whole hunk reads as a single focused
-        // block.
-        Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
-    } else {
-        Span::raw("     ")
-    };
+    // Selected (but not cursor) hunk header matches the DiffLine
+    // ribbon color so the whole hunk reads as a focused block.
+    let gutter = cursor_bar(is_cursor, is_selected);
 
     Line::from(vec![gutter, Span::styled(label, label_style)])
 }
@@ -1420,18 +1287,7 @@ fn render_diff_line(
         LineKind::Deleted => Some(bg_deleted),
         LineKind::Context => None,
     };
-    let bar = if is_cursor {
-        Span::styled(
-            "  ▶  ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else if is_selected {
-        Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
-    } else {
-        Span::raw("     ")
-    };
+    let bar = cursor_bar(is_cursor, is_selected);
     let base_style = match (bg, is_selected) {
         (Some(b), true) => Style::default().bg(b),
         (Some(b), false) => Style::default().bg(b).add_modifier(Modifier::DIM),
@@ -1617,24 +1473,10 @@ fn render_file_view(
     let height = area.height as usize;
     let width = area.width as usize;
     // v0.5: mirror render_scroll's single-source body_width calc so
-    // FileViewVisualIndex and the numbered renderer see the same value
+    // VisualIndex::build_lines and the numbered renderer see the same value
     // (Codex review §Critical-1).
-    let mut effective_show_ln = show_line_numbers;
-    let digits = line_number_digits(fv.lines.len());
-    let mut ln_gutter_width = if effective_show_ln {
-        LineNumberGutter::single(digits).total_width
-    } else {
-        0
-    };
-    if effective_show_ln && width < 5 + ln_gutter_width + 4 {
-        effective_show_ln = false;
-        ln_gutter_width = 0;
-    }
-    let ln_gutter = if effective_show_ln {
-        LineNumberGutter::single(digits)
-    } else {
-        LineNumberGutter::single(0)
-    };
+    let (effective_show_ln, ln_gutter_width, ln_gutter) =
+        resolve_ln_gutter(show_line_numbers, fv.lines.len(), width);
     let body_width = width.saturating_sub(5 + ln_gutter_width).max(1);
     fv.last_body_width.set(body_width);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
@@ -1644,7 +1486,7 @@ fn render_file_view(
     let last_line_idx = fv.lines.len().saturating_sub(1);
     let mark_last_no_newline = !fv.last_line_has_trailing_newline;
     if wrap_lines {
-        let vi = crate::app::FileViewVisualIndex::build(&fv.lines, Some(body_width));
+        let vi = crate::app::VisualIndex::build_lines(&fv.lines, Some(body_width));
         let (mut line_idx, mut skip_remaining) = vi.logical_at(effective_top);
         while line_idx < fv.lines.len() && lines.len() < height {
             let base_style = if let Some(&bg) = fv.line_bg.get(&line_idx) {
@@ -1654,28 +1496,23 @@ fn render_file_view(
             };
             let cursor_sub = (line_idx == fv.cursor).then_some(fv.cursor_sub_row);
             let show_eof_marker = mark_last_no_newline && line_idx == last_line_idx;
+            let rendered = render_file_view_line_wrapped(
+                &fv.lines[line_idx],
+                cursor_sub,
+                body_width,
+                base_style,
+                hl,
+                &fv.path,
+                show_eof_marker,
+            );
             let rendered = if effective_show_ln {
-                render_file_view_line_wrapped_numbered(
-                    &fv.lines[line_idx],
-                    cursor_sub,
-                    body_width,
-                    base_style,
-                    hl,
-                    &fv.path,
-                    line_idx + 1,
+                add_line_number_gutters(
+                    rendered,
+                    file_ln_span(line_idx + 1, &ln_gutter),
                     &ln_gutter,
-                    show_eof_marker,
                 )
             } else {
-                render_file_view_line_wrapped(
-                    &fv.lines[line_idx],
-                    cursor_sub,
-                    body_width,
-                    base_style,
-                    hl,
-                    &fv.path,
-                    show_eof_marker,
-                )
+                rendered
             };
             let mut take = rendered.into_iter();
             for _ in 0..skip_remaining {
@@ -1704,28 +1541,24 @@ fn render_file_view(
                 Style::default()
             };
             let show_eof_marker = mark_last_no_newline && line_idx == last_line_idx;
+            let rendered = render_file_view_line(
+                &fv.lines[line_idx],
+                line_idx == fv.cursor,
+                body_width,
+                base_style,
+                hl,
+                &fv.path,
+                show_eof_marker,
+            );
             let rendered = if effective_show_ln {
-                render_file_view_line_numbered(
-                    &fv.lines[line_idx],
-                    line_idx == fv.cursor,
-                    body_width,
-                    base_style,
-                    hl,
-                    &fv.path,
-                    line_idx + 1,
+                let mut lines = add_line_number_gutters(
+                    vec![rendered],
+                    file_ln_span(line_idx + 1, &ln_gutter),
                     &ln_gutter,
-                    show_eof_marker,
-                )
+                );
+                lines.remove(0)
             } else {
-                render_file_view_line(
-                    &fv.lines[line_idx],
-                    line_idx == fv.cursor,
-                    body_width,
-                    base_style,
-                    hl,
-                    &fv.path,
-                    show_eof_marker,
-                )
+                rendered
             };
             lines.push(rendered);
         }
@@ -1750,16 +1583,7 @@ fn render_file_view_line(
     file_path: &std::path::Path,
     show_eof_marker: bool,
 ) -> Line<'static> {
-    let bar = if is_cursor {
-        Span::styled(
-            "  ▶  ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::raw("     ")
-    };
+    let bar = cursor_bar(is_cursor, false);
     // v0.5 M2: reserve 1 cell at the end when we need to paint the
     // EOF-no-newline marker. body_budget governs both content fit
     // and pad so the `∅` lands inside body_width (never overflows).
@@ -1856,18 +1680,7 @@ fn render_file_view_line_wrapped(
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
-            let bar = if cursor_line == Some(i) {
-                Span::styled(
-                    "  ▶  ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else if cursor_line.is_some() {
-                Span::styled("  ▎  ", Style::default().fg(Color::Yellow))
-            } else {
-                Span::raw("     ")
-            };
+            let bar = cursor_bar(cursor_line == Some(i), cursor_line.is_some());
 
             let is_last = i == last_idx;
             let emit_marker = show_eof_marker && is_last;
@@ -1913,781 +1726,6 @@ fn render_file_view_line_wrapped(
         .collect()
 }
 
-/// Convert a Unix epoch millisecond timestamp to a local-time
-/// `HH:MM:SS` string. Uses `libc::localtime_r` on Unix for
-/// timezone-aware conversion; falls back to UTC on other platforms.
-pub fn format_local_time(timestamp_ms: u64) -> String {
-    let epoch_secs = (timestamp_ms / 1000) as i64;
-
-    #[cfg(unix)]
-    {
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        let time_t = epoch_secs as libc::time_t;
-        unsafe { libc::localtime_r(&time_t, &mut tm) };
-        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let secs = epoch_secs as u64;
-        let hours = (secs / 3600) % 24;
-        let mins = (secs / 60) % 60;
-        let s = secs % 60;
-        format!("{hours:02}:{mins:02}:{s:02}")
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FooterDensity {
-    Full,
-    Compact,
-    Minimal,
-}
-
-fn spans_display_width(spans: &[Span<'static>]) -> usize {
-    use unicode_width::UnicodeWidthStr;
-    spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum()
-}
-
-fn truncate_display(s: &str, max_width: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-    if max_width == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    if max_width == 1 {
-        return "…".to_string();
-    }
-
-    let mut out = String::new();
-    let mut used = 0usize;
-    let limit = max_width - 1;
-    for ch in s.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > limit {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
-}
-
-fn choose_footer_variant(candidates: Vec<Vec<Span<'static>>>, width: u16) -> Vec<Span<'static>> {
-    let width = width as usize;
-    let mut candidates = candidates.into_iter();
-    let Some(mut fallback) = candidates.next() else {
-        return Vec::new();
-    };
-    if spans_display_width(&fallback) <= width {
-        return fallback;
-    }
-    for candidate in candidates {
-        if spans_display_width(&candidate) <= width {
-            return candidate;
-        }
-        fallback = candidate;
-    }
-    fallback
-}
-
-fn key_label(ch: char) -> String {
-    if ch == ' ' {
-        "Space".to_string()
-    } else {
-        ch.to_string()
-    }
-}
-
-fn sep_span(dim: Style) -> Span<'static> {
-    Span::styled(" │ ", dim)
-}
-
-fn slash_span(dim: Style) -> Span<'static> {
-    Span::styled(" / ", dim)
-}
-
-fn footer_mode(app: &App) -> (&'static str, Color) {
-    if app.picker.is_some() {
-        ("[picker]", Color::Magenta)
-    } else if app.scar_comment.is_some() {
-        ("[scar]", Color::Magenta)
-    } else if app.revert_confirm.is_some() {
-        ("[revert?]", Color::Red)
-    } else if app.search_input.is_some() {
-        ("[search]", Color::Yellow)
-    } else if app.file_view.is_some() {
-        ("[file view]", Color::Cyan)
-    } else if app.view_mode == crate::app::ViewMode::Stream {
-        ("[stream]", Color::Blue)
-    } else if app.follow_mode {
-        ("[follow]", Color::Green)
-    } else {
-        ("[manual]", Color::Yellow)
-    }
-}
-
-fn push_mode(spans: &mut Vec<Span<'static>>, app: &App, bold: Modifier) {
-    let (mode_text, mode_color) = footer_mode(app);
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        mode_text,
-        Style::default().fg(mode_color).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-}
-
-fn line_numbers_label(app: &App) -> &'static str {
-    if app.view_mode == crate::app::ViewMode::Stream {
-        "nums off"
-    } else if app.show_line_numbers {
-        "nums on"
-    } else {
-        "nums off"
-    }
-}
-
-fn line_numbers_style(app: &App, dim: Style, bold: Modifier) -> Style {
-    if app.view_mode == crate::app::ViewMode::Stream {
-        dim
-    } else if app.show_line_numbers {
-        Style::default().fg(Color::Cyan).add_modifier(bold)
-    } else {
-        Style::default().fg(Color::Cyan)
-    }
-}
-
-fn wrap_label(app: &App) -> &'static str {
-    if app.wrap_lines { "wrap" } else { "nowrap" }
-}
-
-fn push_line_numbers_full(spans: &mut Vec<Span<'static>>, app: &App, dim: Style, bold: Modifier) {
-    spans.push(sep_span(dim));
-    spans.push(Span::styled(
-        line_numbers_label(app),
-        line_numbers_style(app, dim, bold),
-    ));
-}
-
-fn push_compact_toggles(
-    spans: &mut Vec<Span<'static>>,
-    app: &App,
-    dim: Style,
-    bold: Modifier,
-    include_picker: bool,
-) {
-    spans.push(Span::styled(
-        app.cursor_placement.label(),
-        Style::default().fg(Color::Cyan).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        wrap_label(app),
-        Style::default().fg(Color::Cyan).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        line_numbers_label(app),
-        line_numbers_style(app, dim, bold),
-    ));
-    if include_picker {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("? help", Style::default().fg(Color::Magenta)));
-    }
-}
-
-fn session_counts(app: &App) -> (usize, usize, usize) {
-    let added: usize = app.files.iter().map(|f| f.added).sum();
-    let deleted: usize = app.files.iter().map(|f| f.deleted).sum();
-    (added, deleted, app.files.len())
-}
-
-fn push_session_full(spans: &mut Vec<Span<'static>>, app: &App, dim: Style, bold: Modifier) {
-    let (session_added, session_deleted, files_len) = session_counts(app);
-    spans.push(sep_span(dim));
-    spans.push(Span::styled("session", dim));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("+{session_added}"),
-        Style::default().fg(Color::Green).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("-{session_deleted}"),
-        Style::default().fg(Color::Red).add_modifier(bold),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("{files_len} files"),
-        Style::default().fg(Color::Cyan),
-    ));
-    if app.head_dirty {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            "HEAD*",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-}
-
-fn push_session_compact(spans: &mut Vec<Span<'static>>, app: &App) {
-    let (session_added, session_deleted, files_len) = session_counts(app);
-    spans.push(Span::raw(format!(
-        "+{session_added}/-{session_deleted} {files_len}f"
-    )));
-    if app.head_dirty {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            "HEAD*",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-}
-
-fn current_path_and_color(app: &App) -> (String, Color) {
-    let current_path = app
-        .current_file_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "--".to_string());
-    let path_color = app
-        .current_file_idx()
-        .and_then(|i| app.files.get(i))
-        .map(|f| match f.status {
-            FileStatus::Modified => Color::Cyan,
-            FileStatus::Added => Color::Green,
-            FileStatus::Deleted => Color::Red,
-            FileStatus::Untracked => Color::Yellow,
-        })
-        .unwrap_or(Color::Reset);
-    (current_path, path_color)
-}
-
-fn push_diagnostics(
-    spans: &mut Vec<Span<'static>>,
-    app: &App,
-    density: FooterDensity,
-    dim: Style,
-    bold: Modifier,
-) {
-    if let Some(msg) = app.watcher_health.summary() {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled(
-            "⚠ WATCHER",
-            Style::default().fg(Color::Red).add_modifier(bold),
-        ));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            let msg = if density == FooterDensity::Full {
-                msg
-            } else {
-                truncate_display(&msg, 28)
-            };
-            spans.push(Span::styled(msg, Style::default().fg(Color::Red)));
-        }
-    }
-
-    if let Some(msg) = &app.input_health {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled(
-            "⚠ INPUT",
-            Style::default().fg(Color::Red).add_modifier(bold),
-        ));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            let msg = if density == FooterDensity::Full {
-                msg.clone()
-            } else {
-                truncate_display(msg, 28)
-            };
-            spans.push(Span::styled(msg, Style::default().fg(Color::Red)));
-        }
-    }
-
-    if let Some(err) = &app.last_error {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled(
-            "×",
-            Style::default().fg(Color::Red).add_modifier(bold),
-        ));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            let err = if density == FooterDensity::Full {
-                err.clone()
-            } else {
-                truncate_display(err, 28)
-            };
-            spans.push(Span::styled(err, Style::default().fg(Color::Red)));
-        }
-    }
-}
-
-fn build_footer_spans(
-    app: &App,
-    density: FooterDensity,
-    dim: Style,
-    bold: Modifier,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    push_mode(&mut spans, app, bold);
-
-    if app.picker.is_some() {
-        spans.push(sep_span(dim));
-        match density {
-            FooterDensity::Full => {
-                spans.push(Span::styled(
-                    "type to filter",
-                    Style::default().fg(Color::Yellow),
-                ));
-                spans.push(slash_span(dim));
-                spans.push(Span::styled(
-                    "↑↓ Ctrl-n/p",
-                    Style::default().fg(Color::Cyan),
-                ));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("move", dim));
-                spans.push(slash_span(dim));
-                spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("jump", dim));
-                spans.push(slash_span(dim));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("cancel", dim));
-            }
-            FooterDensity::Compact => {
-                spans.push(Span::styled("filter", Style::default().fg(Color::Yellow)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-                spans.push(Span::styled("/Esc", dim));
-            }
-            FooterDensity::Minimal => {
-                spans.push(Span::styled("filter", Style::default().fg(Color::Yellow)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-            }
-        }
-    } else if let Some(fv) = app.file_view.as_ref() {
-        match density {
-            FooterDensity::Full => {
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    wrap_label(app),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-                push_line_numbers_full(&mut spans, app, dim, bold);
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    fv.path.display().to_string(),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-                spans.push(Span::styled(
-                    format!(" [{}/{}]", fv.cursor + 1, fv.lines.len()),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                spans.push(sep_span(dim));
-                spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-                spans.push(Span::styled("/", dim));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("back", dim));
-            }
-            FooterDensity::Compact => {
-                spans.push(sep_span(dim));
-                push_compact_toggles(&mut spans, app, dim, bold, false);
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    truncate_display(&fv.path.display().to_string(), 18),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-                spans.push(Span::raw(format!(" {}/{}", fv.cursor + 1, fv.lines.len())));
-                spans.push(sep_span(dim));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("back", dim));
-            }
-            FooterDensity::Minimal => {
-                spans.push(sep_span(dim));
-                spans.push(Span::raw(format!("{}/{}", fv.cursor + 1, fv.lines.len())));
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    wrap_label(app),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    line_numbers_label(app),
-                    line_numbers_style(app, dim, bold),
-                ));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-            }
-        }
-    } else if app.search_input.is_some() {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("find", dim));
-        if density != FooterDensity::Minimal {
-            spans.push(slash_span(dim));
-        } else {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled("cancel", dim));
-        }
-    } else if let Some(state) = app.revert_confirm.as_ref() {
-        spans.push(sep_span(dim));
-        match density {
-            FooterDensity::Full => spans.push(Span::styled(
-                format!("revert hunk in {} ?", state.file_path.display()),
-                Style::default().fg(Color::Red).add_modifier(bold),
-            )),
-            FooterDensity::Compact => spans.push(Span::styled(
-                format!(
-                    "revert {} ?",
-                    truncate_display(&state.file_path.display().to_string(), 24)
-                ),
-                Style::default().fg(Color::Red).add_modifier(bold),
-            )),
-            FooterDensity::Minimal => spans.push(Span::styled(
-                "revert ?",
-                Style::default().fg(Color::Red).add_modifier(bold),
-            )),
-        }
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("(y/N)", Style::default().fg(Color::Yellow)));
-    } else if app.scar_comment.is_some() {
-        spans.push(sep_span(dim));
-        spans.push(Span::styled("Enter", Style::default().fg(Color::Green)));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("save", dim));
-        if density != FooterDensity::Minimal {
-            spans.push(slash_span(dim));
-        } else {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled("Esc", Style::default().fg(Color::Red)));
-        if density != FooterDensity::Minimal {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled("cancel", dim));
-        }
-    } else {
-        let (current_path, path_color) = current_path_and_color(app);
-        match density {
-            FooterDensity::Full => {
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    current_path,
-                    Style::default().fg(path_color).add_modifier(bold),
-                ));
-                push_session_full(&mut spans, app, dim, bold);
-
-                if let Some(state) = app.search.as_ref() {
-                    spans.push(sep_span(dim));
-                    spans.push(Span::styled(
-                        format!("/{}", state.query),
-                        Style::default().fg(Color::Yellow).add_modifier(bold),
-                    ));
-                    spans.push(Span::raw(" "));
-                    let position = if state.matches.is_empty() {
-                        "[0/0]".to_string()
-                    } else {
-                        format!("[{}/{}]", state.current + 1, state.matches.len())
-                    };
-                    spans.push(Span::styled(position, Style::default().fg(Color::DarkGray)));
-                }
-
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    app.cursor_placement.label(),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    wrap_label(app),
-                    Style::default().fg(Color::Cyan).add_modifier(bold),
-                ));
-
-                push_line_numbers_full(&mut spans, app, dim, bold);
-
-                spans.push(sep_span(dim));
-                spans.push(Span::styled("? help", Style::default().fg(Color::Magenta)));
-            }
-            FooterDensity::Compact => {
-                spans.push(sep_span(dim));
-                spans.push(Span::styled(
-                    truncate_display(&current_path, 18),
-                    Style::default().fg(path_color).add_modifier(bold),
-                ));
-                spans.push(sep_span(dim));
-                push_session_compact(&mut spans, app);
-                if let Some(state) = app.search.as_ref() {
-                    spans.push(sep_span(dim));
-                    spans.push(Span::styled(
-                        truncate_display(&format!("/{}", state.query), 16),
-                        Style::default().fg(Color::Yellow).add_modifier(bold),
-                    ));
-                    spans.push(Span::raw(" "));
-                    let position = if state.matches.is_empty() {
-                        "[0/0]".to_string()
-                    } else {
-                        format!("[{}/{}]", state.current + 1, state.matches.len())
-                    };
-                    spans.push(Span::styled(position, Style::default().fg(Color::DarkGray)));
-                }
-                spans.push(sep_span(dim));
-                push_compact_toggles(&mut spans, app, dim, bold, true);
-            }
-            FooterDensity::Minimal => {
-                spans.push(sep_span(dim));
-                push_session_compact(&mut spans, app);
-                if let Some(state) = app.search.as_ref() {
-                    spans.push(Span::raw(" "));
-                    let position = if state.matches.is_empty() {
-                        "[0/0]".to_string()
-                    } else {
-                        format!("[{}/{}]", state.current + 1, state.matches.len())
-                    };
-                    spans.push(Span::styled(position, Style::default().fg(Color::DarkGray)));
-                }
-                spans.push(sep_span(dim));
-                push_compact_toggles(&mut spans, app, dim, bold, true);
-            }
-        }
-    }
-
-    push_diagnostics(&mut spans, app, density, dim, bold);
-    spans
-}
-
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let dim = Style::default().fg(Color::DarkGray);
-    let bold = Modifier::BOLD;
-    let spans = choose_footer_variant(
-        vec![
-            build_footer_spans(app, FooterDensity::Full, dim, bold),
-            build_footer_spans(app, FooterDensity::Compact, dim, bold),
-            build_footer_spans(app, FooterDensity::Minimal, dim, bold),
-        ],
-        area.width,
-    );
-    let line = Line::from(spans);
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-fn help_section(title: &'static str) -> Line<'static> {
-    Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    ))
-}
-
-fn help_row(key: impl Into<String>, description: impl Into<String>) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{:<14}", key.into()),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(description.into()),
-    ])
-}
-
-fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let popup_area = centered_rect(72, 72, area);
-    frame.render_widget(Clear, popup_area);
-
-    let block = Block::default().borders(Borders::ALL).title(" Help ");
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-
-    let k = &app.config.keys;
-    let columns =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
-
-    let left = vec![
-        help_section("Navigation"),
-        help_row("j / ↓", "next change"),
-        help_row("k / ↑", "previous change"),
-        help_row("J / K", "move one visual row"),
-        help_row("h / l", "previous / next hunk"),
-        help_row("g / G", "top / bottom"),
-        help_row("Ctrl-d/u", "half-page down / up"),
-        Line::raw(""),
-        help_section("Review"),
-        help_row(key_label(k.ask), "ask scar"),
-        help_row(key_label(k.reject), "reject scar"),
-        help_row(key_label(k.comment), "free comment scar"),
-        help_row(key_label(k.revert), "revert hunk"),
-        help_row(key_label(k.seen), "seen / fold hunk"),
-        help_row(key_label(k.undo), "undo scar"),
-        help_row(key_label(k.editor), "open editor"),
-    ];
-
-    let right = vec![
-        help_section("Views"),
-        help_row("Enter", "file view / back"),
-        help_row("Tab", "stream / diff"),
-        help_row(key_label(k.follow), "follow latest"),
-        help_row(key_label(k.picker), "picker"),
-        help_row(key_label(k.cursor_placement), "center / top cursor"),
-        help_row(key_label(k.wrap_toggle), "wrap"),
-        help_row(key_label(k.line_numbers_toggle), "line numbers"),
-        Line::raw(""),
-        help_section("Search"),
-        help_row(key_label(k.search), "search"),
-        help_row(key_label(k.search_next), "next match"),
-        help_row(key_label(k.search_prev), "previous match"),
-        Line::raw(""),
-        help_section("Other"),
-        help_row("? / Esc", "close help"),
-        help_row("q", "quit"),
-    ];
-
-    frame.render_widget(Paragraph::new(left).wrap(Wrap { trim: false }), columns[0]);
-    frame.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), columns[1]);
-}
-
-/// Pad or truncate `s` so its display width (cells) equals exactly
-/// `target`. Truncation is rune-aware via `unicode-width` so CJK
-/// filenames do not land mid-codepoint or overflow by one cell.
-fn pad_or_truncate_display(s: &str, target: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    let w = UnicodeWidthStr::width(s);
-    if w <= target {
-        let pad = target - w;
-        let mut out = String::with_capacity(s.len() + pad);
-        out.push_str(s);
-        for _ in 0..pad {
-            out.push(' ');
-        }
-        return out;
-    }
-    // Truncate, reserving 1 cell for an ellipsis when it fits.
-    let keep = target.saturating_sub(1);
-    let mut acc = 0usize;
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if acc + cw > keep {
-            break;
-        }
-        acc += cw;
-        out.push(ch);
-    }
-    // Add the ellipsis marker + a trailing space when target - acc >= 1.
-    if target > acc {
-        out.push('…');
-        acc += 1;
-    }
-    while acc < target {
-        out.push(' ');
-        acc += 1;
-    }
-    out
-}
-
-fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let popup_area = centered_rect(60, 60, area);
-    let Some(picker) = &app.picker else { return };
-    let results = app.picker_results();
-
-    // Wipe whatever was beneath the popup so the underlying scroll view
-    // doesn't bleed through translucent rows.
-    frame.render_widget(Clear, popup_area);
-
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        " Files {}/{} ",
-        results.len(),
-        app.files.len()
-    ));
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-
-    // Inside the block, top row is the query line; the rest is the file list.
-    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-    let query_area = chunks[0];
-    let list_area = chunks[1];
-
-    let query_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Yellow)),
-        Span::raw(picker.query.clone()),
-    ]);
-    frame.render_widget(Paragraph::new(query_line), query_area);
-
-    // Reserve a fixed right-hand slot for `HH:MM` + `+N -M` so the
-    // minute column is never clipped by a long path. The selection
-    // gutter (2 cells) sits left of the path, so the usable width
-    // inside `list_area` is `width - 2`. The path takes the rest.
-    let list_width = list_area.width as usize;
-    const MTIME_WIDTH: usize = 5; // "HH:MM"
-    const COUNTS_WIDTH: usize = 10; // "+NNN -MMM" fits comfortably
-    const GAP: usize = 1;
-    const GUTTER: usize = 2; // space for "▸ "
-    let reserved = MTIME_WIDTH + GAP + COUNTS_WIDTH + GAP;
-    let path_width = list_width.saturating_sub(reserved + GUTTER).max(10);
-
-    let items: Vec<ListItem<'_>> = results
-        .iter()
-        .map(|&file_idx| {
-            let file = &app.files[file_idx];
-            let path_color = match file.status {
-                FileStatus::Modified => Color::Cyan,
-                FileStatus::Added => Color::Green,
-                FileStatus::Deleted => Color::Red,
-                FileStatus::Untracked => Color::Yellow,
-            };
-            let counts = match &file.content {
-                DiffContent::Binary => "bin".to_string(),
-                DiffContent::Text(_) => format!("+{} -{}", file.added, file.deleted),
-            };
-            let mtime = format_mtime(file.mtime);
-            // Pad path to `path_width` using unicode-width so CJK
-            // filenames stay aligned. Truncate from the right if the
-            // name overflows the column so the right-hand mtime/counts
-            // columns are never pushed off-screen.
-            let path_str = file.path.display().to_string();
-            let padded_path = pad_or_truncate_display(&path_str, path_width);
-            // Right-pad counts to a fixed width so the mtime column
-            // lands at a stable offset even when +/- counts vary.
-            let padded_counts = format!("{counts:>width$}", width = COUNTS_WIDTH);
-            ListItem::new(Line::from(vec![
-                Span::styled(padded_path, Style::default().fg(path_color)),
-                Span::raw(" "),
-                Span::styled(mtime, Style::default().fg(Color::DarkGray)),
-                Span::raw(" "),
-                Span::raw(padded_counts),
-            ]))
-        })
-        .collect();
-
-    let list = List::new(items)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▸ ");
-    let mut state = ListState::default();
-    if !results.is_empty() {
-        state.select(Some(picker.cursor.min(results.len() - 1)));
-    }
-    frame.render_stateful_widget(list, list_area, &mut state);
-}
-
 fn centered_line(area: Rect) -> Rect {
     let row = area.y + area.height / 2;
     Rect {
@@ -2698,173 +1736,74 @@ fn centered_line(area: Rect) -> Rect {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_width = area.width.saturating_mul(percent_x) / 100;
-    let popup_height = area.height.saturating_mul(percent_y) / 100;
-    Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{PickerState, ScrollLayout};
+    use crate::app::PickerState;
     use crate::git::{DiffContent, DiffLine, FileDiff, FileStatus, Hunk, LineKind};
+    use crate::test_support::{
+        added_hunk, added_hunk_app, app_with_file, app_with_files, app_with_hunks,
+        binary_file as timed_binary_file, diff_line, file_view_state, hunk, install_search,
+        make_file, numbered_added_lines, prefixed_diff_lines, single_added_app, single_added_file,
+        single_added_hunk_file, single_hunk_app,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime};
 
-    fn diff_line(kind: LineKind, content: &str) -> DiffLine {
-        DiffLine {
-            kind,
-            content: content.to_string(),
-            has_trailing_newline: true,
-        }
-    }
-
-    fn hunk(old_start: usize, lines: Vec<DiffLine>) -> Hunk {
-        let added = lines.iter().filter(|l| l.kind == LineKind::Added).count();
-        let deleted = lines.iter().filter(|l| l.kind == LineKind::Deleted).count();
-        Hunk {
-            old_start,
-            old_count: deleted,
-            new_start: old_start,
-            new_count: added,
-            lines,
-            context: None,
-        }
-    }
-
-    fn make_file(name: &str, hunks: Vec<Hunk>, secs: u64) -> FileDiff {
-        let added: usize = hunks
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .filter(|l| l.kind == LineKind::Added)
-            .count();
-        let deleted: usize = hunks
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .filter(|l| l.kind == LineKind::Deleted)
-            .count();
-        FileDiff {
-            path: PathBuf::from(name),
-            status: FileStatus::Modified,
-            added,
-            deleted,
-            content: DiffContent::Text(hunks),
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-            header_prefix: None,
-        }
-    }
-
-    fn binary_file(name: &str) -> FileDiff {
-        FileDiff {
-            path: PathBuf::from(name),
-            status: FileStatus::Modified,
-            added: 0,
-            deleted: 0,
-            content: DiffContent::Binary,
-            mtime: SystemTime::UNIX_EPOCH,
-            header_prefix: None,
-        }
-    }
-
-    fn fake_app() -> App {
-        App {
-            root: PathBuf::from("/tmp/fake"),
-            git_dir: PathBuf::from("/tmp/fake/.git"),
-            common_git_dir: PathBuf::from("/tmp/fake/.git"),
-            current_branch_ref: Some("refs/heads/main".into()),
-            baseline_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
-            files: Vec::new(),
-            layout: ScrollLayout::default(),
-            scroll: 0,
-            cursor_sub_row: 0,
-            cursor_placement: crate::app::CursorPlacement::Centered,
-            anchor: None,
-            help_overlay: false,
-            picker: None,
-            scar_comment: None,
-            revert_confirm: None,
-            file_view: None,
-            search_input: None,
-            search: None,
-            seen_hunks: std::collections::BTreeMap::new(),
-            follow_mode: true,
-            last_error: None,
-            input_health: None,
-            head_dirty: false,
-            should_quit: false,
-            last_body_height: std::cell::Cell::new(24),
-            last_body_width: std::cell::Cell::new(None),
-            visual_top: std::cell::Cell::new(0.0),
-            anim: None,
-            wrap_lines: false,
-            show_line_numbers: false,
-            watcher_health: crate::app::WatcherHealth::default(),
-            highlighter: std::cell::OnceCell::new(),
-            config: crate::config::KizuConfig::default(),
-            view_mode: crate::app::ViewMode::default(),
-            saved_diff_scroll: 0,
-            saved_stream_scroll: 0,
-            stream_events: Vec::new(),
-            processed_event_paths: std::collections::HashSet::new(),
-            session_start_ms: 0,
-            bound_session_id: None,
-            diff_snapshots: crate::app::DiffSnapshots::default(),
-            scar_undo_stack: Vec::new(),
-            scar_focus: None,
-            pinned_cursor_y: None,
-        }
-    }
-
-    fn populated_app(files: Vec<FileDiff>) -> App {
-        let mut app = fake_app();
-        app.files = files;
-        // Match recompute_diff: mtime ascending (oldest first, newest last).
-        app.files.sort_by_key(|a| a.mtime);
-        // Replicate the bootstrap path without touching the real filesystem.
-        app.build_layout();
-        app.refresh_anchor();
-        app
-    }
-
-    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+    fn render_buffer(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| render(f, app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+        let buffer = render_buffer(app, w, h);
         let mut out = String::new();
         for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                out.push_str(buffer[(x, y)].symbol());
-            }
+            out.push_str(&buffer_row_text(&buffer, y));
             out.push('\n');
         }
         out
     }
 
     fn render_footer_text(app: &App, w: u16, h: u16) -> String {
-        let backend = TestBackend::new(w, h);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
-        let footer_y = buffer.area().height - 1;
+        let buffer = render_buffer(app, w, h);
+        buffer_row_text(&buffer, buffer.area().height - 1)
+    }
+
+    fn buffer_row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
         let mut out = String::new();
         for x in 0..buffer.area().width {
-            out.push_str(buffer[(x, footer_y)].symbol());
+            out.push_str(buffer[(x, y)].symbol());
         }
         out
     }
 
+    fn first_cell_matching<F>(buffer: &ratatui::buffer::Buffer, f: F) -> Option<(u16, u16)>
+    where
+        F: Fn(&ratatui::buffer::Cell) -> bool,
+    {
+        for y in 0..buffer.area().height {
+            for x in 0..buffer.area().width {
+                if f(&buffer[(x, y)]) {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    fn buffer_has_cell<F>(buffer: &ratatui::buffer::Buffer, f: F) -> bool
+    where
+        F: Fn(&ratatui::buffer::Cell) -> bool,
+    {
+        first_cell_matching(buffer, f).is_some()
+    }
+
     #[test]
     fn render_empty_state_when_no_files() {
-        let app = fake_app();
+        let app = app_with_files(Vec::new());
         let view = render_to_string(&app, 70, 6);
         assert!(
             view.contains("No changes since baseline (baseline: abcdef1)"),
@@ -2879,19 +1818,23 @@ mod tests {
     fn render_diff_line_numbered_inserts_line_number_span_after_bar() {
         let line = diff_line(LineKind::Context, "hello");
         let gutter = LineNumberGutter::single(2);
-        let rendered = render_diff_line_numbered(
+        let base = render_diff_line(
             &line,
-            /*is_selected*/ false,
-            /*is_cursor*/ false,
-            /*body_width*/ 40,
+            false,
+            false,
+            40,
             None,
             None,
             Color::Reset,
             Color::Reset,
             &[],
-            (Some(10), Some(10)),
+        );
+        let mut rendered = add_line_number_gutters(
+            vec![base],
+            diff_ln_span((Some(10), Some(10)), &gutter),
             &gutter,
         );
+        let rendered = rendered.remove(0);
         // span 0: 5-cell cursor bar
         // span 1: " 10 " single-column line-number gutter
         // span 2..: body
@@ -2913,7 +1856,7 @@ mod tests {
     fn render_diff_line_numbered_added_row_shows_new_side() {
         let line = diff_line(LineKind::Added, "x");
         let gutter = LineNumberGutter::single(2);
-        let rendered = render_diff_line_numbered(
+        let base = render_diff_line(
             &line,
             false,
             false,
@@ -2923,9 +1866,10 @@ mod tests {
             Color::Reset,
             Color::Reset,
             &[],
-            (None, Some(11)),
-            &gutter,
         );
+        let mut rendered =
+            add_line_number_gutters(vec![base], diff_ln_span((None, Some(11)), &gutter), &gutter);
+        let rendered = rendered.remove(0);
         let ln = rendered.spans[1].content.as_ref();
         // Single column shows the new-side line number.
         assert!(ln.contains("11"), "Added row must show new number: {ln:?}");
@@ -2939,7 +1883,7 @@ mod tests {
         // See `diff_ln_span` docstring for the intuition / reasoning.
         let line = diff_line(LineKind::Deleted, "y");
         let gutter = LineNumberGutter::single(2);
-        let rendered = render_diff_line_numbered(
+        let base = render_diff_line(
             &line,
             false,
             false,
@@ -2949,9 +1893,10 @@ mod tests {
             Color::Reset,
             Color::Reset,
             &[],
-            (Some(12), None),
-            &gutter,
         );
+        let mut rendered =
+            add_line_number_gutters(vec![base], diff_ln_span((Some(12), None), &gutter), &gutter);
+        let rendered = rendered.remove(0);
         let ln = rendered.spans[1].content.as_ref();
         assert!(
             ln.chars().all(|c| c == ' '),
@@ -2966,19 +1911,19 @@ mod tests {
         // body_width=4. Continuation rows must not repeat the number.
         let line = diff_line(LineKind::Context, "aaaaaaaaaa");
         let gutter = LineNumberGutter::single(2);
-        let rendered = render_diff_line_wrapped_numbered(
+        let base = render_diff_line_wrapped(
             &line,
             false,
             Some(0),
-            /*body_width*/ 4,
+            4,
             None,
             None,
             Color::Reset,
             Color::Reset,
             &[],
-            (Some(10), Some(10)),
-            &gutter,
         );
+        let rendered =
+            add_line_number_gutters(base, diff_ln_span((Some(10), Some(10)), &gutter), &gutter);
         assert!(rendered.len() >= 2, "content must wrap into 2+ rows");
         // First row has numbers.
         let first_ln = rendered[0].spans[1].content.as_ref();
@@ -2998,17 +1943,17 @@ mod tests {
     #[test]
     fn render_file_view_line_numbered_shows_single_column() {
         let gutter = LineNumberGutter::single(3);
-        let rendered = render_file_view_line_numbered(
+        let base = render_file_view_line(
             "hello world",
             false,
             40,
             Style::default(),
             None,
             std::path::Path::new("foo.rs"),
-            42,
-            &gutter,
             false,
         );
+        let mut rendered = add_line_number_gutters(vec![base], file_ln_span(42, &gutter), &gutter);
+        let rendered = rendered.remove(0);
         assert!(rendered.spans.len() >= 3);
         let ln = rendered.spans[1].content.as_ref();
         assert!(ln.contains("42"), "file-view gutter: {ln:?}");
@@ -3018,17 +1963,16 @@ mod tests {
     #[test]
     fn render_file_view_line_wrapped_numbered_blanks_continuation() {
         let gutter = LineNumberGutter::single(3);
-        let rendered = render_file_view_line_wrapped_numbered(
+        let base = render_file_view_line_wrapped(
             "aaaaaaaaaa",
             Some(0),
             /*body_width*/ 4,
             Style::default(),
             None,
             std::path::Path::new("foo.rs"),
-            42,
-            &gutter,
             false,
         );
+        let rendered = add_line_number_gutters(base, file_ln_span(42, &gutter), &gutter);
         assert!(rendered.len() >= 2);
         let cont_ln = rendered[1].spans[1].content.as_ref();
         assert!(
@@ -3045,26 +1989,19 @@ mod tests {
         // an explicit fix the pinned header sits 4 cells left of the
         // scrolling DiffLine bodies whenever LN is on and the cursor
         // is deep enough inside a hunk to activate stickiness.
-        let mut app = populated_app(vec![make_file(
+        let mut app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                10,
-                // Enough DiffLines that the cursor will scroll past
-                // the hunk header and stickiness kicks in.
-                (0..30)
-                    .map(|i| diff_line(LineKind::Context, &format!("line {i}")))
-                    .collect(),
-            )],
+            10,
+            // Enough DiffLines that the cursor will scroll past
+            // the hunk header and stickiness kicks in.
+            prefixed_diff_lines(LineKind::Context, "line ", 30),
             100,
-        )]);
+        );
         app.show_line_numbers = true;
         app.build_layout();
         // Move cursor deep into the hunk so the header becomes sticky.
         app.scroll = 20;
-        let backend = TestBackend::new(80, 10);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 10);
 
         // Sticky header lives at y=0. Its `@@` must share its x with
         // the DiffLine `line` bodies below.
@@ -3107,44 +2044,25 @@ mod tests {
         // first body glyph must match between LN OFF and LN ON —
         // turning the gutter on shifts *both* by the same amount.
         let make_app = |show_ln: bool| {
-            let mut app = populated_app(vec![make_file(
+            let mut app = single_hunk_app(
                 "src/foo.rs",
-                vec![hunk(
-                    10,
-                    vec![
-                        diff_line(LineKind::Context, "fn ok()"),
-                        diff_line(LineKind::Added, "x"),
-                    ],
-                )],
+                10,
+                vec![
+                    diff_line(LineKind::Context, "fn ok()"),
+                    diff_line(LineKind::Added, "x"),
+                ],
                 100,
-            )]);
+            );
             app.show_line_numbers = show_ln;
             app.build_layout();
             app
         };
         let probe = |app: &App| -> (usize, usize) {
-            let backend = TestBackend::new(80, 12);
-            let mut terminal = Terminal::new(backend).expect("terminal");
-            terminal.draw(|f| render(f, app)).expect("draw");
-            let buffer = terminal.backend().buffer().clone();
-            let mut header_x: Option<usize> = None;
-            let mut body_x: Option<usize> = None;
-            for y in 0..buffer.area().height {
-                let row: String = (0..buffer.area().width)
-                    .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect();
-                if header_x.is_none()
-                    && let Some(col) = row.find("@@")
-                {
-                    header_x = Some(col);
-                }
-                if body_x.is_none()
-                    && let Some(col) = row.find("fn ok()")
-                {
-                    body_x = Some(col);
-                }
-            }
-            (header_x.expect("@@"), body_x.expect("fn ok()"))
+            let buffer = render_buffer(app, 80, 12);
+            (
+                first_text_run(&buffer, "@@").0 as usize,
+                first_text_run(&buffer, "fn ok()").0 as usize,
+            )
         };
         let (off_h, off_b) = probe(&make_app(false));
         let (on_h, on_b) = probe(&make_app(true));
@@ -3165,17 +2083,15 @@ mod tests {
         // v0.5 end-to-end: `show_line_numbers=true` must put a
         // right-aligned worktree line number in the gutter of every
         // Context / Added row.
-        let mut app = populated_app(vec![make_file(
+        let mut app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Context, "fn ok()"),
-                    diff_line(LineKind::Added, "let x = 1;"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Context, "fn ok()"),
+                diff_line(LineKind::Added, "let x = 1;"),
+            ],
             100,
-        )]);
+        );
         app.show_line_numbers = true;
         app.build_layout();
         let view = render_to_string(&app, 80, 12);
@@ -3193,14 +2109,7 @@ mod tests {
         // Codex review §Critical-2: Stream mode FileDiffs carry
         // synthetic old_start/new_start values that are not real file
         // line numbers. The renderer must suppress the gutter.
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(
-                100, // new_start=100 so any LN artifact would be visible
-                vec![diff_line(LineKind::Added, "x")],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("src/foo.rs", 100, &["x"], 100);
         app.show_line_numbers = true;
         app.view_mode = crate::app::ViewMode::Stream;
         app.build_layout();
@@ -3221,11 +2130,7 @@ mod tests {
         // + gutter + 4 (min body) cannot fit, the renderer must
         // silently fall back to the no-gutter layout so the user
         // still sees diff content.
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(10, vec![diff_line(LineKind::Added, "xyz")])],
-            100,
-        )]);
+        let mut app = app_with_file(single_added_hunk_file("src/foo.rs", 10, "xyz", 100));
         app.show_line_numbers = true;
         app.build_layout();
         // Width 9 is too small: 5 + 9 (gutter) + 4 > 9. Fallback
@@ -3253,18 +2158,16 @@ mod tests {
 
     #[test]
     fn render_scroll_shows_file_header_hunk_header_and_diff_line() {
-        let app = populated_app(vec![make_file(
+        let app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Context, "fn ok()"),
-                    diff_line(LineKind::Added, "let x = 1;"),
-                    diff_line(LineKind::Deleted, "let y = 2;"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Context, "fn ok()"),
+                diff_line(LineKind::Added, "let x = 1;"),
+                diff_line(LineKind::Deleted, "let y = 2;"),
+            ],
             100,
-        )]);
+        );
         let view = render_to_string(&app, 80, 12);
         assert!(view.contains("src/foo.rs"), "missing file header:\n{view}");
         // New hunk header format: @@ L<range> +N/-M
@@ -3290,35 +2193,23 @@ mod tests {
         // identified purely by their background color. We assert that
         // (a) the body text carries a green or red `bg` Style and
         // (b) no literal `+`/`-` prefix cell appears on the row body.
-        let app = populated_app(vec![make_file(
+        let app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "x"),
-                    diff_line(LineKind::Deleted, "y"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "x"),
+                diff_line(LineKind::Deleted, "y"),
+            ],
             100,
-        )]);
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        );
+        let buffer = render_buffer(&app, 80, 12);
 
-        let mut found_added_bg = false;
-        let mut found_deleted_bg = false;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "x" && cell.style().bg == Some(BG_ADDED) {
-                    found_added_bg = true;
-                }
-                if cell.symbol() == "y" && cell.style().bg == Some(BG_DELETED) {
-                    found_deleted_bg = true;
-                }
-            }
-        }
+        let found_added_bg = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "x" && cell.style().bg == Some(BG_ADDED)
+        });
+        let found_deleted_bg = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "y" && cell.style().bg == Some(BG_DELETED)
+        });
         assert!(
             found_added_bg,
             "expected an added 'x' cell with green background"
@@ -3337,29 +2228,12 @@ mod tests {
         // tests nowrap mode (the default). If the padding logic
         // breaks, the right edge of a short added row will fall
         // back to the terminal default background.
-        let app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "tiny")])],
-            100,
-        )]);
+        let app = single_added_app("a.rs", "tiny");
         let width: u16 = 40;
-        let backend = TestBackend::new(width, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, width, 12);
 
         // Find the row that contains the "tiny" body text.
-        let mut tiny_y: Option<u16> = None;
-        for y in 0..buffer.area().height {
-            let row: String = (0..width)
-                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
-                .collect();
-            if row.contains("tiny") {
-                tiny_y = Some(y);
-                break;
-            }
-        }
-        let y = tiny_y.expect("tiny row must render somewhere");
+        let y = row_containing(&buffer, "tiny");
 
         // Every cell from the start of the body region (x = 5) to
         // the last column must carry BG_ADDED.
@@ -3379,17 +2253,15 @@ mod tests {
         // ADR-0014: there must be no `+`/`-` prefix cells in the diff
         // body region (rows past the 5-char bar margin). The background
         // color encodes add/delete instead.
-        let app = populated_app(vec![make_file(
+        let app = single_hunk_app(
             "src/foo.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "ADDED_LINE"),
-                    diff_line(LineKind::Deleted, "DELETED_LINE"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "ADDED_LINE"),
+                diff_line(LineKind::Deleted, "DELETED_LINE"),
+            ],
             100,
-        )]);
+        );
         let view = render_to_string(&app, 80, 12);
         assert!(
             !view.contains("+ADDED_LINE"),
@@ -3409,11 +2281,7 @@ mod tests {
         // EOF-no-newline rows get a Yellow `∅`. Pin the new default:
         // normal rows must be glyph-free.
         let long_content: String = (0..120u8).map(|i| (b'a' + (i % 26)) as char).collect();
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, &long_content)])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", &long_content);
         app.wrap_lines = true;
 
         let view = render_to_string(&app, 80, 14);
@@ -3490,11 +2358,7 @@ mod tests {
         // silently truncated or that bled past the viewport.
         let forty_kanji: String = "あいうえおかきくけこ".repeat(4);
         assert_eq!(forty_kanji.chars().count(), 40);
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, &forty_kanji)])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", &forty_kanji);
         app.wrap_lines = true;
 
         // Viewport: 45 cols (5 for left bar + 40 for body).
@@ -3519,17 +2383,13 @@ mod tests {
         // at end of file` case. The new EOF marker is `∅` in Yellow.
         // Pin the *presence* of `∅` and the *absence* of the legacy `¶`.
         let long_content: String = (0..40u8).map(|i| (b'a' + (i % 26)) as char).collect();
-        let mut file = make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, &long_content)])],
-            100,
-        );
+        let mut file = single_added_file("a.rs", &long_content, 100);
         let DiffContent::Text(hunks) = &mut file.content else {
             panic!("expected text diff");
         };
         hunks[0].lines[0].has_trailing_newline = false;
 
-        let mut app = populated_app(vec![file]);
+        let mut app = app_with_file(file);
         app.wrap_lines = true;
         let view = render_to_string(&app, 40, 10);
         assert!(
@@ -3543,17 +2403,13 @@ mod tests {
     fn nowrap_mode_shows_eof_marker_when_no_terminal_newline() {
         // v0.5 M2: EOF-no-newline information is independent of wrap
         // mode. The marker must appear in nowrap as well.
-        let mut file = make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "short")])],
-            100,
-        );
+        let mut file = single_added_file("a.rs", "short", 100);
         let DiffContent::Text(hunks) = &mut file.content else {
             panic!("expected text diff");
         };
         hunks[0].lines[0].has_trailing_newline = false;
 
-        let mut app = populated_app(vec![file]);
+        let mut app = app_with_file(file);
         app.wrap_lines = false;
         let view = render_to_string(&app, 80, 10);
         assert!(
@@ -3566,11 +2422,7 @@ mod tests {
     fn nowrap_mode_omits_marker_for_normal_line() {
         // Symmetric to the wrap "normal row" test: no marker on a
         // has_trailing_newline=true nowrap row.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "short")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "short");
         app.wrap_lines = false;
         let view = render_to_string(&app, 80, 10);
         assert!(
@@ -3583,11 +2435,7 @@ mod tests {
     fn line_numbers_hint_appears_in_footer_and_marks_state() {
         // v0.5 plan §Important-4 (Codex): wrap/`z` hints are already
         // visible in the footer, so the LN toggle must be too.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         // OFF by default → still shows a hint (just without bold).
         let off_view = render_to_string(&app, 80, 8);
         assert!(
@@ -3610,11 +2458,7 @@ mod tests {
         // Stream mode always suppresses the gutter, so the footer
         // should make that explicit with an `(off)` marker no matter
         // what `show_line_numbers` is.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.show_line_numbers = true;
         app.view_mode = crate::app::ViewMode::Stream;
         app.build_layout();
@@ -3627,11 +2471,7 @@ mod tests {
 
     #[test]
     fn wrap_nowrap_indicator_appears_in_footer() {
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         let nowrap_view = render_to_string(&app, 80, 8);
         assert!(nowrap_view.contains("nowrap"));
 
@@ -3643,11 +2483,10 @@ mod tests {
 
     #[test]
     fn responsive_footer_keeps_state_not_keymap_when_normal_mode_is_narrow() {
-        let mut app = populated_app(vec![make_file(
+        let mut app = single_added_app(
             "src/extremely/long/path/that/pushes/status/content/out/of/sight/component.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+            "x",
+        );
         app.follow_mode = false;
         app.wrap_lines = true;
         app.show_line_numbers = true;
@@ -3680,22 +2519,13 @@ mod tests {
 
     #[test]
     fn responsive_footer_keeps_back_hint_when_file_view_path_is_long() {
-        let mut app = fake_app();
-        app.file_view = Some(crate::app::FileViewState {
-            path: PathBuf::from(
-                "src/extremely/long/path/that/would/otherwise/hide/the/back/hint/demo.rs",
-            ),
-            return_scroll: 0,
-            lines: vec!["first".into(), "second".into(), "third".into()],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 1,
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: std::cell::Cell::new(1),
-            last_line_has_trailing_newline: true,
-        });
+        let mut app = app_with_files(Vec::new());
+        app.file_view = Some(file_view_state(
+            "src/extremely/long/path/that/would/otherwise/hide/the/back/hint/demo.rs",
+            vec!["first".into(), "second".into(), "third".into()],
+            1,
+            true,
+        ));
         app.wrap_lines = true;
         app.show_line_numbers = true;
 
@@ -3720,11 +2550,7 @@ mod tests {
 
     #[test]
     fn help_overlay_uses_configured_key_labels() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.follow_mode = false;
         app.config.keys.cursor_placement = 'Z';
         app.config.keys.wrap_toggle = 'W';
@@ -3757,20 +2583,13 @@ mod tests {
         // file view must draw `∅` at the end of the final line.
         // Non-last lines never get the marker, regardless of
         // `last_line_has_trailing_newline`.
-        let mut app = fake_app();
-        app.file_view = Some(crate::app::FileViewState {
-            path: PathBuf::from("foo.rs"),
-            return_scroll: 0,
-            lines: vec!["first".into(), "tail-no-newline".into()],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 1,
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: std::cell::Cell::new(1),
-            last_line_has_trailing_newline: false,
-        });
+        let mut app = app_with_files(Vec::new());
+        app.file_view = Some(file_view_state(
+            "foo.rs",
+            vec!["first".into(), "tail-no-newline".into()],
+            1,
+            false,
+        ));
         app.wrap_lines = false;
         let view = render_to_string(&app, 40, 8);
         assert!(
@@ -3781,20 +2600,13 @@ mod tests {
 
     #[test]
     fn file_view_omits_marker_when_last_line_has_newline() {
-        let mut app = fake_app();
-        app.file_view = Some(crate::app::FileViewState {
-            path: PathBuf::from("foo.rs"),
-            return_scroll: 0,
-            lines: vec!["first".into(), "last".into()],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 1,
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: std::cell::Cell::new(1),
-            last_line_has_trailing_newline: true,
-        });
+        let mut app = app_with_files(Vec::new());
+        app.file_view = Some(file_view_state(
+            "foo.rs",
+            vec!["first".into(), "last".into()],
+            1,
+            true,
+        ));
         app.wrap_lines = false;
         let view = render_to_string(&app, 40, 8);
         assert!(
@@ -3806,20 +2618,8 @@ mod tests {
     #[test]
     fn file_view_wrap_mode_renders_late_content_and_footer_indicator() {
         let long = format!("const DATA: &str = {:?};", "0123456789".repeat(12));
-        let mut app = fake_app();
-        app.file_view = Some(crate::app::FileViewState {
-            path: PathBuf::from("src/demo.rs"),
-            return_scroll: 0,
-            lines: vec![long.clone()],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 0,
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: std::cell::Cell::new(1),
-            last_line_has_trailing_newline: true,
-        });
+        let mut app = app_with_files(Vec::new());
+        app.file_view = Some(file_view_state("src/demo.rs", vec![long.clone()], 0, true));
         app.wrap_lines = true;
 
         let view = render_to_string(&app, 40, 8);
@@ -3836,7 +2636,7 @@ mod tests {
 
     #[test]
     fn render_scroll_marks_binary_file_with_notice() {
-        let app = populated_app(vec![binary_file("assets/icon.png")]);
+        let app = app_with_file(timed_binary_file("assets/icon.png", 0));
         let view = render_to_string(&app, 80, 8);
         assert!(view.contains("assets/icon.png"));
         assert!(view.contains("[binary file - diff suppressed]"));
@@ -3845,22 +2645,10 @@ mod tests {
 
     #[test]
     fn render_picker_overlays_a_box_with_query_and_filtered_list() {
-        let mut app = populated_app(vec![
-            make_file(
-                "src/auth.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "src/handler.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                200,
-            ),
-            make_file(
-                "tests/auth_test.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-                100,
-            ),
+        let mut app = app_with_files(vec![
+            single_added_file("src/auth.rs", "x", 300),
+            single_added_file("src/handler.rs", "y", 200),
+            single_added_file("tests/auth_test.rs", "z", 100),
         ]);
         app.picker = Some(PickerState {
             query: "auth".into(),
@@ -3888,29 +2676,18 @@ mod tests {
 
     #[test]
     fn render_footer_shows_last_error_in_red_when_set() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.last_error = Some("git diff exploded".into());
 
         // Wide enough that the footer's body + error message both fit.
-        let backend = TestBackend::new(140, 6);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 140, 6);
 
         let footer_y = buffer.area().height - 1;
-        let mut footer_text = String::new();
-        let mut had_red_x = false;
-        for x in 0..buffer.area().width {
+        let footer_text = buffer_row_text(&buffer, footer_y);
+        let had_red_x = (0..buffer.area().width).any(|x| {
             let cell = &buffer[(x, footer_y)];
-            footer_text.push_str(cell.symbol());
-            if cell.symbol() == "×" && cell.style().fg == Some(Color::Red) {
-                had_red_x = true;
-            }
-        }
+            cell.symbol() == "×" && cell.style().fg == Some(Color::Red)
+        });
         assert!(
             footer_text.contains("git diff exploded"),
             "footer:\n{footer_text}"
@@ -3923,11 +2700,7 @@ mod tests {
 
     #[test]
     fn render_footer_shows_source_aware_watcher_failures() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.watcher_health.record_failure(
             crate::watcher::WatchSource::GitRefs,
             "watcher [git.refs]: refs watcher dead".into(),
@@ -3957,11 +2730,7 @@ mod tests {
 
     #[test]
     fn render_footer_shows_input_health_warning() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.input_health = Some("input: stream hiccup".into());
 
         let view = render_to_string(&app, 140, 6);
@@ -3974,44 +2743,27 @@ mod tests {
 
     #[test]
     fn render_footer_switches_to_manual_when_follow_mode_off() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "x");
         app.follow_mode = false;
         let view = render_to_string(&app, 80, 6);
         assert!(view.contains("[manual]"), "expected [manual]:\n{view}");
     }
 
     fn hunk_with_context(old_start: usize, ctx: &str, lines: Vec<DiffLine>) -> Hunk {
-        let added = lines.iter().filter(|l| l.kind == LineKind::Added).count();
-        let deleted = lines.iter().filter(|l| l.kind == LineKind::Deleted).count();
-        Hunk {
-            old_start,
-            old_count: deleted,
-            new_start: old_start,
-            new_count: added,
-            lines,
-            context: Some(ctx.to_string()),
-        }
+        let mut hunk = hunk(old_start, lines);
+        hunk.context = Some(ctx.to_string());
+        hunk
     }
 
     fn modified_file_status(name: &str, status: FileStatus, secs: u64) -> FileDiff {
-        FileDiff {
-            path: PathBuf::from(name),
-            status,
-            added: 1,
-            deleted: 0,
-            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "x")])]),
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-            header_prefix: None,
-        }
+        let mut file = make_file(name, vec![added_hunk(1, &["x"])], secs);
+        file.status = status;
+        file
     }
 
     #[test]
     fn file_header_path_color_encodes_status() {
-        let mut app = populated_app(vec![
+        let mut app = app_with_files(vec![
             modified_file_status("a.rs", FileStatus::Modified, 100),
             modified_file_status("b.rs", FileStatus::Added, 200),
             modified_file_status("c.rs", FileStatus::Deleted, 300),
@@ -4020,10 +2772,7 @@ mod tests {
         // Bootstrap parks scroll on the follow target (bottom). Reset to 0
         // so every file header sits inside the viewport for inspection.
         app.scroll_to(0);
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 30);
 
         // For each path, find its first cell (the 'a'/'b'/'c'/'d') and
         // assert the foreground color matches the status mapping.
@@ -4034,50 +2783,26 @@ mod tests {
             ("d.rs", Color::Yellow),
         ];
         for (name, expected) in want {
-            let mut found = false;
-            'outer: for y in 0..buffer.area().height {
-                for x in 0..buffer.area().width {
-                    if buffer[(x, y)].symbol() == &name[..1] {
-                        // Walk forward to make sure this is the start of `name`.
-                        let chars: String = (0..name.len())
-                            .map(|i| buffer[(x + i as u16, y)].symbol().to_string())
-                            .collect();
-                        if chars == name {
-                            assert_eq!(
-                                buffer[(x, y)].style().fg,
-                                Some(expected),
-                                "{name} should be in {expected:?}"
-                            );
-                            found = true;
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-            assert!(found, "{name} not found in buffer");
+            let (x, y, _) = first_text_run(&buffer, name);
+            assert_eq!(
+                buffer[(x, y)].style().fg,
+                Some(expected),
+                "{name} should be in {expected:?}"
+            );
         }
     }
 
     #[test]
     fn file_header_shows_prefix_when_set() {
-        let mut file = make_file(
-            "src/auth.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        );
+        let mut file = single_added_file("src/auth.rs", "x", 100);
         file.header_prefix = Some("14:03:22 Write".to_string());
-        let mut app = populated_app(vec![file]);
+        let mut app = app_with_file(file);
         app.scroll = 0;
 
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10))
-            .expect("test terminal");
-        terminal.draw(|frame| render(frame, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 60, 10);
 
         // The prefix "14:03:22 Write" should appear in the header line.
-        let first_line: String = (0..buffer.area().width)
-            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
-            .collect();
+        let first_line = buffer_row_text(&buffer, 0);
         assert!(
             first_line.contains("14:03:22 Write"),
             "header should contain prefix, got: {first_line:?}"
@@ -4086,7 +2811,7 @@ mod tests {
 
     #[test]
     fn hunk_header_uses_function_context_when_available() {
-        let app = populated_app(vec![make_file(
+        let app = app_with_hunks(
             "src/auth.rs",
             vec![hunk_with_context(
                 10,
@@ -4094,7 +2819,7 @@ mod tests {
                 vec![diff_line(LineKind::Added, "let x = 1;")],
             )],
             100,
-        )]);
+        );
         let view = render_to_string(&app, 100, 14);
         assert!(
             view.contains("@@ fn verify_token(claims: &Claims) -> Result<bool> {"),
@@ -4112,7 +2837,7 @@ mod tests {
     fn hunk_header_shows_line_range_and_counts() {
         // Hunk header should display line number range and +/-
         // counts alongside the function context.
-        let app = populated_app(vec![make_file(
+        let app = app_with_hunks(
             "a.rs",
             vec![Hunk {
                 old_start: 10,
@@ -4129,7 +2854,7 @@ mod tests {
                 context: Some("fn example()".to_string()),
             }],
             100,
-        )]);
+        );
         let view = render_to_string(&app, 100, 14);
         // Should contain the line range.
         assert!(
@@ -4152,7 +2877,7 @@ mod tests {
         // Deleted DiffLine rows have a blank gutter, the header was
         // the only positional signal left. Fall back to the baseline
         // range so the reader can still locate the removal.
-        let app = populated_app(vec![make_file(
+        let app = app_with_hunks(
             "a.rs",
             vec![Hunk {
                 old_start: 1,
@@ -4167,7 +2892,7 @@ mod tests {
                 context: None,
             }],
             100,
-        )]);
+        );
         let view = render_to_string(&app, 100, 14);
         assert!(
             !view.contains("L0"),
@@ -4184,7 +2909,7 @@ mod tests {
     fn hunk_header_shows_range_in_fallback_format() {
         // When no function context is available, the header should
         // still show line range and counts.
-        let app = populated_app(vec![make_file(
+        let app = app_with_hunks(
             "a.rs",
             vec![Hunk {
                 old_start: 5,
@@ -4199,7 +2924,7 @@ mod tests {
                 context: None,
             }],
             100,
-        )]);
+        );
         let view = render_to_string(&app, 100, 14);
         assert!(view.contains("L5"), "expected line range L5, got:\n{view}");
         assert!(
@@ -4220,21 +2945,15 @@ mod tests {
         // We use content-only characters ('~', '!') that don't appear
         // in file paths, hunk headers (`@@`), or scroll chrome so the
         // cell lookup doesn't collide.
-        let mut app = populated_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "~~~~")]),
-                hunk(20, vec![diff_line(LineKind::Added, "!!!!")]),
-            ],
+            vec![added_hunk(1, &["~~~~"]), added_hunk(20, &["!!!!"])],
             100,
-        )]);
+        );
         // Snap to the first hunk so one hunk is focused and the other
         // is not.
         app.scroll_to(app.layout.hunk_starts[0]);
-        let backend = TestBackend::new(100, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 100, 14);
 
         // Both body characters must sit on BG_ADDED (the colored
         // band never disappears), but the unfocused row must also
@@ -4282,34 +3001,15 @@ mod tests {
         // Multi-line hunk so that *some* row exists that's selected but
         // not the cursor — proving the `▎` ribbon still gets drawn for
         // the rest of the hunk while only one row gets the `▶` arrow.
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "first"),
-                    diff_line(LineKind::Added, "second"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("src/foo.rs", 1, &["first", "second"], 100);
         // Place the cursor on the hunk header so the `▎` (not `▶`) bar
         // covers both diff line rows.
         app.scroll_to(app.layout.hunk_starts[0]);
-        let backend = TestBackend::new(80, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 14);
 
-        let mut had_yellow_bar = false;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▎" && cell.style().fg == Some(Color::Yellow) {
-                    had_yellow_bar = true;
-                }
-            }
-        }
+        let had_yellow_bar = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "▎" && cell.style().fg == Some(Color::Yellow)
+        });
         assert!(
             had_yellow_bar,
             "expected a yellow '▎' on the selected hunk row"
@@ -4321,38 +3021,18 @@ mod tests {
         // Two-line hunk: park the cursor on the first diff line. That row
         // should render `▶` in the left margin while the *other* diff row
         // of the same hunk still uses the plain `▎` ribbon.
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "first"),
-                    diff_line(LineKind::Added, "second"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("src/foo.rs", 1, &["first", "second"], 100);
         // Layout: FileHeader, HunkHeader, DiffLine(0), DiffLine(1), Spacer
         // hunk_starts[0] = 1 (HunkHeader). First DiffLine is at row 2.
         app.scroll_to(app.layout.hunk_starts[0] + 1);
-        let backend = TestBackend::new(80, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 14);
 
-        let mut had_arrow = false;
-        let mut had_plain_bar = false;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow) {
-                    had_arrow = true;
-                }
-                if cell.symbol() == "▎" && cell.style().fg == Some(Color::Yellow) {
-                    had_plain_bar = true;
-                }
-            }
-        }
+        let had_arrow = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow)
+        });
+        let had_plain_bar = buffer_has_cell(&buffer, |cell| {
+            cell.symbol() == "▎" && cell.style().fg == Some(Color::Yellow)
+        });
         assert!(had_arrow, "expected a yellow '▶' arrow at the cursor row");
         assert!(
             had_plain_bar,
@@ -4362,11 +3042,7 @@ mod tests {
 
     #[test]
     fn hunk_header_cursor_displays_arrow_marker() {
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "first");
         app.scroll_to(app.layout.hunk_starts[0]);
 
         let view = render_to_string(&app, 80, 10);
@@ -4383,30 +3059,17 @@ mod tests {
         // Paint its `▶` with the same Yellow + Bold style DiffLine
         // rows use so the cursor stays visible across the hand-off
         // between expanded and collapsed hunks.
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "first");
         app.scroll_to(app.layout.hunk_starts[0]);
 
-        let backend = TestBackend::new(80, 10);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 10);
 
-        let mut found = false;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▶" {
-                    let st = cell.style();
-                    if st.fg == Some(Color::Yellow) && st.add_modifier.contains(Modifier::BOLD) {
-                        found = true;
-                    }
-                }
-            }
-        }
+        let found = buffer_has_cell(&buffer, |cell| {
+            let st = cell.style();
+            cell.symbol() == "▶"
+                && st.fg == Some(Color::Yellow)
+                && st.add_modifier.contains(Modifier::BOLD)
+        });
         assert!(
             found,
             "cursor `▶` on a hunk header must be Yellow + Bold, not Cyan"
@@ -4418,11 +3081,7 @@ mod tests {
         // v0.4: seen hunks render with a ▸ fold glyph in the hunk
         // header so the reader can tell "this hunk is collapsed,
         // not empty" at a glance. Unseen hunks have no such glyph.
-        let mut app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/foo.rs", "first");
         app.scroll_to(app.layout.hunk_starts[0] + 1); // onto the DiffLine
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char(' '),
@@ -4438,11 +3097,7 @@ mod tests {
 
     #[test]
     fn file_header_cursor_displays_arrow_marker() {
-        let app = populated_app(vec![make_file(
-            "src/foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "first")])],
-            100,
-        )]);
+        let app = single_added_app("src/foo.rs", "first");
 
         let view = render_to_string(&app, 80, 10);
         assert!(
@@ -4453,7 +3108,7 @@ mod tests {
 
     #[test]
     fn binary_notice_cursor_displays_arrow_marker() {
-        let mut app = populated_app(vec![binary_file("assets/icon.png")]);
+        let mut app = app_with_file(timed_binary_file("assets/icon.png", 0));
         app.scroll_to(1);
 
         let view = render_to_string(&app, 80, 8);
@@ -4468,15 +3123,8 @@ mod tests {
         // 40-row hunk, 12-row viewport, cursor parked deep inside the
         // hunk. In centered mode the cursor row should land at roughly
         // viewport_height / 2.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = populated_app(vec![make_file_with_context(
-            "src/foo.rs",
-            "fn long_function() {",
-            lines,
-            100,
-        )]);
+        let lines = numbered_added_lines(40);
+        let mut app = app_with_context_hunk("src/foo.rs", "fn long_function() {", lines, 100);
         let header = app.layout.hunk_starts[0];
         // Park the cursor 20 rows past the hunk header (well inside the
         // hunk). Settle the scroll animation so this test asserts on
@@ -4484,22 +3132,13 @@ mod tests {
         app.scroll_to(header + 20);
         app.anim = None;
 
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 12);
 
         // Find the row that holds the yellow `▶` marker.
-        let mut cursor_y: Option<u16> = None;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow) {
-                    cursor_y = Some(y);
-                }
-            }
-        }
-        let y = cursor_y.expect("expected the cursor `▶` to be drawn");
+        let (_, y) = first_cell_matching(&buffer, |cell| {
+            cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow)
+        })
+        .expect("expected the cursor `▶` to be drawn");
         // Sticky takes row 0, so the body height is 11. We expect the
         // cursor near the middle of the body — between rows 4 and 8 of
         // the full buffer, well within tolerance.
@@ -4514,35 +3153,19 @@ mod tests {
         // Same fixture, toggled to Top placement. The arrow should
         // sit at the body's top row, just below the pinned sticky
         // hunk header.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = populated_app(vec![make_file_with_context(
-            "src/foo.rs",
-            "fn long_function() {",
-            lines,
-            100,
-        )]);
+        let lines = numbered_added_lines(40);
+        let mut app = app_with_context_hunk("src/foo.rs", "fn long_function() {", lines, 100);
         let header = app.layout.hunk_starts[0];
         app.scroll_to(header + 20);
         app.anim = None;
         app.cursor_placement = crate::app::CursorPlacement::Top;
 
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 12);
 
-        let mut cursor_y: Option<u16> = None;
-        for y in 0..buffer.area().height {
-            for x in 0..buffer.area().width {
-                let cell = &buffer[(x, y)];
-                if cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow) {
-                    cursor_y = Some(y);
-                }
-            }
-        }
-        let y = cursor_y.expect("expected the cursor `▶` to be drawn");
+        let (_, y) = first_cell_matching(&buffer, |cell| {
+            cell.symbol() == "▶" && cell.style().fg == Some(Color::Yellow)
+        })
+        .expect("expected the cursor `▶` to be drawn");
         // Top mode + sticky header (row 0): the cursor should sit at
         // the first body row, which is y=1 (right below the sticky
         // header).
@@ -4571,35 +3194,22 @@ mod tests {
         // that the full-body placement puts the header JUST at the
         // top (not sticky-worthy) but any reduction would push it
         // off. A 20-line hunk with a tight viewport hits this.
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = populated_app(vec![make_file_with_context(
-            "src/foo.rs",
-            "fn boundary() {",
-            lines,
-            100,
-        )]);
+        let lines = numbered_added_lines(20);
+        let mut app = app_with_context_hunk("src/foo.rs", "fn boundary() {", lines, 100);
         // Jump into the middle of the hunk so any sticky reservation
         // would definitely push the header off-screen.
         let header_row = app.layout.hunk_starts[0];
         app.scroll_to(header_row + 5);
         app.anim = None;
 
-        let backend = TestBackend::new(80, 8);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 8);
 
         // Pin: whichever branch the new decision flow picks, row 0
         // must either be the sticky header (contains `boundary`) OR
         // be the actual hunk header / a row on or after header_row
         // but never a row from later in the hunk with the header
         // silently dropped.
-        let mut row0 = String::new();
-        for x in 0..buffer.area().width {
-            row0.push_str(buffer[(x, 0)].symbol());
-        }
+        let row0 = buffer_row_text(&buffer, 0);
         assert!(
             row0.contains("boundary") || row0.contains("@@"),
             "row 0 must show the hunk header (sticky or inline), got:\n{row0}"
@@ -4611,57 +3221,27 @@ mod tests {
         // Build a single hunk tall enough that scrolling past the header
         // pushes it off the top of a small viewport. The renderer should
         // pin the header on viewport row 0.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = populated_app(vec![make_file_with_context(
-            "src/foo.rs",
-            "fn long_function() {",
-            lines,
-            100,
-        )]);
+        let lines = numbered_added_lines(40);
+        let mut app = app_with_context_hunk("src/foo.rs", "fn long_function() {", lines, 100);
         // Skip past the hunk header so the renderer has to pin it.
         let header_row = app.layout.hunk_starts[0];
         app.scroll_to(header_row + 10);
         app.anim = None;
 
         // Tight viewport so the original header row really is off-screen.
-        let backend = TestBackend::new(80, 8);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 8);
 
         // The very first row of the main area must contain the function
         // name from the sticky header.
-        let mut row0 = String::new();
-        for x in 0..buffer.area().width {
-            row0.push_str(buffer[(x, 0)].symbol());
-        }
+        let row0 = buffer_row_text(&buffer, 0);
         assert!(
             row0.contains("long_function"),
             "row 0 should be the pinned hunk header, got:\n{row0}"
         );
     }
 
-    fn make_file_with_context(name: &str, ctx: &str, lines: Vec<DiffLine>, secs: u64) -> FileDiff {
-        let added: usize = lines.iter().filter(|l| l.kind == LineKind::Added).count();
-        let deleted: usize = lines.iter().filter(|l| l.kind == LineKind::Deleted).count();
-        FileDiff {
-            path: PathBuf::from(name),
-            status: FileStatus::Modified,
-            added,
-            deleted,
-            content: DiffContent::Text(vec![Hunk {
-                old_start: 1,
-                old_count: deleted,
-                new_start: 1,
-                new_count: added,
-                lines,
-                context: Some(ctx.to_string()),
-            }]),
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-            header_prefix: None,
-        }
+    fn app_with_context_hunk(name: &str, ctx: &str, lines: Vec<DiffLine>, secs: u64) -> App {
+        app_with_hunks(name, vec![hunk_with_context(1, ctx, lines)], secs)
     }
 
     // ---- v0.4 slash-search in-body highlight ------------------------
@@ -4704,29 +3284,28 @@ mod tests {
         out
     }
 
+    fn first_text_run(buf: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16, usize) {
+        find_text_runs(buf, needle)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{needle} not found in buffer"))
+    }
+
+    fn row_containing(buf: &ratatui::buffer::Buffer, needle: &str) -> u16 {
+        first_text_run(buf, needle).1
+    }
+
     #[test]
     fn search_current_match_renders_with_yellow_background() {
         // `/foo<Enter>` on a single Added line containing one `foo` must
         // paint the 3 cells of `foo` with Yellow bg + Black fg + Bold.
         // Before this slice the matched cells inherit the diff bg_added
         // green, so the test fails loudly until the overlay lands.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "let foo = 1;")])],
-            100,
-        )]);
-        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
-        assert_eq!(matches.len(), 1, "test fixture precondition");
-        app.search = Some(crate::app::SearchState {
-            query: "foo".to_string(),
-            matches,
-            current: 0,
-        });
+        let mut app = single_added_app("a.rs", "let foo = 1;");
+        let match_count = install_search(&mut app, "foo", 0);
+        assert_eq!(match_count, 1, "test fixture precondition");
 
-        let backend = TestBackend::new(80, 6);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 6);
 
         let runs = find_text_runs(&buffer, "foo");
         assert_eq!(runs.len(), 1, "rendered buffer should contain one `foo`");
@@ -4766,23 +3345,11 @@ mod tests {
         // match) wears the Yellow reversal; the second one still gets a
         // visual cue (UNDERLINED + BOLD) while keeping the diff bg_added
         // green so the add/delete signal survives the overlay.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar foo")])],
-            100,
-        )]);
-        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
-        assert_eq!(matches.len(), 2, "test fixture precondition");
-        app.search = Some(crate::app::SearchState {
-            query: "foo".to_string(),
-            matches,
-            current: 0,
-        });
+        let mut app = single_added_app("a.rs", "foo bar foo");
+        let match_count = install_search(&mut app, "foo", 0);
+        assert_eq!(match_count, 2, "test fixture precondition");
 
-        let backend = TestBackend::new(80, 6);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 6);
 
         let runs = find_text_runs(&buffer, "foo");
         assert_eq!(runs.len(), 2, "expected two `foo` runs in the buffer");
@@ -4855,27 +3422,15 @@ mod tests {
         // colors, the Yellow reversal collapses into `DEFAULT_DIM`
         // (Rgb(30,30,36)) and the user perceives the highlight as
         // "dark". This test pins the carve-out.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "let foo = 1;")])],
-            100,
-        )]);
-        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
-        let match_row = matches[0].row;
-        app.search = Some(crate::app::SearchState {
-            query: "foo".to_string(),
-            matches,
-            current: 0,
-        });
+        let mut app = single_added_app("a.rs", "let foo = 1;");
+        install_search(&mut app, "foo", 0);
+        let match_row = app.search.as_ref().unwrap().matches[0].row;
         // Force the cursor onto the match row (mirrors the
         // post-`n`/`N` state where `scroll_to(match.row)` runs).
         app.scroll = match_row;
         app.follow_mode = false;
 
-        let backend = TestBackend::new(80, 6);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 6);
 
         let runs = find_text_runs(&buffer, "foo");
         assert_eq!(runs.len(), 1, "rendered buffer should contain one `foo`");
@@ -4907,25 +3462,9 @@ mod tests {
         // With an active `SearchState`, the footer must echo the query
         // and a `[current/total]` counter so the user can tell which
         // hit `n`/`N` is about to jump to without counting visually.
-        let mut app = populated_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo one"),
-                    diff_line(LineKind::Added, "foo two"),
-                    diff_line(LineKind::Added, "foo three"),
-                ],
-            )],
-            100,
-        )]);
-        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
-        assert_eq!(matches.len(), 3);
-        app.search = Some(crate::app::SearchState {
-            query: "foo".to_string(),
-            matches,
-            current: 1, // 2/3
-        });
+        let mut app = added_hunk_app("a.rs", 1, &["foo one", "foo two", "foo three"], 100);
+        let match_count = install_search(&mut app, "foo", 1); // 2/3
+        assert_eq!(match_count, 3);
         app.follow_mode = false;
 
         let view = render_to_string(&app, 120, 8);
@@ -4947,33 +3486,25 @@ mod tests {
         // overlay must strip DIM so matches stay loud regardless of
         // which hunk the cursor is in — otherwise every non-focus
         // match looks "dark" even though underline + bold are set.
-        let mut app = populated_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
             vec![
-                hunk(1, vec![diff_line(LineKind::Added, "first foo")]),
-                hunk(50, vec![diff_line(LineKind::Added, "second foo")]),
+                added_hunk(1, &["first foo"]),
+                added_hunk(50, &["second foo"]),
             ],
             100,
-        )]);
-        let matches = crate::app::find_matches(&app.layout, &app.files, "foo");
-        assert_eq!(matches.len(), 2, "test fixture precondition");
+        );
+        let match_count = install_search(&mut app, "foo", 0);
+        assert_eq!(match_count, 2, "test fixture precondition");
         // `current = 0` -> first hunk's `foo` is current; the cursor
         // sits on the first match row so the second hunk is unfocused.
-        let first_row = matches[0].row;
-        app.search = Some(crate::app::SearchState {
-            query: "foo".to_string(),
-            matches,
-            current: 0,
-        });
+        let first_row = app.search.as_ref().unwrap().matches[0].row;
         app.follow_mode = false;
         // Place the cursor explicitly on the first hunk's DiffLine so
         // `current_hunk()` resolves to hunk 0 and hunk 1 is unfocused.
         app.scroll = first_row;
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(&app, 80, 20);
 
         let runs = find_text_runs(&buffer, "foo");
         assert_eq!(runs.len(), 2, "both `foo` runs must render in the viewport");

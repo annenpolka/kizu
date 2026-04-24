@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -116,6 +116,7 @@ impl DiffSnapshots {
 use crate::git::{self, DiffContent, FileDiff, FileStatus, LineKind};
 use crate::hook::SanitizedEvent;
 use crate::scar::ScarKind;
+use crate::stream::{build_stream_files, compute_operation_diff};
 use crate::watcher::{self, WatchEvent, WatchSource};
 
 /// Which TUI view is currently active.
@@ -159,6 +160,12 @@ pub(crate) const SCAR_TEXT_ASK: &str = "explain this change";
 
 /// Canned scar body bound to the `r` key — "reject".
 pub(crate) const SCAR_TEXT_REJECT: &str = "revert this change";
+
+#[derive(Debug, Clone)]
+pub(crate) struct CachedVisualIndex {
+    body_width: Option<usize>,
+    index: VisualIndex,
+}
 
 /// Top-level application state. Single-threaded, mutated by the event loop
 /// via `&mut self` (we run on tokio's `current_thread` flavor — see ADR-0003).
@@ -265,6 +272,11 @@ pub struct App {
     /// snap — the next tween picks up from wherever the current one
     /// happened to be).
     pub visual_top: Cell<f32>,
+    /// Wrap-mode visual coordinate cache. `VisualIndex` is O(layout rows)
+    /// to build because it measures every logical row. Rendering may ask
+    /// for placement more than once per frame (sticky-header decision),
+    /// so cache the current width until `build_layout` invalidates it.
+    pub(crate) visual_index_cache: RefCell<Option<CachedVisualIndex>>,
     /// Active viewport-top tween. `None` when the renderer should
     /// draw at the logical target.
     pub anim: Option<ScrollAnim>,
@@ -514,14 +526,14 @@ fn uses_plus_line_format(basename: &str) -> bool {
 /// mismatched fingerprint means the hunk has been edited since it
 /// was marked seen — in that case the mark is considered stale and
 /// the hunk behaves as if it were unmarked (auto-expand).
-pub fn is_hunk_seen(
+pub fn seen_hunk_fingerprint(
     seen: &BTreeMap<(PathBuf, usize), u64>,
     path: &Path,
     old_start: usize,
-    current_fp: u64,
-) -> bool {
+) -> Option<u64> {
     seen.iter()
-        .any(|((p, o), fp)| *o == old_start && *fp == current_fp && p.as_path() == path)
+        .find(|((p, o), _)| *o == old_start && p.as_path() == path)
+        .map(|(_, fp)| *fp)
 }
 
 /// v0.4 adaptive-navigation helper: given the nearest "run start"
@@ -546,6 +558,37 @@ fn nearest_landing_backward(prev_run: Option<usize>, prev_hh: Option<usize>) -> 
         (None, Some(h)) => Some(h),
         (None, None) => None,
     }
+}
+
+fn next_sorted_after(values: &[usize], cursor: usize) -> Option<usize> {
+    values
+        .get(values.partition_point(|&value| value <= cursor))
+        .copied()
+}
+
+fn prev_sorted_before(values: &[usize], cursor: usize) -> Option<usize> {
+    values
+        .partition_point(|&value| value < cursor)
+        .checked_sub(1)
+        .and_then(|idx| values.get(idx).copied())
+}
+
+fn change_run_at(runs: &[(usize, usize)], cursor: usize) -> Option<(usize, usize)> {
+    let idx = runs.partition_point(|&(_, end)| end <= cursor);
+    runs.get(idx)
+        .copied()
+        .filter(|(start, end)| *start <= cursor && cursor < *end)
+}
+
+fn next_change_run_start_after(runs: &[(usize, usize)], cursor: usize) -> Option<usize> {
+    runs.get(runs.partition_point(|&(start, _)| start <= cursor))
+        .map(|(start, _)| *start)
+}
+
+fn prev_change_run_start_before(runs: &[(usize, usize)], cursor: usize) -> Option<usize> {
+    runs.partition_point(|&(start, _)| start < cursor)
+        .checked_sub(1)
+        .and_then(|idx| runs.get(idx).map(|(start, _)| *start))
 }
 
 /// Hash the full `lines` vector of a hunk (kind + content + trailing
@@ -615,6 +658,98 @@ fn edit_backspace(text: &mut String, cursor_pos: &mut usize) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextInputKeyEffect {
+    Continue,
+    Commit,
+    Cancel,
+}
+
+fn handle_text_input_edit(
+    key: KeyEvent,
+    text: &mut String,
+    cursor_pos: &mut usize,
+) -> TextInputKeyEffect {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') => return TextInputKeyEffect::Cancel,
+            KeyCode::Char('a') => *cursor_pos = 0,
+            KeyCode::Char('e') => *cursor_pos = text.chars().count(),
+            _ => {}
+        }
+        return TextInputKeyEffect::Continue;
+    }
+    match key.code {
+        KeyCode::Esc => TextInputKeyEffect::Cancel,
+        KeyCode::Enter => TextInputKeyEffect::Commit,
+        KeyCode::Backspace => {
+            edit_backspace(text, cursor_pos);
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::Left => {
+            *cursor_pos = cursor_pos.saturating_sub(1);
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::Right => {
+            *cursor_pos = (*cursor_pos + 1).min(text.chars().count());
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::Home => {
+            *cursor_pos = 0;
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::End => {
+            *cursor_pos = text.chars().count();
+            TextInputKeyEffect::Continue
+        }
+        KeyCode::Char(c) => {
+            edit_insert_char(text, cursor_pos, c);
+            TextInputKeyEffect::Continue
+        }
+        _ => TextInputKeyEffect::Continue,
+    }
+}
+
+fn is_quit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('q'))
+        || (matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn control_page_delta(key: KeyEvent) -> Option<isize> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('d') => Some(HALF_PAGE as isize),
+        KeyCode::Char('u') => Some(-(HALF_PAGE as isize)),
+        _ => None,
+    }
+}
+
+fn scroll_top_to_keep_visible(scroll_top: usize, cursor_y: usize, viewport_height: usize) -> usize {
+    let viewport_height = viewport_height.max(1);
+    if cursor_y < scroll_top {
+        cursor_y
+    } else if cursor_y >= scroll_top + viewport_height {
+        cursor_y.saturating_sub(viewport_height - 1)
+    } else {
+        scroll_top
+    }
+}
+
+fn update_file_view_scroll_anim(fv: &mut FileViewState, old_top: usize, animate: bool) {
+    if animate && fv.scroll_top != old_top {
+        fv.anim = Some(ScrollAnim {
+            from: fv.visual_top,
+            start: Instant::now(),
+            dur: SCROLL_ANIM_DURATION,
+        });
+    } else if !animate {
+        fv.anim = None;
+        fv.visual_top = fv.scroll_top as f32;
+    }
+}
+
 /// Two ways the renderer can park the cursor inside the viewport.
 /// Defaults to [`CursorPlacement::Centered`]; `z` toggles to
 /// [`CursorPlacement::Top`] (the cursor sits at the viewport ceiling
@@ -663,6 +798,14 @@ pub struct ScrollLayout {
     /// `rows` indices that point at a `HunkHeader` — used by `j/k` to jump
     /// hunk-by-hunk regardless of how many context lines sit in between.
     pub hunk_starts: Vec<usize>,
+    /// Per-file, per-hunk `(start, end_exclusive)` spans in `rows`.
+    /// Used by viewport anchoring so every render can find the
+    /// selected hunk's extent without scanning the whole layout.
+    pub hunk_ranges: Vec<Vec<(usize, usize)>>,
+    /// Per-file, per-hunk content fingerprints. `None` means no seen
+    /// mark existed for that `(path, old_start)` during `build_layout`,
+    /// so callers can avoid hashing untouched hunks on hot render paths.
+    pub hunk_fingerprints: Vec<Vec<Option<u64>>>,
     /// For each file in `App.files`, the row index of its first hunk header
     /// (or the file header for binaries / empty hunks). `None` only when the
     /// layout build couldn't produce any anchorable row for that file.
@@ -680,10 +823,12 @@ pub struct ScrollLayout {
     pub change_runs: Vec<(usize, usize)>,
     /// v0.5: parallel Vec to `rows`. For every `RowKind::DiffLine`, the
     /// corresponding slot holds `Some((old_line_number, new_line_number))`
-    /// as computed by [`crate::git::line_numbers_for`]. All other row
-    /// kinds carry `None`. `build_layout` fills this in the same pass
-    /// that pushes rows so renderer cost stays O(viewport) regardless
-    /// of hunk size.
+    /// using the per-kind rule Context → both sides, Added → new only,
+    /// Deleted → old only. All other row kinds carry `None`.
+    /// `build_layout` fills this with a single cumulative walk per
+    /// hunk in the same pass that pushes rows, so renderer cost stays
+    /// O(viewport) regardless of hunk size. `git::line_numbers_for`
+    /// in test builds pins the same semantics as a single-line spec.
     pub diff_line_numbers: Vec<Option<(Option<usize>, Option<usize>)>>,
     /// v0.5: largest line number (either `old` or `new`) among all
     /// **visible** DiffLine rows. Seen (collapsed) hunks are excluded
@@ -747,12 +892,35 @@ impl VisualIndex {
     /// resulting index acts as the identity and keeps the legacy
     /// logical-row scroll model intact.
     pub fn build(layout: &ScrollLayout, files: &[FileDiff], body_width: Option<usize>) -> Self {
-        let n = layout.rows.len();
-        let mut prefix = Vec::with_capacity(n + 1);
+        Self::from_heights(
+            body_width,
+            layout
+                .rows
+                .iter()
+                .map(|row| Self::row_visual_height(row, files, body_width)),
+        )
+    }
+
+    /// Build a visual index for full-file view lines. The prefix
+    /// coordinate machinery is identical to the diff layout; only
+    /// the per-logical-row height calculation changes.
+    pub fn build_lines(lines: &[String], body_width: Option<usize>) -> Self {
+        Self::from_heights(
+            body_width,
+            lines
+                .iter()
+                .map(|line| Self::line_visual_height(line, body_width)),
+        )
+    }
+
+    fn from_heights<I>(body_width: Option<usize>, heights: I) -> Self
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut prefix = Vec::new();
         prefix.push(0);
         let mut acc = 0usize;
-        for row in &layout.rows {
-            let h = Self::row_visual_height(row, files, body_width);
+        for h in heights {
             acc += h;
             prefix.push(acc);
         }
@@ -843,6 +1011,29 @@ impl VisualIndex {
         } else {
             cells.div_ceil(width.max(1))
         }
+    }
+
+    fn line_visual_height(line: &str, body_width: Option<usize>) -> usize {
+        let Some(width) = body_width else {
+            return 1;
+        };
+        use unicode_width::UnicodeWidthChar;
+
+        if line.is_empty() {
+            return 1;
+        }
+
+        let mut rows = 1usize;
+        let mut chunk_cells = 0usize;
+        for ch in line.chars() {
+            let ch_cells = ch.width().unwrap_or(0);
+            if chunk_cells > 0 && chunk_cells + ch_cells > width {
+                rows += 1;
+                chunk_cells = 0;
+            }
+            chunk_cells += ch_cells;
+        }
+        rows
     }
 }
 
@@ -1059,92 +1250,6 @@ pub struct FileViewState {
     pub last_line_has_trailing_newline: bool,
 }
 
-/// File-view counterpart to [`VisualIndex`]. Maps logical file lines
-/// to visual y offsets under the current wrap width so file-view
-/// navigation can move inside a single long line instead of jumping
-/// straight to the next logical line.
-#[derive(Debug, Clone)]
-pub struct FileViewVisualIndex {
-    prefix: Vec<usize>,
-    #[allow(dead_code)]
-    pub body_width: Option<usize>,
-}
-
-impl FileViewVisualIndex {
-    pub fn build(lines: &[String], body_width: Option<usize>) -> Self {
-        let mut prefix = Vec::with_capacity(lines.len() + 1);
-        prefix.push(0);
-        let mut acc = 0usize;
-        for line in lines {
-            let h = Self::line_visual_height(line, body_width);
-            acc += h;
-            prefix.push(acc);
-        }
-        Self { prefix, body_width }
-    }
-
-    pub fn visual_y(&self, line_idx: usize) -> usize {
-        self.prefix.get(line_idx).copied().unwrap_or(0)
-    }
-
-    pub fn visual_height(&self, line_idx: usize) -> usize {
-        match (self.prefix.get(line_idx), self.prefix.get(line_idx + 1)) {
-            (Some(&a), Some(&b)) => b - a,
-            _ => 1,
-        }
-    }
-
-    pub fn total_visual(&self) -> usize {
-        self.prefix.last().copied().unwrap_or(0)
-    }
-
-    pub fn logical_at(&self, y: usize) -> (usize, usize) {
-        if self.prefix.len() < 2 {
-            return (0, 0);
-        }
-        let total = self.total_visual();
-        if y >= total {
-            let last = self.prefix.len() - 2;
-            return (last, self.visual_height(last).saturating_sub(1));
-        }
-        let mut lo = 0usize;
-        let mut hi = self.prefix.len() - 1;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.prefix[mid + 1] > y {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        let within = y - self.prefix[lo];
-        (lo, within)
-    }
-
-    fn line_visual_height(line: &str, body_width: Option<usize>) -> usize {
-        let Some(width) = body_width else {
-            return 1;
-        };
-        use unicode_width::UnicodeWidthChar;
-
-        if line.is_empty() {
-            return 1;
-        }
-
-        let mut rows = 1usize;
-        let mut chunk_cells = 0usize;
-        for ch in line.chars() {
-            let ch_cells = ch.width().unwrap_or(0);
-            if chunk_cells > 0 && chunk_cells + ch_cells > width {
-                rows += 1;
-                chunk_cells = 0;
-            }
-            chunk_cells += ch_cells;
-        }
-        rows
-    }
-}
-
 /// Confirmation overlay for hunk revert (`x` key). Holds the
 /// `(file_idx, hunk_idx)` captured the moment the user pressed `x`
 /// so a watcher-driven recompute while the dialog is open cannot
@@ -1280,6 +1385,7 @@ impl App {
             last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
             last_body_width: Cell::new(None),
             visual_top: Cell::new(0.0),
+            visual_index_cache: RefCell::new(None),
             anim: None,
             wrap_lines: false,
             show_line_numbers: config.line_numbers.enabled,
@@ -1353,7 +1459,7 @@ impl App {
         // lands cleanly on the row's first visual line under the
         // new coordinate system.
         self.cursor_sub_row = 0;
-        self.reflow_file_view_after_wrap_toggle();
+        self.reflow_file_view();
     }
 
     /// Toggle the line-number gutter (v0.5). `#` calls this (or
@@ -1362,37 +1468,13 @@ impl App {
     /// gutter regardless of the flag.
     ///
     /// Rebuilds the layout (to refresh `diff_line_numbers` / `max_line_number`)
-    /// and reflows the file view (so `FileViewVisualIndex` matches the
+    /// and reflows the file view (so `VisualIndex::build_lines` matches the
     /// new body_width). Codex adversarial review §Important-2 flagged
     /// that skipping either step leaves stale derived state.
     pub fn toggle_line_numbers(&mut self) {
         self.show_line_numbers = !self.show_line_numbers;
         self.build_layout();
-        self.reflow_file_view_after_width_change();
-    }
-
-    /// Reflow the file view after the effective body width changed
-    /// (line-number toggle, Stream mode switch, future window resize).
-    /// Mirrors [`Self::reflow_file_view_after_wrap_toggle`] but keys
-    /// off width instead of the wrap flag. The gutter width is
-    /// computed fresh each frame by the renderer from
-    /// [`Self::show_line_numbers`] + `fv.lines.len()`, so here we only
-    /// need to drop stale intra-row offsets and re-center the
-    /// viewport against the current visual index.
-    fn reflow_file_view_after_width_change(&mut self) {
-        let viewport_height = self.last_body_height.get().max(1);
-        let wrap_lines = self.wrap_lines;
-        let Some(fv) = self.file_view.as_mut() else {
-            return;
-        };
-        fv.cursor_sub_row = 0;
-        let body_width = wrap_lines.then_some(fv.last_body_width.get().max(1));
-        let vi = FileViewVisualIndex::build(&fv.lines, body_width);
-        let cursor_y = vi.visual_y(fv.cursor);
-        let max_top = vi.total_visual().saturating_sub(1);
-        fv.scroll_top = cursor_y.saturating_sub(viewport_height / 2).min(max_top);
-        fv.anim = None;
-        fv.visual_top = fv.scroll_top as f32;
+        self.reflow_file_view();
     }
 
     /// Toggle between Diff and Stream view modes. Rebuilds `files`
@@ -2005,10 +2087,7 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> KeyEffect {
         // Quit shortcuts.
-        if matches!(key.code, KeyCode::Char('q'))
-            || (matches!(key.code, KeyCode::Char('c'))
-                && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
+        if is_quit_key(key) {
             self.should_quit = true;
             return KeyEffect::None;
         }
@@ -2020,20 +2099,10 @@ impl App {
         // leaving the cursor pinned to the last scar.
         self.clear_scar_focus_on_nav();
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('d') => {
-                    self.scroll_by(HALF_PAGE as isize);
-                    self.follow_mode = false;
-                    return KeyEffect::None;
-                }
-                KeyCode::Char('u') => {
-                    self.scroll_by(-(HALF_PAGE as isize));
-                    self.follow_mode = false;
-                    return KeyEffect::None;
-                }
-                _ => {}
-            }
+        if let Some(delta) = control_page_delta(key) {
+            self.scroll_by(delta);
+            self.follow_mode = false;
+            return KeyEffect::None;
         }
 
         match key.code {
@@ -2099,19 +2168,14 @@ impl App {
                 // keys (j/k/J/K/h/l/g/G) are handled above; these
                 // are the action keys that users can remap in
                 // ~/.config/kizu/config.toml.
+                if self.handle_common_action_key(ch) {
+                    return KeyEffect::None;
+                }
                 let k = &self.config.keys;
-                if ch == '?' {
-                    self.help_overlay = true;
-                } else if ch == k.follow {
+                if ch == k.follow {
                     self.follow_restore();
                 } else if ch == k.picker {
                     self.open_picker();
-                } else if ch == k.ask {
-                    self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
-                } else if ch == k.reject {
-                    self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
-                } else if ch == k.comment {
-                    self.open_scar_comment();
                 } else if ch == k.revert {
                     self.open_revert_confirm();
                 } else if ch == k.seen {
@@ -2119,9 +2183,9 @@ impl App {
                 } else if ch == k.search {
                     self.open_search_input();
                 } else if ch == k.search_next {
-                    self.search_jump_next();
+                    self.search_jump_by(1);
                 } else if ch == k.search_prev {
-                    self.search_jump_prev();
+                    self.search_jump_by(-1);
                 } else if ch == k.editor {
                     // Read `$EDITOR` at dispatch time (not at bootstrap)
                     // so users who `export EDITOR=` mid-session pick up
@@ -2138,17 +2202,32 @@ impl App {
                     return self.reset_baseline();
                 } else if ch == k.cursor_placement {
                     self.toggle_cursor_placement();
-                } else if ch == k.wrap_toggle {
-                    self.toggle_wrap_lines();
-                } else if ch == k.line_numbers_toggle {
-                    self.toggle_line_numbers();
-                } else if ch == k.undo {
-                    self.undo_scar();
                 }
             }
             _ => {}
         }
         KeyEffect::None
+    }
+
+    fn handle_common_action_key(&mut self, ch: char) -> bool {
+        if ch == '?' {
+            self.help_overlay = true;
+        } else if ch == self.config.keys.ask {
+            self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
+        } else if ch == self.config.keys.reject {
+            self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
+        } else if ch == self.config.keys.comment {
+            self.open_scar_comment();
+        } else if ch == self.config.keys.wrap_toggle {
+            self.toggle_wrap_lines();
+        } else if ch == self.config.keys.line_numbers_toggle {
+            self.toggle_line_numbers();
+        } else if ch == self.config.keys.undo {
+            self.undo_scar();
+        } else {
+            return false;
+        }
+        true
     }
 
     // ---- help-overlay keys --------------------------------------------
@@ -2173,8 +2252,8 @@ impl App {
         // filter character.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('n') | KeyCode::Char('j') => self.picker_cursor_down(),
-                KeyCode::Char('p') | KeyCode::Char('k') => self.picker_cursor_up(),
+                KeyCode::Char('n') | KeyCode::Char('j') => self.move_picker_cursor(1),
+                KeyCode::Char('p') | KeyCode::Char('k') => self.move_picker_cursor(-1),
                 KeyCode::Char('c') => self.close_picker(),
                 _ => {}
             }
@@ -2198,8 +2277,8 @@ impl App {
                     self.jump_to_file_first_hunk(file_idx);
                 }
             }
-            KeyCode::Up => self.picker_cursor_up(),
-            KeyCode::Down => self.picker_cursor_down(),
+            KeyCode::Up => self.move_picker_cursor(-1),
+            KeyCode::Down => self.move_picker_cursor(1),
             KeyCode::Backspace => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.query.pop();
@@ -2271,19 +2350,14 @@ impl App {
         }
     }
 
-    fn picker_cursor_down(&mut self) {
+    fn move_picker_cursor(&mut self, delta: isize) {
         let len = self.picker_results().len();
-        if let Some(picker) = self.picker.as_mut()
-            && len > 0
-            && picker.cursor + 1 < len
-        {
-            picker.cursor += 1;
+        if len == 0 {
+            return;
         }
-    }
-
-    fn picker_cursor_up(&mut self) {
         if let Some(picker) = self.picker.as_mut() {
-            picker.cursor = picker.cursor.saturating_sub(1);
+            let max = len as isize - 1;
+            picker.cursor = (picker.cursor as isize + delta).clamp(0, max) as usize;
         }
     }
 
@@ -2444,6 +2518,38 @@ impl App {
         visual.round().max(0.0) as usize
     }
 
+    fn with_visual_index<R>(
+        &self,
+        body_width: Option<usize>,
+        f: impl FnOnce(&VisualIndex) -> R,
+    ) -> R {
+        let needs_rebuild = !matches!(
+            self.visual_index_cache.borrow().as_ref(),
+            Some(cached) if cached.body_width == body_width
+        );
+        if needs_rebuild {
+            let index = VisualIndex::build(&self.layout, &self.files, body_width);
+            *self.visual_index_cache.borrow_mut() = Some(CachedVisualIndex { body_width, index });
+        }
+        let cache = self.visual_index_cache.borrow();
+        let index = &cache.as_ref().expect("visual index cache populated").index;
+        f(index)
+    }
+
+    fn run_visual_height(
+        &self,
+        run_start: usize,
+        run_end: usize,
+        body_width: Option<usize>,
+    ) -> usize {
+        match body_width {
+            None => run_end.saturating_sub(run_start),
+            Some(_) => self.with_visual_index(body_width, |vi| {
+                vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start))
+            }),
+        }
+    }
+
     /// Compute the viewport's top position for the current render,
     /// returning `(top_row, skip_visual)` where `top_row` is the first
     /// logical layout row to draw and `skip_visual` is the number of
@@ -2471,15 +2577,16 @@ impl App {
             // Nowrap fast path — identical to the old visual_viewport_top.
             return (self.visual_viewport_top(viewport_height, now), 0);
         };
-        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-        let target_y = self.placement_target_visual_y(viewport_height, &vi);
-        let sampled_y = match self.anim.as_ref() {
-            Some(anim) => anim.sample(target_y as f32, now).0,
-            None => target_y as f32,
-        };
-        self.visual_top.set(sampled_y);
-        let y = sampled_y.round().max(0.0) as usize;
-        vi.logical_at(y)
+        self.with_visual_index(body_width, |vi| {
+            let target_y = self.placement_target_visual_y(viewport_height, vi);
+            let sampled_y = match self.anim.as_ref() {
+                Some(anim) => anim.sample(target_y as f32, now).0,
+                None => target_y as f32,
+            };
+            self.visual_top.set(sampled_y);
+            let y = sampled_y.round().max(0.0) as usize;
+            vi.logical_at(y)
+        })
     }
 
     /// Visual-y coordinate of the viewport's top edge under wrap mode,
@@ -2555,24 +2662,13 @@ impl App {
         // jump **backward** whenever the cursor sat past the final hunk
         // header (e.g. on the last diff line of a long hunk), which is
         // the opposite of what "next" should mean.
-        if let Some(&row) = self
-            .layout
-            .hunk_starts
-            .iter()
-            .find(|&&start| start > self.scroll)
-        {
+        if let Some(row) = next_sorted_after(&self.layout.hunk_starts, self.scroll) {
             self.scroll_to(row);
         }
     }
 
     pub fn prev_hunk(&mut self) {
-        if let Some(&row) = self
-            .layout
-            .hunk_starts
-            .iter()
-            .rev()
-            .find(|&&start| start < self.scroll)
-        {
+        if let Some(row) = prev_sorted_before(&self.layout.hunk_starts, self.scroll) {
             self.scroll_to(row);
         } else if let Some(&row) = self.layout.hunk_starts.first() {
             self.scroll_to(row);
@@ -2605,17 +2701,10 @@ impl App {
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
 
-        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-
         // Inside a long run, not at its last row → chunk forward
         // within the run so its body isn't teleported past.
-        if let Some(&(run_start, run_end)) = self
-            .layout
-            .change_runs
-            .iter()
-            .find(|(s, e)| *s <= cursor && cursor < *e)
-        {
-            let run_visual = vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start));
+        if let Some((run_start, run_end)) = change_run_at(&self.layout.change_runs, cursor) {
+            let run_visual = self.run_visual_height(run_start, run_end, body_width);
             if is_long_run(run_visual, viewport) && cursor + 1 < run_end {
                 let last_row = run_end.saturating_sub(1);
                 let target = (cursor + self.chunk_size()).min(last_row);
@@ -2630,18 +2719,8 @@ impl App {
         // headers *and* run starts, matching how a reader walks
         // through a diff (header = "here comes a hunk", run =
         // "here's a change inside it").
-        let next_run = self
-            .layout
-            .change_runs
-            .iter()
-            .find(|(s, _)| *s > cursor)
-            .map(|(s, _)| *s);
-        let next_hh = self
-            .layout
-            .hunk_starts
-            .iter()
-            .find(|&&s| s > cursor)
-            .copied();
+        let next_run = next_change_run_start_after(&self.layout.change_runs, cursor);
+        let next_hh = next_sorted_after(&self.layout.hunk_starts, cursor);
         if let Some(target) = nearest_landing_forward(next_run, next_hh) {
             self.scroll_to(target);
         }
@@ -2655,16 +2734,9 @@ impl App {
         let viewport = self.last_body_height.get().max(1);
         let body_width = self.last_body_width.get();
 
-        let vi = VisualIndex::build(&self.layout, &self.files, body_width);
-
         // Inside a long run, not at its start → chunk back within.
-        if let Some(&(run_start, run_end)) = self
-            .layout
-            .change_runs
-            .iter()
-            .find(|(s, e)| *s <= cursor && cursor < *e)
-        {
-            let run_visual = vi.visual_y(run_end).saturating_sub(vi.visual_y(run_start));
+        if let Some((run_start, run_end)) = change_run_at(&self.layout.change_runs, cursor) {
+            let run_visual = self.run_visual_height(run_start, run_end, body_width);
             if is_long_run(run_visual, viewport) && cursor > run_start {
                 let target = cursor.saturating_sub(self.chunk_size()).max(run_start);
                 self.scroll_to(target);
@@ -2674,20 +2746,8 @@ impl App {
 
         // v0.4: landing candidates are `{HunkHeader rows} ∪
         // {change-run starts}`. Mirror of [`Self::next_change`].
-        let prev_run = self
-            .layout
-            .change_runs
-            .iter()
-            .rev()
-            .find(|(s, _)| *s < cursor)
-            .map(|(s, _)| *s);
-        let prev_hh = self
-            .layout
-            .hunk_starts
-            .iter()
-            .rev()
-            .find(|&&s| s < cursor)
-            .copied();
+        let prev_run = prev_change_run_start_before(&self.layout.change_runs, cursor);
+        let prev_hh = prev_sorted_before(&self.layout.hunk_starts, cursor);
         if let Some(target) = nearest_landing_backward(prev_run, prev_hh) {
             self.scroll_to(target);
         }
@@ -2716,17 +2776,17 @@ impl App {
             return None;
         }
         let newest = self.files.len() - 1;
-        // Walk from the end to find the last HunkHeader of the newest file.
-        for (i, row) in self.layout.rows.iter().enumerate().rev() {
-            if matches!(row, RowKind::HunkHeader { file_idx, .. } if *file_idx == newest) {
-                return Some(i);
-            }
+        if let Some((row, _)) = self
+            .layout
+            .hunk_ranges
+            .get(newest)
+            .and_then(|ranges| ranges.last())
+            .copied()
+        {
+            return Some(row);
         }
-        // Fallback: try file header, then the absolute last row.
-        for (i, row) in self.layout.rows.iter().enumerate() {
-            if matches!(row, RowKind::FileHeader { file_idx } if *file_idx == newest) {
-                return Some(i);
-            }
+        if let Some(row) = self.layout.file_first_hunk.get(newest).copied().flatten() {
+            return Some(row);
         }
         self.layout.rows.len().checked_sub(1)
     }
@@ -3182,7 +3242,7 @@ impl App {
 
         let guessed_body_width = self.last_body_width.get().unwrap_or(1).max(1);
         let scroll_top = if self.wrap_lines {
-            let vi = FileViewVisualIndex::build(&lines, Some(guessed_body_width));
+            let vi = VisualIndex::build_lines(&lines, Some(guessed_body_width));
             vi.visual_y(initial_cursor)
                 .saturating_sub(self.last_body_height.get() / 2)
         } else {
@@ -3215,28 +3275,16 @@ impl App {
     /// `Enter`/`Esc` to exit, `j`/`k`/`J`/`K` for cursor
     /// movement, `g`/`G` for top/bottom, and `q` to quit.
     fn handle_file_view_key(&mut self, key: KeyEvent) -> KeyEffect {
-        if matches!(key.code, KeyCode::Char('q'))
-            || (matches!(key.code, KeyCode::Char('c'))
-                && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
+        if is_quit_key(key) {
             self.should_quit = true;
             return KeyEffect::None;
         }
         // Same sticky-focus discipline as normal mode: every keypress
         // drops the scar-focus pin; scar action keys re-establish it.
         self.clear_scar_focus_on_nav();
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('d') => {
-                    self.file_view_scroll_by(HALF_PAGE as isize, true);
-                    return KeyEffect::None;
-                }
-                KeyCode::Char('u') => {
-                    self.file_view_scroll_by(-(HALF_PAGE as isize), true);
-                    return KeyEffect::None;
-                }
-                _ => {}
-            }
+        if let Some(delta) = control_page_delta(key) {
+            self.file_view_scroll_by(delta, true);
+            return KeyEffect::None;
         }
         match key.code {
             KeyCode::Enter | KeyCode::Esc => self.close_file_view(),
@@ -3286,34 +3334,21 @@ impl App {
             // is now file-view aware. Config bindings apply (so a user
             // who remaps `ask` to `A` gets the new key here too).
             KeyCode::Char(ch) => {
-                let k = &self.config.keys;
-                if ch == '?' {
-                    self.help_overlay = true;
-                } else if ch == k.ask {
-                    self.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
-                } else if ch == k.reject {
-                    self.insert_canned_scar(ScarKind::Reject, SCAR_TEXT_REJECT);
-                } else if ch == k.comment {
-                    self.open_scar_comment();
-                } else if ch == k.wrap_toggle {
-                    self.toggle_wrap_lines();
-                } else if ch == k.line_numbers_toggle {
-                    self.toggle_line_numbers();
-                } else if ch == k.undo {
-                    self.undo_scar();
-                }
+                self.handle_common_action_key(ch);
             }
             _ => {}
         }
         KeyEffect::None
     }
 
-    /// Wrap toggle changes the file-view coordinate system from
-    /// logical lines to visual rows (or back). Re-center the viewport
-    /// around the current cursor, drop any stale intra-line offset,
-    /// and clear the animation so the next frame snaps cleanly onto
-    /// the new scale.
-    fn reflow_file_view_after_wrap_toggle(&mut self) {
+    /// Re-center the file view around the current cursor after any
+    /// change that invalidates visual-row coordinates — wrap toggle
+    /// flips the coordinate system between logical and visual rows;
+    /// line-number toggle / Stream-mode switch change `body_width`
+    /// and therefore the visual index. Drop any stale intra-line
+    /// offset and clear the animation so the next frame snaps cleanly
+    /// onto the new scale.
+    fn reflow_file_view(&mut self) {
         let viewport_height = self.last_body_height.get().max(1);
         let wrap_lines = self.wrap_lines;
         let Some(fv) = self.file_view.as_mut() else {
@@ -3321,7 +3356,7 @@ impl App {
         };
         fv.cursor_sub_row = 0;
         let body_width = wrap_lines.then_some(fv.last_body_width.get().max(1));
-        let vi = FileViewVisualIndex::build(&fv.lines, body_width);
+        let vi = VisualIndex::build_lines(&fv.lines, body_width);
         let cursor_y = vi.visual_y(fv.cursor);
         let max_top = vi.total_visual().saturating_sub(1);
         fv.scroll_top = cursor_y.saturating_sub(viewport_height / 2).min(max_top);
@@ -3336,7 +3371,7 @@ impl App {
             return;
         };
         if wrap_lines {
-            let vi = FileViewVisualIndex::build(&fv.lines, Some(fv.last_body_width.get().max(1)));
+            let vi = VisualIndex::build_lines(&fv.lines, Some(fv.last_body_width.get().max(1)));
             let cur_y = vi.visual_y(fv.cursor) + fv.cursor_sub_row;
             let new_y = (cur_y as isize + delta).max(0) as usize;
             let clamped = new_y.min(vi.total_visual().saturating_sub(1));
@@ -3344,21 +3379,8 @@ impl App {
             fv.cursor = new_cursor;
             fv.cursor_sub_row = new_sub;
             let old_top = fv.scroll_top;
-            if clamped < fv.scroll_top {
-                fv.scroll_top = clamped;
-            } else if clamped >= fv.scroll_top + viewport_height {
-                fv.scroll_top = clamped.saturating_sub(viewport_height - 1);
-            }
-            if animate && fv.scroll_top != old_top {
-                fv.anim = Some(ScrollAnim {
-                    from: fv.visual_top,
-                    start: Instant::now(),
-                    dur: SCROLL_ANIM_DURATION,
-                });
-            } else if !animate {
-                fv.anim = None;
-                fv.visual_top = fv.scroll_top as f32;
-            }
+            fv.scroll_top = scroll_top_to_keep_visible(fv.scroll_top, clamped, viewport_height);
+            update_file_view_scroll_anim(fv, old_top, animate);
             return;
         }
 
@@ -3367,22 +3389,8 @@ impl App {
         fv.cursor = new;
         fv.cursor_sub_row = 0;
         let old_top = fv.scroll_top;
-        if fv.cursor < fv.scroll_top {
-            fv.scroll_top = fv.cursor;
-        } else if fv.cursor >= fv.scroll_top + viewport_height {
-            fv.scroll_top = fv.cursor.saturating_sub(viewport_height - 1);
-        }
-        if animate && fv.scroll_top != old_top {
-            fv.anim = Some(ScrollAnim {
-                from: fv.visual_top,
-                start: Instant::now(),
-                dur: SCROLL_ANIM_DURATION,
-            });
-        } else if !animate {
-            // Snap: clear any in-flight animation (J/K 1-row moves).
-            fv.anim = None;
-            fv.visual_top = fv.scroll_top as f32;
-        }
+        fv.scroll_top = scroll_top_to_keep_visible(fv.scroll_top, fv.cursor, viewport_height);
+        update_file_view_scroll_anim(fv, old_top, animate);
     }
 
     /// Advance the file-view scroll animation by one frame.
@@ -3411,16 +3419,12 @@ impl App {
         fv.cursor = line.min(max);
         fv.cursor_sub_row = 0;
         let cursor_y = if wrap_lines {
-            let vi = FileViewVisualIndex::build(&fv.lines, Some(fv.last_body_width.get().max(1)));
+            let vi = VisualIndex::build_lines(&fv.lines, Some(fv.last_body_width.get().max(1)));
             vi.visual_y(fv.cursor)
         } else {
             fv.cursor
         };
-        if cursor_y < fv.scroll_top {
-            fv.scroll_top = cursor_y;
-        } else if cursor_y >= fv.scroll_top + viewport_height {
-            fv.scroll_top = cursor_y.saturating_sub(viewport_height - 1);
-        }
+        fv.scroll_top = scroll_top_to_keep_visible(fv.scroll_top, cursor_y, viewport_height);
         // g/G are instant jumps — no animation.
         fv.anim = None;
         fv.visual_top = fv.scroll_top as f32;
@@ -3444,8 +3448,7 @@ impl App {
     /// jump the cursor to the first match **after the current cursor
     /// position** (vim-style). Wraps around to the global first match
     /// when every hit is before the cursor, so the press always lands
-    /// somewhere as long as matches exist. `N` / `search_jump_prev`
-    /// is the way to step backward from there.
+    /// somewhere as long as matches exist. `N` steps backward from there.
     ///
     /// Empty queries close the composer without touching confirmed
     /// state so a stray `/` + `Enter` does not wipe an existing search.
@@ -3479,90 +3482,25 @@ impl App {
     /// deletes, Enter commits, Esc cancels. Ctrl-C also cancels
     /// (matches the other modal overlays).
     fn handle_search_input_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('c') => self.close_search_input(),
-                KeyCode::Char('a') => {
-                    if let Some(s) = self.search_input.as_mut() {
-                        s.cursor_pos = 0;
-                    }
-                }
-                KeyCode::Char('e') => {
-                    if let Some(s) = self.search_input.as_mut() {
-                        s.cursor_pos = s.query.chars().count();
-                    }
-                }
-                _ => {}
-            }
+        let Some(s) = self.search_input.as_mut() else {
             return;
-        }
-        match key.code {
-            KeyCode::Esc => self.close_search_input(),
-            KeyCode::Enter => self.commit_search_input(),
-            KeyCode::Backspace => {
-                if let Some(s) = self.search_input.as_mut() {
-                    edit_backspace(&mut s.query, &mut s.cursor_pos);
-                }
-            }
-            KeyCode::Left => {
-                if let Some(s) = self.search_input.as_mut() {
-                    s.cursor_pos = s.cursor_pos.saturating_sub(1);
-                }
-            }
-            KeyCode::Right => {
-                if let Some(s) = self.search_input.as_mut() {
-                    s.cursor_pos = (s.cursor_pos + 1).min(s.query.chars().count());
-                }
-            }
-            KeyCode::Home => {
-                if let Some(s) = self.search_input.as_mut() {
-                    s.cursor_pos = 0;
-                }
-            }
-            KeyCode::End => {
-                if let Some(s) = self.search_input.as_mut() {
-                    s.cursor_pos = s.query.chars().count();
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(s) = self.search_input.as_mut() {
-                    edit_insert_char(&mut s.query, &mut s.cursor_pos, c);
-                }
-            }
-            _ => {}
+        };
+        match handle_text_input_edit(key, &mut s.query, &mut s.cursor_pos) {
+            TextInputKeyEffect::Continue => {}
+            TextInputKeyEffect::Commit => self.commit_search_input(),
+            TextInputKeyEffect::Cancel => self.close_search_input(),
         }
     }
 
-    /// `n` — advance to the next confirmed search hit and jump the
-    /// cursor to its row. Wraps around at the end. No-op when
-    /// there is no confirmed search or it has zero matches.
-    pub fn search_jump_next(&mut self) {
+    fn search_jump_by(&mut self, delta: isize) {
         let Some(state) = self.search.as_mut() else {
             return;
         };
         if state.matches.is_empty() {
             return;
         }
-        state.current = (state.current + 1) % state.matches.len();
-        let row = state.matches[state.current].row;
-        self.follow_mode = false;
-        self.scroll_to(row);
-    }
-
-    /// `N` — step back to the previous confirmed search hit,
-    /// wrapping to the tail at the start.
-    pub fn search_jump_prev(&mut self) {
-        let Some(state) = self.search.as_mut() else {
-            return;
-        };
-        if state.matches.is_empty() {
-            return;
-        }
-        state.current = if state.current == 0 {
-            state.matches.len() - 1
-        } else {
-            state.current - 1
-        };
+        let len = state.matches.len() as isize;
+        state.current = (state.current as isize + delta).rem_euclid(len) as usize;
         let row = state.matches[state.current].row;
         self.follow_mode = false;
         self.scroll_to(row);
@@ -3581,12 +3519,19 @@ impl App {
         let Some(hunk) = hunks.get(hunk_idx) else {
             return false;
         };
-        is_hunk_seen(
-            &self.seen_hunks,
-            &file.path,
-            hunk.old_start,
-            hunk_fingerprint(hunk),
-        )
+        let Some(marked_fp) = seen_hunk_fingerprint(&self.seen_hunks, &file.path, hunk.old_start)
+        else {
+            return false;
+        };
+        let current_fp = self
+            .layout
+            .hunk_fingerprints
+            .get(file_idx)
+            .and_then(|fps| fps.get(hunk_idx))
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| hunk_fingerprint(hunk));
+        marked_fp == current_fp
     }
 
     /// Resolve the cursor's current target (path + 1-indexed line)
@@ -3700,57 +3645,13 @@ impl App {
     }
 
     fn handle_scar_comment_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('c') => self.close_scar_comment(),
-                KeyCode::Char('a') => {
-                    if let Some(s) = self.scar_comment.as_mut() {
-                        s.cursor_pos = 0;
-                    }
-                }
-                KeyCode::Char('e') => {
-                    if let Some(s) = self.scar_comment.as_mut() {
-                        s.cursor_pos = s.body.chars().count();
-                    }
-                }
-                _ => {}
-            }
+        let Some(s) = self.scar_comment.as_mut() else {
             return;
-        }
-        match key.code {
-            KeyCode::Esc => self.close_scar_comment(),
-            KeyCode::Enter => self.commit_scar_comment(),
-            KeyCode::Backspace => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    edit_backspace(&mut s.body, &mut s.cursor_pos);
-                }
-            }
-            KeyCode::Left => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    s.cursor_pos = s.cursor_pos.saturating_sub(1);
-                }
-            }
-            KeyCode::Right => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    s.cursor_pos = (s.cursor_pos + 1).min(s.body.chars().count());
-                }
-            }
-            KeyCode::Home => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    s.cursor_pos = 0;
-                }
-            }
-            KeyCode::End => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    s.cursor_pos = s.body.chars().count();
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(s) = self.scar_comment.as_mut() {
-                    edit_insert_char(&mut s.body, &mut s.cursor_pos, c);
-                }
-            }
-            _ => {}
+        };
+        match handle_text_input_edit(key, &mut s.body, &mut s.cursor_pos) {
+            TextInputKeyEffect::Continue => {}
+            TextInputKeyEffect::Commit => self.commit_scar_comment(),
+            TextInputKeyEffect::Cancel => self.close_scar_comment(),
         }
     }
 
@@ -3833,37 +3734,16 @@ impl App {
     }
 
     /// `(start, end_exclusive)` row range of the cursor's current hunk.
-    /// Walks `layout.rows` from the start of the hunk header through
-    /// every consecutive `DiffLine` belonging to the same hunk. Returns
-    /// `None` when the cursor is not inside a hunk.
+    /// Reads the range cached by `build_layout`, so render-time hunk
+    /// anchoring stays O(1) even when a diff contains thousands of hunks.
+    /// Returns `None` when the cursor is not inside a hunk.
     pub fn current_hunk_range(&self) -> Option<(usize, usize)> {
         let (file_idx, hunk_idx) = self.current_hunk()?;
-        let mut start = None;
-        let mut end = None;
-        for (i, row) in self.layout.rows.iter().enumerate() {
-            let belongs = match row {
-                RowKind::HunkHeader {
-                    file_idx: f,
-                    hunk_idx: h,
-                } => *f == file_idx && *h == hunk_idx,
-                RowKind::DiffLine {
-                    file_idx: f,
-                    hunk_idx: h,
-                    ..
-                } => *f == file_idx && *h == hunk_idx,
-                _ => false,
-            };
-            if belongs {
-                if start.is_none() {
-                    start = Some(i);
-                }
-                end = Some(i + 1);
-            } else if start.is_some() {
-                // Already walked past the hunk's last row.
-                break;
-            }
-        }
-        Some((start?, end?))
+        self.layout
+            .hunk_ranges
+            .get(file_idx)?
+            .get(hunk_idx)
+            .copied()
     }
 
     /// Where the renderer should park the viewport top, given a body
@@ -3947,6 +3827,8 @@ impl App {
         let mut max_line_number: usize = 0;
 
         for (file_idx, file) in self.files.iter().enumerate() {
+            let mut file_hunk_ranges = Vec::new();
+            let mut file_hunk_fingerprints = Vec::new();
             let header_row = layout.rows.len();
             layout.rows.push(RowKind::FileHeader { file_idx });
             layout.diff_line_numbers.push(None);
@@ -3977,11 +3859,13 @@ impl App {
                             // the hunk header is visible. The mark
                             // auto-clears (below, in the fingerprint
                             // check) once the hunk content drifts.
-                            let is_seen = is_hunk_seen(
-                                &self.seen_hunks,
-                                &file.path,
-                                hunk.old_start,
-                                hunk_fingerprint(hunk),
+                            let marked_fp =
+                                seen_hunk_fingerprint(&self.seen_hunks, &file.path, hunk.old_start);
+                            let current_fp = marked_fp.map(|_| hunk_fingerprint(hunk));
+                            file_hunk_fingerprints.push(current_fp);
+                            let is_seen = matches!(
+                                (marked_fp, current_fp),
+                                (Some(marked), Some(current)) if marked == current
                             );
                             if !is_seen {
                                 // v0.5: inline the old/new counter walk
@@ -4029,11 +3913,14 @@ impl App {
                                     layout.diff_line_numbers.push(Some(pair));
                                 }
                             }
+                            file_hunk_ranges.push((row, layout.rows.len()));
                         }
                     }
                 }
             }
 
+            layout.hunk_ranges.push(file_hunk_ranges);
+            layout.hunk_fingerprints.push(file_hunk_fingerprints);
             layout.rows.push(RowKind::Spacer);
             layout.diff_line_numbers.push(None);
         }
@@ -4096,6 +3983,7 @@ impl App {
         }
 
         self.layout = layout;
+        self.visual_index_cache.get_mut().take();
     }
 
     /// Slide `scroll` to the row of `self.anchor` in the new layout.
@@ -4241,137 +4129,6 @@ impl App {
 }
 
 /// Async event loop. See ADR-0003 / ADR-0005.
-/// Convert stream events into virtual [`FileDiff`] entries so the
-/// existing scroll infrastructure can render them identically to
-/// git diff output. Each event becomes one `FileDiff` with:
-/// - `header_prefix`: "HH:MM:SS Tool" for display in the file header
-/// - `path`: the edited file path
-/// - `content`: parsed diff lines from the captured snapshot
-pub fn build_stream_files(events: &[StreamEvent]) -> Vec<FileDiff> {
-    let mut out: Vec<FileDiff> = Vec::new();
-    for (i, ev) in events.iter().enumerate() {
-        let ts = ev.metadata.timestamp_ms;
-        let time_str = crate::ui::format_local_time(ts);
-        let tool = ev.metadata.tool_name.as_deref().unwrap_or("?");
-        let prefix = format!("{time_str} {tool}");
-        let mtime = SystemTime::UNIX_EPOCH + Duration::from_millis(ts);
-
-        // Use `file_paths` order as the stable render order so a
-        // multi-file tool call presents files in the order the agent
-        // reported them, not in the BTreeMap's sort order.
-        let paths: Vec<PathBuf> = if ev.metadata.file_paths.is_empty() {
-            // Preserve the "empty placeholder" behavior for events
-            // whose file_paths could not be resolved — they still
-            // need to be visible in the stream as a metadata row.
-            vec![PathBuf::new()]
-        } else {
-            ev.metadata.file_paths.clone()
-        };
-
-        // Space each (event, path) pair's old_start apart so hunk
-        // anchors (keyed on path + old_start) stay unique across
-        // events and paths.
-        for (j, path) in paths.into_iter().enumerate() {
-            let anchor_base = (i * 10_000) + (j * 100) + 1;
-            let diff_text = ev.per_file_diffs.get(&path);
-            let (hunks, added, deleted) = match diff_text {
-                Some(t) if !t.is_empty() => parse_stream_diff_to_hunk(t, anchor_base),
-                _ => (vec![], 0, 0),
-            };
-
-            out.push(FileDiff {
-                path,
-                status: git::FileStatus::Modified,
-                added,
-                deleted,
-                content: git::DiffContent::Text(hunks),
-                mtime,
-                header_prefix: Some(prefix.clone()),
-            });
-        }
-    }
-    out
-}
-
-/// Parse raw diff text (from a stream event snapshot) into a single
-/// `Hunk` with `DiffLine` entries. Hunk header lines (`@@`) are
-/// skipped; `+`/`-`/` ` prefix determines `LineKind`.
-fn parse_stream_diff_to_hunk(diff_text: &str, old_start: usize) -> (Vec<git::Hunk>, usize, usize) {
-    let mut lines = Vec::new();
-    let mut added = 0usize;
-    let mut deleted = 0usize;
-    for raw in diff_text.lines() {
-        if raw.starts_with("@@")
-            || raw.starts_with("diff ")
-            || raw.starts_with("---")
-            || raw.starts_with("+++")
-            || raw.starts_with("index ")
-        {
-            continue;
-        }
-        let (kind, content) = if let Some(rest) = raw.strip_prefix('+') {
-            added += 1;
-            (LineKind::Added, rest.to_string())
-        } else if let Some(rest) = raw.strip_prefix('-') {
-            deleted += 1;
-            (LineKind::Deleted, rest.to_string())
-        } else if let Some(rest) = raw.strip_prefix(' ') {
-            (LineKind::Context, rest.to_string())
-        } else {
-            (LineKind::Context, raw.to_string())
-        };
-        lines.push(git::DiffLine {
-            kind,
-            content,
-            has_trailing_newline: true,
-        });
-    }
-    if lines.is_empty() {
-        return (vec![], 0, 0);
-    }
-    let hunk = git::Hunk {
-        old_start,
-        old_count: deleted,
-        new_start: old_start,
-        new_count: added,
-        lines,
-        context: None,
-    };
-    (vec![hunk], added, deleted)
-}
-
-/// Compute the "operation diff" — the lines in `current` that were
-/// not already present in `previous`, counted as a **multiset** so
-/// duplicate lines (e.g. two blank `+` lines, or two identical
-/// closing-brace context rows) survive when `current` has more copies
-/// than `previous`.
-///
-/// This is not a true diff-of-diff — hunk boundaries, line numbers,
-/// and ordering drift are ignored. In practice the cumulative
-/// snapshots differ by the lines one Write/Edit operation added or
-/// re-shaped, so a multiset difference gives a readable approximation.
-/// Limitations and design rationale are documented in ADR-0016.
-fn compute_operation_diff(previous: &str, current: &str) -> String {
-    use std::collections::HashMap;
-    let mut prev_counts: HashMap<&str, usize> = HashMap::new();
-    for line in previous.lines() {
-        *prev_counts.entry(line).or_insert(0) += 1;
-    }
-    let mut result = String::new();
-    for line in current.lines() {
-        match prev_counts.get_mut(line) {
-            Some(count) if *count > 0 => {
-                *count -= 1;
-            }
-            _ => {
-                result.push_str(line);
-                result.push('\n');
-            }
-        }
-    }
-    result
-}
-
 pub async fn run() -> Result<()> {
     use std::io::Write;
     let log_path = std::env::var("KIZU_STARTUP_TIMING_FILE").ok();
@@ -4676,7 +4433,14 @@ fn run_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::{DiffContent, DiffLine, FileStatus, Hunk, LineKind};
+    use crate::git::{DiffContent, DiffLine, LineKind};
+    use crate::test_support::{
+        added_hunk, added_hunk_app, added_hunk_file, app_with_files as fake_app, app_with_hunks,
+        binary_file, context_hunk_file, diff_line, file_view_state, file_with_hunk, hunk,
+        install_search, make_file, numbered_added_lines, prefixed_diff_lines, single_added_app,
+        single_added_file, single_added_hunk_file, single_deleted_file, single_hunk_app,
+        single_hunk_file,
+    };
     use std::time::Duration;
 
     #[test]
@@ -4738,121 +4502,10 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    fn diff_line(kind: LineKind, content: &str) -> DiffLine {
-        DiffLine {
-            kind,
-            content: content.to_string(),
-            has_trailing_newline: true,
+    fn type_chars(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
         }
-    }
-
-    fn hunk(old_start: usize, lines: Vec<DiffLine>) -> Hunk {
-        let added = lines.iter().filter(|l| l.kind == LineKind::Added).count();
-        let deleted = lines.iter().filter(|l| l.kind == LineKind::Deleted).count();
-        Hunk {
-            old_start,
-            old_count: deleted,
-            new_start: old_start,
-            new_count: added,
-            lines,
-            context: None,
-        }
-    }
-
-    fn make_file(name: &str, hunks: Vec<Hunk>, secs: u64) -> FileDiff {
-        let added: usize = hunks
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .filter(|l| l.kind == LineKind::Added)
-            .count();
-        let deleted: usize = hunks
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .filter(|l| l.kind == LineKind::Deleted)
-            .count();
-        FileDiff {
-            path: PathBuf::from(name),
-            status: FileStatus::Modified,
-            added,
-            deleted,
-            content: DiffContent::Text(hunks),
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-            header_prefix: None,
-        }
-    }
-
-    fn binary_file(name: &str, secs: u64) -> FileDiff {
-        FileDiff {
-            path: PathBuf::from(name),
-            status: FileStatus::Modified,
-            added: 0,
-            deleted: 0,
-            content: DiffContent::Binary,
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-            header_prefix: None,
-        }
-    }
-
-    /// Build an `App` against `/tmp/fake` with no real filesystem use; the
-    /// `populate_mtimes` step is bypassed by writing `mtime` directly on the
-    /// fixtures. Files are sorted in ascending mtime order to match the
-    /// real `recompute_diff` path.
-    fn fake_app(files: Vec<FileDiff>) -> App {
-        let mut app = App {
-            root: PathBuf::from("/tmp/fake"),
-            git_dir: PathBuf::from("/tmp/fake/.git"),
-            common_git_dir: PathBuf::from("/tmp/fake/.git"),
-            current_branch_ref: Some("refs/heads/main".into()),
-            baseline_sha: "abcdef1234567890abcdef1234567890abcdef12".into(),
-            files: Vec::new(),
-            layout: ScrollLayout::default(),
-            scroll: 0,
-            cursor_sub_row: 0,
-            cursor_placement: CursorPlacement::Centered,
-            anchor: None,
-            help_overlay: false,
-            picker: None,
-            scar_comment: None,
-            revert_confirm: None,
-            file_view: None,
-            search_input: None,
-            search: None,
-            seen_hunks: BTreeMap::new(),
-            follow_mode: true,
-            last_error: None,
-            input_health: None,
-            head_dirty: false,
-            should_quit: false,
-            last_body_height: Cell::new(DEFAULT_BODY_HEIGHT),
-            last_body_width: Cell::new(None),
-            visual_top: Cell::new(0.0),
-            anim: None,
-            wrap_lines: false,
-            show_line_numbers: false,
-            watcher_health: WatcherHealth::default(),
-            highlighter: std::cell::OnceCell::new(),
-            config: crate::config::KizuConfig::default(),
-            view_mode: ViewMode::default(),
-            saved_diff_scroll: 0,
-            saved_stream_scroll: 0,
-            stream_events: Vec::new(),
-            processed_event_paths: std::collections::HashSet::new(),
-            // Tests use small timestamps (1000, 2000, …) for events.
-            // Leave `session_start_ms` at 0 so the session-isolation
-            // filter in `handle_event_log` is a no-op by default;
-            // tests that exercise the filter set this field explicitly.
-            session_start_ms: 0,
-            bound_session_id: None,
-            diff_snapshots: DiffSnapshots::default(),
-            scar_undo_stack: Vec::new(),
-            scar_focus: None,
-            pinned_cursor_y: None,
-        };
-        app.files = files;
-        app.files.sort_by_key(|a| a.mtime);
-        app.build_layout();
-        app.refresh_anchor();
-        app
     }
 
     fn file_idx(app: &App, name: &str) -> usize {
@@ -4864,11 +4517,7 @@ mod tests {
 
     #[test]
     fn build_layout_produces_header_then_hunks_then_spacer_per_file() {
-        let app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let app = single_added_app("a.rs", "x");
 
         // Expected sequence:
         //   FileHeader, HunkHeader, DiffLine, Spacer
@@ -4916,18 +4565,11 @@ mod tests {
             // a.rs: newest, 2 hunks
             make_file(
                 "a.rs",
-                vec![
-                    hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                    hunk(10, vec![diff_line(LineKind::Added, "y")]),
-                ],
+                vec![added_hunk(1, &["x"]), added_hunk(10, &["y"])],
                 200,
             ),
             // b.rs: older, 1 hunk
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-                100,
-            ),
+            single_added_file("b.rs", "z", 100),
         ];
         let mut app = fake_app(app_files);
         // Three hunks total → three hunk_starts.
@@ -4950,10 +4592,7 @@ mod tests {
     fn prev_hunk_walks_backwards() {
         let app_files = vec![make_file(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(10, vec![diff_line(LineKind::Added, "y")]),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(10, &["y"])],
             100,
         )];
         let mut app = fake_app(app_files);
@@ -4972,17 +4611,10 @@ mod tests {
         // the newest file so the user sees the most recent @@
         // context and the diff body below it.
         let app = fake_app(vec![
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "c")])],
-                100,
-            ),
+            single_added_file("older.rs", "c", 100),
             make_file(
                 "newest.rs",
-                vec![
-                    hunk(1, vec![diff_line(LineKind::Added, "a")]),
-                    hunk(20, vec![diff_line(LineKind::Added, "b")]),
-                ],
+                vec![added_hunk(1, &["a"]), added_hunk(20, &["b"])],
                 300,
             ),
         ]);
@@ -5011,13 +4643,8 @@ mod tests {
     fn follow_target_row_lands_on_hunk_header_even_for_tall_hunk() {
         // Even with a 20-line hunk, follow parks on the hunk header
         // so the user sees the @@ context and diff body from the top.
-        let huge_hunk = hunk(
-            1,
-            (0..20)
-                .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-                .collect(),
-        );
-        let app = fake_app(vec![make_file("big.rs", vec![huge_hunk], 500)]);
+        let huge_hunk = hunk(1, numbered_added_lines(20));
+        let app = app_with_hunks("big.rs", vec![huge_hunk], 500);
         assert!(
             matches!(app.layout.rows[app.scroll], RowKind::HunkHeader { .. }),
             "follow should land on HunkHeader, got {:?}",
@@ -5028,16 +4655,8 @@ mod tests {
     #[test]
     fn current_file_path_reports_the_file_under_the_cursor() {
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("a.rs", "x", 200),
+            single_added_file("b.rs", "y", 100),
         ]);
         // a.rs has the larger mtime → it sorts to the bottom of the
         // layout, and bootstrap follow lands on it.
@@ -5057,14 +4676,11 @@ mod tests {
         // then to the Added line within that hunk (the run), then to
         // the next hunk. Repeatedly pressing `j` eventually crosses
         // into the next hunk even without a "short hunk shortcut".
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(20, vec![diff_line(LineKind::Added, "y")]),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(20, &["y"])],
             100,
-        )]);
+        );
         app.scroll_to(0);
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll, app.layout.hunk_starts[0]);
@@ -5081,14 +4697,11 @@ mod tests {
         // SHIFT-J used to play. Two short hunks; pressing `l` from the
         // first lands on the second; pressing `l` again stays put
         // because there is no third hunk.
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "alpha")]),
-                hunk(10, vec![diff_line(LineKind::Added, "beta")]),
-            ],
+            vec![added_hunk(1, &["alpha"]), added_hunk(10, &["beta"])],
             100,
-        )]);
+        );
         assert_eq!(app.layout.hunk_starts.len(), 2);
         let first_hunk = app.layout.hunk_starts[0];
         let second_hunk = app.layout.hunk_starts[1];
@@ -5111,10 +4724,8 @@ mod tests {
         // old `next_hunk` fallback to `hunk_starts.last()` made the
         // cursor leap backward, which is the opposite of what `j`
         // should mean.
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let lines = numbered_added_lines(20);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(15);
         let (_start, end) = app.layout.change_runs[0];
         let last = end - 1;
@@ -5134,10 +4745,8 @@ mod tests {
         // the user actually sees the change. Once the cursor reaches
         // the run's last row, the next `j` hands off to the straight
         // hunk-cross path (no trailing-context dwell).
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let lines = numbered_added_lines(20);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
         assert_eq!(chunk, 5, "viewport=15 → chunk=5");
@@ -5169,16 +4778,8 @@ mod tests {
         // file boundary between them. One tiny hunk per file so the
         // jump has to cross from a.rs into b.rs.
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "alpha")])],
-                100,
-            ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "beta")])],
-                200,
-            ),
+            single_added_file("a.rs", "alpha", 100),
+            single_added_file("b.rs", "beta", 200),
         ]);
         assert_eq!(app.layout.hunk_starts.len(), 2);
         let first_hunk = app.layout.hunk_starts[0];
@@ -5200,10 +4801,8 @@ mod tests {
         // start; the next `k` falls through to the hunk header
         // (v0.4: hunk headers are landing targets). With no prev
         // hunk, a further `k` stays put.
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let lines = numbered_added_lines(20);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(15);
         let chunk = app.chunk_size();
         let (run_start, run_end) = app.layout.change_runs[0];
@@ -5258,7 +4857,7 @@ mod tests {
             diff_line(LineKind::Added, "r3-a1"), // run 3 start
             diff_line(LineKind::Context, "ctx11"),
         ];
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.last_body_height.set(10);
         let runs: Vec<_> = app.layout.change_runs.clone();
         assert_eq!(runs.len(), 3);
@@ -5300,11 +4899,7 @@ mod tests {
                 )],
                 100,
             ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "b1")])],
-                200,
-            ),
+            single_added_file("b.rs", "b1", 200),
         ]);
         app.last_body_height.set(40);
         let runs = app.layout.change_runs.clone();
@@ -5333,21 +4928,11 @@ mod tests {
         // In this fixture the prev hunk's only run starts at row 2
         // (closer to HH1 than HH0 at row 1), so we land on the run
         // start first. A second `k` then steps back to HH0.
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "a1"),
-                        diff_line(LineKind::Added, "a2"),
-                        diff_line(LineKind::Added, "a3"),
-                    ],
-                ),
-                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
-            ],
+            vec![added_hunk(1, &["a1", "a2", "a3"]), added_hunk(10, &["b1"])],
             100,
-        )]);
+        );
         let first_hunk_top = app.layout.hunk_starts[0];
         let second_hunk_top = app.layout.hunk_starts[1];
         let (first_hunk_last_run_start, _) = app.layout.change_runs[0];
@@ -5376,14 +4961,7 @@ mod tests {
         for _ in 0..5 {
             lines_a.push(diff_line(LineKind::Context, "tail"));
         }
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![
-                hunk(1, lines_a),
-                hunk(20, vec![diff_line(LineKind::Added, "b1")]),
-            ],
-            100,
-        )]);
+        let mut app = app_with_hunks("a.rs", vec![hunk(1, lines_a), added_hunk(20, &["b1"])], 100);
         let first_hunk_top = app.layout.hunk_starts[0];
         let second_hunk_top = app.layout.hunk_starts[1];
         let (first_run_start, _) = app.layout.change_runs[0];
@@ -5416,12 +4994,8 @@ mod tests {
             lines.push(diff_line(LineKind::Context, "trail"));
         }
         let mut app = fake_app(vec![
-            make_file("a.rs", vec![hunk(1, lines)], 100),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
+            single_hunk_file("a.rs", lines, 100),
+            single_added_file("b.rs", "x", 200),
         ]);
         app.last_body_height.set(10);
         let (run_start, _) = app.layout.change_runs[0];
@@ -5439,14 +5013,11 @@ mod tests {
         // v0.2 remap: `h` is the strict previous-hunk jump that the
         // old SHIFT-K used to do. Two short hunks, cursor on the
         // second — pressing `h` lands on the first hunk header.
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "alpha")]),
-                hunk(10, vec![diff_line(LineKind::Added, "beta")]),
-            ],
+            vec![added_hunk(1, &["alpha"]), added_hunk(10, &["beta"])],
             100,
-        )]);
+        );
         let first_hunk = app.layout.hunk_starts[0];
         let second_hunk = app.layout.hunk_starts[1];
 
@@ -5460,18 +5031,7 @@ mod tests {
         // v0.2 remap: `J` is a one-row forward cursor move, not a
         // hunk jump. Starting at the file header row, `J` walks one
         // row at a time (header → hunk header → first diff line).
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "one"),
-                    diff_line(LineKind::Added, "two"),
-                    diff_line(LineKind::Added, "three"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["one", "two", "three"], 100);
         app.scroll_to(0);
         let before = app.scroll;
         app.handle_key(key(KeyCode::Char('J')));
@@ -5484,18 +5044,7 @@ mod tests {
     #[test]
     fn shift_k_moves_cursor_up_by_exactly_one_visual_row() {
         // v0.2 remap: `K` is a one-row backward cursor move.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "one"),
-                    diff_line(LineKind::Added, "two"),
-                    diff_line(LineKind::Added, "three"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["one", "two", "three"], 100);
         app.scroll_to(3);
         app.handle_key(key(KeyCode::Char('K')));
         assert_eq!(app.scroll, 2);
@@ -5509,17 +5058,12 @@ mod tests {
         // Even from the last row of a long hunk, `l` jumps to the
         // next hunk's header. This mirrors the old SHIFT-J "flow
         // across boundary" behavior but now lives on `l`.
-        let lines: Vec<DiffLine> = (0..20)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = fake_app(vec![make_file(
+        let lines = numbered_added_lines(20);
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, lines),
-                hunk(100, vec![diff_line(LineKind::Added, "tail")]),
-            ],
+            vec![hunk(1, lines), added_hunk(100, &["tail"])],
             100,
-        )]);
+        );
         app.last_body_height.set(15);
         let second_hunk = app.layout.hunk_starts[1];
 
@@ -5552,43 +5096,9 @@ mod tests {
         // Centring 3 rows in a 9-row viewport means
         // viewport_top = 8 - (9 - 3)/2 = 8 - 3 = 5.
         let mut app = fake_app(vec![
-            make_file(
-                "before.rs",
-                vec![hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Context, " a"),
-                        diff_line(LineKind::Context, " b"),
-                        diff_line(LineKind::Context, " c"),
-                        diff_line(LineKind::Context, " d"),
-                    ],
-                )],
-                100,
-            ),
-            make_file(
-                "target.rs",
-                vec![hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "alpha"),
-                        diff_line(LineKind::Added, "beta"),
-                    ],
-                )],
-                200,
-            ),
-            make_file(
-                "after.rs",
-                vec![hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Context, " a"),
-                        diff_line(LineKind::Context, " b"),
-                        diff_line(LineKind::Context, " c"),
-                        diff_line(LineKind::Context, " d"),
-                    ],
-                )],
-                300,
-            ),
+            context_hunk_file("before.rs", 1, &[" a", " b", " c", " d"], 100),
+            added_hunk_file("target.rs", 1, &["alpha", "beta"], 200),
+            context_hunk_file("after.rs", 1, &[" a", " b", " c", " d"], 300),
         ]);
         // Park the cursor on target.rs's hunk header.
         let target_hunk_row = app.layout.hunk_starts[1];
@@ -5608,10 +5118,8 @@ mod tests {
         // Single long hunk, much taller than the viewport: should fall
         // back to centring the cursor row instead of trying to centre
         // the whole hunk.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let lines = numbered_added_lines(40);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         let header = app.layout.hunk_starts[0];
         // Park well inside the long hunk.
         app.scroll_to(header + 20);
@@ -5647,43 +5155,9 @@ mod tests {
         // Top mode pins hunk_top (8) to the viewport ceiling, so
         // viewport_top = 8.
         let mut app = fake_app(vec![
-            make_file(
-                "before.rs",
-                vec![hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Context, " a"),
-                        diff_line(LineKind::Context, " b"),
-                        diff_line(LineKind::Context, " c"),
-                        diff_line(LineKind::Context, " d"),
-                    ],
-                )],
-                100,
-            ),
-            make_file(
-                "target.rs",
-                vec![hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "alpha"),
-                        diff_line(LineKind::Added, "beta"),
-                    ],
-                )],
-                200,
-            ),
-            make_file(
-                "after.rs",
-                vec![hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Context, " a"),
-                        diff_line(LineKind::Context, " b"),
-                        diff_line(LineKind::Context, " c"),
-                        diff_line(LineKind::Context, " d"),
-                    ],
-                )],
-                300,
-            ),
+            context_hunk_file("before.rs", 1, &[" a", " b", " c", " d"], 100),
+            added_hunk_file("target.rs", 1, &["alpha", "beta"], 200),
+            context_hunk_file("after.rs", 1, &[" a", " b", " c", " d"], 300),
         ]);
         app.cursor_placement = CursorPlacement::Top;
         let target_hunk_row = app.layout.hunk_starts[1];
@@ -5703,10 +5177,8 @@ mod tests {
         // When hunk_size > viewport, Top mode falls back to pinning
         // the cursor row itself to the ceiling so J/K chunk scroll
         // keeps working.
-        let lines: Vec<DiffLine> = (0..40)
-            .map(|i| diff_line(LineKind::Added, &format!("line {i}")))
-            .collect();
-        let mut app = fake_app(vec![make_file("a.rs", vec![hunk(1, lines)], 100)]);
+        let lines = numbered_added_lines(40);
+        let mut app = fake_app(vec![single_hunk_file("a.rs", lines, 100)]);
         app.cursor_placement = CursorPlacement::Top;
         let header = app.layout.hunk_starts[0];
         app.scroll_to(header + 20);
@@ -5721,17 +5193,7 @@ mod tests {
     fn viewport_top_clamps_short_hunk_centring_against_layout_edges() {
         // A short hunk near the very start of the layout: padding above
         // would push viewport_top below 0 → clamp at 0.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "alpha"),
-                    diff_line(LineKind::Added, "beta"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["alpha", "beta"], 100);
         let hunk_row = app.layout.hunk_starts[0];
         app.scroll_to(hunk_row);
 
@@ -5813,18 +5275,16 @@ mod tests {
     #[test]
     fn change_runs_collapse_consecutive_same_kind_lines_into_one_entry() {
         // Three contiguous +/- lines should be a single change run, not three.
-        let app = fake_app(vec![make_file(
+        let app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "a"),
-                    diff_line(LineKind::Added, "b"),
-                    diff_line(LineKind::Deleted, "c"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "a"),
+                diff_line(LineKind::Added, "b"),
+                diff_line(LineKind::Deleted, "c"),
+            ],
             100,
-        )]);
+        );
         assert_eq!(
             app.layout.change_runs.len(),
             1,
@@ -5873,17 +5333,7 @@ mod tests {
         // to `rows`. RowKind::DiffLine positions carry Some((old, new));
         // all other rows (FileHeader, HunkHeader, Spacer, BinaryNotice)
         // carry None.
-        let mut app = fake_app(vec![make_file(
-            "foo.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Added, "a"),
-                    diff_line(LineKind::Added, "b"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("foo.rs", 10, &["a", "b"], 100);
         app.build_layout();
         let ln = &app.layout.diff_line_numbers;
         assert_eq!(
@@ -5907,17 +5357,7 @@ mod tests {
         // hunk(10, [Added a, Added b]) under the fixture above uses
         // old_start=10, new_start=10, old_count=0, new_count=2.
         // Added #1 → (None, Some(10)); Added #2 → (None, Some(11)).
-        let mut app = fake_app(vec![make_file(
-            "foo.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Added, "a"),
-                    diff_line(LineKind::Added, "b"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("foo.rs", 10, &["a", "b"], 100);
         app.build_layout();
         let diff_rows: Vec<_> = app
             .layout
@@ -5941,18 +5381,7 @@ mod tests {
     fn build_layout_max_line_number_covers_visible_rows() {
         // Single hunk with 3 rows starting at new_start=100 →
         // max_line_number must be >= 102.
-        let mut app = fake_app(vec![make_file(
-            "foo.rs",
-            vec![hunk(
-                100,
-                vec![
-                    diff_line(LineKind::Added, "a"),
-                    diff_line(LineKind::Added, "b"),
-                    diff_line(LineKind::Added, "c"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("foo.rs", 100, &["a", "b", "c"], 100);
         app.build_layout();
         assert_eq!(
             app.layout.max_line_number, 102,
@@ -5964,11 +5393,7 @@ mod tests {
     fn build_layout_max_line_number_has_lower_bound_of_10() {
         // Tiny file with line numbers 1-3 should still clamp to 10 so
         // the gutter width stays at a stable minimum of 2 digits.
-        let mut app = fake_app(vec![make_file(
-            "foo.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
-            100,
-        )]);
+        let mut app = single_added_app("foo.rs", "a");
         app.build_layout();
         assert!(
             app.layout.max_line_number >= 10,
@@ -5990,8 +5415,8 @@ mod tests {
                 diff_line(LineKind::Added, "b"),
             ],
         );
-        let hunk2 = hunk(5000, vec![diff_line(LineKind::Added, "z")]);
-        let mut app = fake_app(vec![make_file("foo.rs", vec![hunk1, hunk2.clone()], 100)]);
+        let hunk2 = added_hunk(5000, &["z"]);
+        let mut app = app_with_hunks("foo.rs", vec![hunk1, hunk2.clone()], 100);
         // Mark hunk2 seen so it collapses out of the layout.
         let path = app.files[0].path.clone();
         let fp = hunk_fingerprint(&hunk2);
@@ -6010,11 +5435,7 @@ mod tests {
         // v0.5 plan Decision Log: `toggle_line_numbers` must rebuild
         // the layout so max_line_number and the parallel number cache
         // stay coherent with `show_line_numbers` (Phase CD).
-        let mut app = fake_app(vec![make_file(
-            "foo.rs",
-            vec![hunk(10, vec![diff_line(LineKind::Added, "a")])],
-            100,
-        )]);
+        let mut app = fake_app(vec![single_added_hunk_file("foo.rs", 10, "a", 100)]);
         // Baseline: build_layout populated the cache.
         assert!(!app.layout.diff_line_numbers.is_empty());
         // Corrupt the layout so we can detect a rebuild on toggle.
@@ -6055,18 +5476,7 @@ mod tests {
 
     #[test]
     fn handle_key_g_and_capital_g_move_to_top_and_bottom() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "x"),
-                    diff_line(LineKind::Added, "y"),
-                    diff_line(LineKind::Added, "z"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["x", "y", "z"], 100);
         app.handle_key(key(KeyCode::Char('G')));
         assert_eq!(app.scroll, app.layout.rows.len() - 2);
         assert!(
@@ -6080,16 +5490,8 @@ mod tests {
     #[test]
     fn scroll_to_does_not_land_on_spacer_rows() {
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                100,
-            ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                200,
-            ),
+            single_added_file("a.rs", "x", 100),
+            single_added_file("b.rs", "y", 200),
         ]);
 
         let spacer = app
@@ -6109,16 +5511,8 @@ mod tests {
     #[test]
     fn scroll_by_skips_spacer_rows_in_nowrap_mode() {
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                100,
-            ),
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                200,
-            ),
+            single_added_file("a.rs", "x", 100),
+            single_added_file("b.rs", "y", 200),
         ]);
         app.follow_mode = false;
 
@@ -6144,14 +5538,11 @@ mod tests {
 
     #[test]
     fn handle_key_f_restores_follow_mode_and_jumps_to_target() {
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(20, vec![diff_line(LineKind::Added, "y")]),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(20, &["y"])],
             100,
-        )]);
+        );
         app.handle_key(key(KeyCode::Char('g'))); // jump to top, drops follow
         assert!(!app.follow_mode);
         app.handle_key(key(KeyCode::Char('f')));
@@ -6176,11 +5567,7 @@ mod tests {
 
     #[test]
     fn question_mark_opens_help_overlay_and_esc_closes_it() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         assert!(!app.help_overlay);
 
         app.handle_key(key(KeyCode::Char('?')));
@@ -6192,11 +5579,7 @@ mod tests {
 
     #[test]
     fn help_overlay_shadows_normal_keys_until_closed() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.handle_key(key(KeyCode::Char('?')));
         app.handle_key(key(KeyCode::Char('s')));
         assert!(
@@ -6214,11 +5597,7 @@ mod tests {
         // v0.2 remap: picker trigger moved from `Space` to `s` so
         // `Space` is free for the scar "seen" mark (wired up in a
         // later M4 slice).
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.handle_key(key(KeyCode::Char('s')));
         assert!(app.picker.is_some());
 
@@ -6233,11 +5612,7 @@ mod tests {
         // state — no file write, no picker. In v0.4 Space also
         // collapses the DiffLine rows and snaps the cursor to the
         // hunk header when its old row disappears from the layout.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         cursor_on_nth_diff_line(&mut app, 0);
 
         app.handle_key(key(KeyCode::Char(' ')));
@@ -6275,17 +5650,8 @@ mod tests {
 
     #[test]
     fn space_on_file_header_row_is_noop() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("header");
+        let mut app = single_added_app("a.rs", "x");
+        let header_row = file_header_row(&app);
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Char(' ')));
@@ -6303,21 +5669,13 @@ mod tests {
         // recompute that rebuilds the FileDiff list without moving
         // the pre-image anchor **and** without altering the hunk's
         // lines must leave the mark in place.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = fake_app(vec![single_added_hunk_file("a.rs", 42, "x", 100)]);
         cursor_on_nth_diff_line(&mut app, 0);
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.hunk_is_seen(0, 0));
 
         // Rebuild an identical diff: same old_start, same lines.
-        let fresh = vec![make_file(
-            "a.rs",
-            vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )];
+        let fresh = vec![single_added_hunk_file("a.rs", 42, "x", 100)];
         app.apply_computed_files(fresh);
 
         assert!(
@@ -6331,18 +5689,7 @@ mod tests {
         // v0.4: marking a hunk as seen must collapse its DiffLine
         // rows out of the layout so only the hunk header survives.
         // The file header and spacer stay put.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "x1"),
-                    diff_line(LineKind::Added, "x2"),
-                    diff_line(LineKind::Added, "x3"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["x1", "x2", "x3"], 100);
         cursor_on_nth_diff_line(&mut app, 0);
 
         let diff_rows_before = app
@@ -6386,67 +5733,22 @@ mod tests {
         // v0.4 mirror of the `k` case: from hunk0 (seen) the `j`
         // key must stop on hunk1's HunkHeader, not dive into
         // hunk1's first change-run start.
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "a1")]),
-                hunk(
-                    10,
-                    vec![
-                        diff_line(LineKind::Added, "b1"),
-                        diff_line(LineKind::Added, "b2"),
-                    ],
-                ),
-            ],
+            vec![added_hunk(1, &["a1"]), added_hunk(10, &["b1", "b2"])],
             100,
-        )]);
-        let hh0 = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                matches!(
-                    r,
-                    RowKind::HunkHeader {
-                        file_idx: 0,
-                        hunk_idx: 0
-                    }
-                )
-            })
-            .expect("hh0");
+        );
+        let hh0 = hunk_header_row(&app, 0);
         app.scroll_to(hh0);
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.hunk_is_seen(0, 0));
 
-        let hh0 = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                matches!(
-                    r,
-                    RowKind::HunkHeader {
-                        file_idx: 0,
-                        hunk_idx: 0
-                    }
-                )
-            })
-            .expect("hh0 after collapse");
+        let hh0 = hunk_header_row(&app, 0);
         app.scroll_to(hh0);
 
         app.handle_key(key(KeyCode::Char('j')));
 
-        assert!(
-            matches!(
-                app.layout.rows.get(app.scroll),
-                Some(RowKind::HunkHeader {
-                    file_idx: 0,
-                    hunk_idx: 1
-                })
-            ),
-            "j must land on hunk 1's HunkHeader, got {:?}",
-            app.layout.rows.get(app.scroll)
-        );
+        assert_cursor_on_hunk_header(&app, 1, "j must land on hunk 1's HunkHeader");
     }
 
     #[test]
@@ -6458,52 +5760,17 @@ mod tests {
         // skip straight to the prev hunk's header meant the
         // expanded hunk's content couldn't be visited on the way
         // back.
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "a1"),
-                        diff_line(LineKind::Added, "a2"),
-                    ],
-                ),
-                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
-            ],
+            vec![added_hunk(1, &["a1", "a2"]), added_hunk(10, &["b1"])],
             100,
-        )]);
-        let hh1 = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                matches!(
-                    r,
-                    RowKind::HunkHeader {
-                        file_idx: 0,
-                        hunk_idx: 1
-                    }
-                )
-            })
-            .expect("hh1");
+        );
+        let hh1 = hunk_header_row(&app, 1);
         app.scroll_to(hh1);
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.hunk_is_seen(0, 1));
 
-        let hh1 = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                matches!(
-                    r,
-                    RowKind::HunkHeader {
-                        file_idx: 0,
-                        hunk_idx: 1
-                    }
-                )
-            })
-            .expect("hh1 after collapse");
+        let hh1 = hunk_header_row(&app, 1);
         app.scroll_to(hh1);
 
         // First `k`: hunk0's run start (closer than HH0).
@@ -6523,56 +5790,26 @@ mod tests {
 
         // Second `k`: hunk0's header.
         app.handle_key(key(KeyCode::Char('k')));
-        assert!(
-            matches!(
-                app.layout.rows.get(app.scroll),
-                Some(RowKind::HunkHeader {
-                    file_idx: 0,
-                    hunk_idx: 0
-                })
-            ),
-            "k #2: expected hunk0 header, got {:?}",
-            app.layout.rows.get(app.scroll)
-        );
+        assert_cursor_on_hunk_header(&app, 0, "k #2: expected hunk0 header");
     }
 
     #[test]
     fn j_walks_through_multiple_seen_hunks_one_by_one() {
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
             vec![
-                hunk(1, vec![diff_line(LineKind::Added, "a")]),
-                hunk(10, vec![diff_line(LineKind::Added, "b")]),
-                hunk(20, vec![diff_line(LineKind::Added, "c")]),
+                added_hunk(1, &["a"]),
+                added_hunk(10, &["b"]),
+                added_hunk(20, &["c"]),
             ],
             100,
-        )]);
+        );
         for i in 0..3 {
-            let row = app
-                .layout
-                .rows
-                .iter()
-                .position(|r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i))
-                .expect("hh");
-            app.scroll_to(row);
+            app.scroll_to(hunk_header_row(&app, i));
             app.handle_key(key(KeyCode::Char(' ')));
         }
 
-        let hh0 = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                matches!(
-                    r,
-                    RowKind::HunkHeader {
-                        file_idx: 0,
-                        hunk_idx: 0
-                    }
-                )
-            })
-            .expect("hh0");
-        app.scroll_to(hh0);
+        app.scroll_to(hunk_header_row(&app, 0));
 
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(
@@ -6597,44 +5834,24 @@ mod tests {
         // report was "k doesn't stop on hunk headers". Press `k`
         // repeatedly from the last hunk's header and expect to
         // land on hunk1's header, then hunk0's header, then no-op.
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
             vec![
-                hunk(1, vec![diff_line(LineKind::Added, "a")]),
-                hunk(10, vec![diff_line(LineKind::Added, "b")]),
-                hunk(20, vec![diff_line(LineKind::Added, "c")]),
+                added_hunk(1, &["a"]),
+                added_hunk(10, &["b"]),
+                added_hunk(20, &["c"]),
             ],
             100,
-        )]);
+        );
         // Seen all three.
         for i in 0..3 {
-            let row = app
-                .layout
-                .rows
-                .iter()
-                .position(|r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx } if *hunk_idx == i))
-                .expect("hh");
-            app.scroll_to(row);
+            app.scroll_to(hunk_header_row(&app, i));
             app.handle_key(key(KeyCode::Char(' ')));
         }
         assert!(app.hunk_is_seen(0, 0) && app.hunk_is_seen(0, 1) && app.hunk_is_seen(0, 2));
 
         // Cursor on hunk 2's HunkHeader.
-        let hh2 = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                matches!(
-                    r,
-                    RowKind::HunkHeader {
-                        file_idx: 0,
-                        hunk_idx: 2
-                    }
-                )
-            })
-            .expect("hh2");
-        app.scroll_to(hh2);
+        app.scroll_to(hunk_header_row(&app, 2));
 
         app.handle_key(key(KeyCode::Char('k')));
         assert_eq!(
@@ -6659,66 +5876,24 @@ mod tests {
         // first DiffLine lands on hunk1's own HunkHeader first
         // (header-as-landing), and the next `k` crosses to hunk0's
         // HunkHeader.
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "a1")]),
-                hunk(
-                    10,
-                    vec![
-                        diff_line(LineKind::Added, "b1"),
-                        diff_line(LineKind::Added, "b2"),
-                    ],
-                ),
-            ],
+            vec![added_hunk(1, &["a1"]), added_hunk(10, &["b1", "b2"])],
             100,
-        )]);
+        );
         cursor_on_nth_diff_line(&mut app, 0);
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.hunk_is_seen(0, 0));
 
-        let hh1 = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                matches!(
-                    r,
-                    RowKind::HunkHeader {
-                        file_idx: 0,
-                        hunk_idx: 1
-                    }
-                )
-            })
-            .expect("hh1");
+        let hh1 = hunk_header_row(&app, 1);
         app.scroll_to(hh1 + 1);
         assert_eq!(app.current_hunk(), Some((0, 1)));
 
         app.handle_key(key(KeyCode::Char('k')));
-        assert!(
-            matches!(
-                app.layout.rows.get(app.scroll),
-                Some(RowKind::HunkHeader {
-                    file_idx: 0,
-                    hunk_idx: 1
-                })
-            ),
-            "k #1: hunk1 HunkHeader first, got {:?}",
-            app.layout.rows.get(app.scroll)
-        );
+        assert_cursor_on_hunk_header(&app, 1, "k #1: hunk1 HunkHeader first");
 
         app.handle_key(key(KeyCode::Char('k')));
-        assert!(
-            matches!(
-                app.layout.rows.get(app.scroll),
-                Some(RowKind::HunkHeader {
-                    file_idx: 0,
-                    hunk_idx: 0
-                })
-            ),
-            "k #2: crosses to hunk0 HunkHeader, got {:?}",
-            app.layout.rows.get(app.scroll)
-        );
+        assert_cursor_on_hunk_header(&app, 0, "k #2: crosses to hunk0 HunkHeader");
     }
 
     #[test]
@@ -6729,21 +5904,11 @@ mod tests {
         // shortens. Naïvely trusting "rows[scroll] is a DiffLine
         // → cursor is fine" silently teleports the cursor to the
         // neighbor. The collapsed hunk's HunkHeader must win.
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(
-                    1,
-                    vec![
-                        diff_line(LineKind::Added, "a1"),
-                        diff_line(LineKind::Added, "a2"),
-                        diff_line(LineKind::Added, "a3"),
-                    ],
-                ),
-                hunk(10, vec![diff_line(LineKind::Added, "b1")]),
-            ],
+            vec![added_hunk(1, &["a1", "a2", "a3"]), added_hunk(10, &["b1"])],
             100,
-        )]);
+        );
         // Park the cursor on the 2nd DiffLine of hunk 0 (a2).
         cursor_on_nth_diff_line(&mut app, 1);
         assert_eq!(app.current_hunk(), Some((0, 0)));
@@ -6775,20 +5940,12 @@ mod tests {
         // that keeps `old_start` fixed but alters any line's
         // content must invalidate the mark so the reader is forced
         // to re-read the new diff.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(42, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = fake_app(vec![single_added_hunk_file("a.rs", 42, "x", 100)]);
         cursor_on_nth_diff_line(&mut app, 0);
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.hunk_is_seen(0, 0));
 
-        let fresh = vec![make_file(
-            "a.rs",
-            vec![hunk(42, vec![diff_line(LineKind::Added, "y")])],
-            100,
-        )];
+        let fresh = vec![single_added_hunk_file("a.rs", 42, "y", 100)];
         app.apply_computed_files(fresh);
 
         assert!(
@@ -6810,26 +5967,12 @@ mod tests {
     #[test]
     fn picker_filters_by_substring_case_insensitively() {
         let mut app = fake_app(vec![
-            make_file(
-                "src/Auth.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "src/handler.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                200,
-            ),
-            make_file(
-                "tests/auth_test.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-                100,
-            ),
+            single_added_file("src/Auth.rs", "x", 300),
+            single_added_file("src/handler.rs", "y", 200),
+            single_added_file("tests/auth_test.rs", "z", 100),
         ]);
         app.open_picker();
-        for c in "auth".chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
+        type_chars(&mut app, "auth");
         let results = app.picker_results();
         // src/Auth.rs and tests/auth_test.rs match; src/handler.rs does not.
         assert_eq!(results.len(), 2);
@@ -6841,16 +5984,8 @@ mod tests {
     #[test]
     fn picker_enter_jumps_to_selected_file_first_hunk_and_closes() {
         let mut app = fake_app(vec![
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "older.rs",
-                vec![hunk(50, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("newest.rs", "x", 300),
+            single_added_hunk_file("older.rs", 50, "y", 100),
         ]);
         app.open_picker();
         // picker_results runs newest-first regardless of how files are
@@ -6888,24 +6023,8 @@ mod tests {
             .expect("reopen kept for mtime set");
         f.set_modified(ancient).expect("backdate kept.rs");
 
-        let kept = FileDiff {
-            path: PathBuf::from("kept.rs"),
-            status: FileStatus::Modified,
-            added: 1,
-            deleted: 0,
-            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "hi2")])]),
-            mtime: SystemTime::UNIX_EPOCH,
-            header_prefix: None,
-        };
-        let gone = FileDiff {
-            path: PathBuf::from("gone.rs"),
-            status: FileStatus::Deleted,
-            added: 0,
-            deleted: 1,
-            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Deleted, "bye")])]),
-            mtime: SystemTime::UNIX_EPOCH,
-            header_prefix: None,
-        };
+        let kept = single_added_file("kept.rs", "hi2", 0);
+        let gone = single_deleted_file("gone.rs", "bye", 0);
 
         let app = App::bootstrap_with_diff(
             tmp.path().to_path_buf(),
@@ -6943,16 +6062,8 @@ mod tests {
         // filesystem. Every piece of baseline-adjacent state must
         // survive a failed reset unchanged.
         let mut app = fake_app(vec![
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "keep me")])],
-                100,
-            ),
-            make_file(
-                "newer.rs",
-                vec![hunk(2, vec![diff_line(LineKind::Added, "also keep")])],
-                200,
-            ),
+            single_added_file("older.rs", "keep me", 100),
+            single_added_hunk_file("newer.rs", 2, "also keep", 200),
         ]);
         let old_sha = app.baseline_sha.clone();
         let old_files = app.files.clone();
@@ -7006,11 +6117,7 @@ mod tests {
         // branch tracking needs to move with it. Otherwise the
         // watcher stays pinned to the startup branch and silently
         // stops firing `GitHead` for future commits.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         assert_eq!(
             app.current_branch_ref.as_deref(),
             Some("refs/heads/main"),
@@ -7042,11 +6149,7 @@ mod tests {
         // and only the per-worktree HEAD file matters. The reset
         // path must surface that so the watcher drops the stale
         // branch ref.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
 
         // main → detached
         let effect = app.apply_reset(
@@ -7072,23 +6175,11 @@ mod tests {
         // Dual of the above: the happy path must still swap the
         // baseline, clear head_dirty, and install the new file set so
         // a successful reset is visibly a reset and not a no-op.
-        let mut app = fake_app(vec![make_file(
-            "old.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "stale")])],
-            100,
-        )]);
+        let mut app = single_added_app("old.rs", "stale");
         app.head_dirty = true;
         app.last_error = Some("stale error".into());
 
-        let new_file = FileDiff {
-            path: PathBuf::from("fresh.rs"),
-            status: FileStatus::Modified,
-            added: 1,
-            deleted: 0,
-            content: DiffContent::Text(vec![hunk(1, vec![diff_line(LineKind::Added, "fresh")])]),
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(500),
-            header_prefix: None,
-        };
+        let new_file = single_added_file("fresh.rs", "fresh", 500);
         let new_sha = "feedfacefeedfacefeedfacefeedfacefeedface".to_string();
         // Same branch as the existing fake_app default — a successful
         // reset that does NOT switch branches should report
@@ -7149,16 +6240,8 @@ mod tests {
         // Success path: bootstrap populates files, sorts them ascending by
         // mtime, builds a layout, and lands on the follow target.
         let diff = Ok(vec![
-            make_file(
-                "newer.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
-                200,
-            ),
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "b")])],
-                100,
-            ),
+            single_added_file("newer.rs", "a", 200),
+            single_added_file("older.rs", "b", 100),
         ]);
         let app = App::bootstrap_with_diff(
             PathBuf::from("/tmp/fake"),
@@ -7197,11 +6280,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         unsafe { std::env::set_var("KIZU_SESSION_ID", "agent-xyz") };
-        let diff = Ok(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
-            100,
-        )]);
+        let diff = Ok(vec![single_added_file("a.rs", "a", 100)]);
         let app = App::bootstrap_with_diff(
             PathBuf::from("/tmp/fake"),
             PathBuf::from("/tmp/fake/.git"),
@@ -7226,16 +6305,8 @@ mod tests {
         // explicit manual navigation — the next recompute must not yank
         // the user back to the newest file's last hunk.
         let mut app = fake_app(vec![
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "older.rs",
-                vec![hunk(50, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("newest.rs", "x", 300),
+            single_added_hunk_file("older.rs", 50, "y", 100),
         ]);
         assert!(app.follow_mode, "bootstrap starts in follow mode");
 
@@ -7255,10 +6326,7 @@ mod tests {
         let newest = file_idx(&app, "newest.rs");
         app.files[newest] = make_file(
             "newest.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(30, vec![diff_line(LineKind::Added, "z")]),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(30, &["z"])],
             400,
         );
         app.files.sort_by_key(|a| a.mtime);
@@ -7275,16 +6343,8 @@ mod tests {
     #[test]
     fn picker_cursor_tracks_same_file_across_recompute_reordering() {
         let mut app = fake_app(vec![
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("newest.rs", "x", 300),
+            single_added_file("older.rs", "y", 100),
         ]);
 
         app.open_picker();
@@ -7298,21 +6358,9 @@ mod tests {
         // reorder newest-first, so a cursor tracked only by index would now
         // point at a different file.
         app.apply_computed_files(vec![
-            make_file(
-                "brand_new.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-                400,
-            ),
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "older.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("brand_new.rs", "z", 400),
+            single_added_file("newest.rs", "x", 300),
+            single_added_file("older.rs", "y", 100),
         ]);
 
         let after = app
@@ -7329,16 +6377,8 @@ mod tests {
     fn refresh_anchor_keeps_us_on_the_same_hunk_after_recompute() {
         // First snapshot: 2 files, scroll parked on b.rs's hunk.
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
-            make_file(
-                "b.rs",
-                vec![hunk(42, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("a.rs", "x", 200),
+            single_added_hunk_file("b.rs", 42, "y", 100),
         ]);
         // Move to b.rs's hunk by path lookup and disable follow so the
         // anchor stays put.
@@ -7353,11 +6393,7 @@ mod tests {
         // Simulate a recompute by appending a new (older) file. The list
         // is re-sorted ascending; b.rs stays in the layout but its row
         // index moves. The anchor must still resolve to it.
-        app.files.push(make_file(
-            "c.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "z")])],
-            50, // older than b.rs
-        ));
+        app.files.push(single_added_file("c.rs", "z", 50));
         app.files.sort_by_key(|x| x.mtime);
         app.build_layout();
         app.refresh_anchor();
@@ -7368,16 +6404,8 @@ mod tests {
     #[test]
     fn refresh_anchor_keeps_manual_mode_on_same_file_when_hunk_identity_changes() {
         let mut app = fake_app(vec![
-            make_file(
-                "newest.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                300,
-            ),
-            make_file(
-                "older.rs",
-                vec![hunk(50, vec![diff_line(LineKind::Added, "y")])],
-                100,
-            ),
+            single_added_file("newest.rs", "x", 300),
+            single_added_hunk_file("older.rs", 50, "y", 100),
         ]);
 
         let older = file_idx(&app, "older.rs");
@@ -7390,11 +6418,7 @@ mod tests {
         // (e.g. git merged/split hunks after a nearby edit). Manual mode
         // should stay on the same file instead of snapping to the newest
         // file's follow target.
-        app.files[older] = make_file(
-            "older.rs",
-            vec![hunk(99, vec![diff_line(LineKind::Added, "y2")])],
-            100,
-        );
+        app.files[older] = single_added_hunk_file("older.rs", 99, "y2", 100);
         app.build_layout();
         app.refresh_anchor();
 
@@ -7407,14 +6431,11 @@ mod tests {
 
     #[test]
     fn refresh_anchor_prefers_nearest_hunk_within_same_file() {
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "only.rs",
-            vec![
-                hunk(10, vec![diff_line(LineKind::Added, "first")]),
-                hunk(50, vec![diff_line(LineKind::Added, "second")]),
-            ],
+            vec![added_hunk(10, &["first"]), added_hunk(50, &["second"])],
             100,
-        )]);
+        );
 
         app.scroll_to(
             app.layout
@@ -7437,8 +6458,8 @@ mod tests {
         app.files[0] = make_file(
             "only.rs",
             vec![
-                hunk(10, vec![diff_line(LineKind::Added, "first")]),
-                hunk(60, vec![diff_line(LineKind::Added, "second shifted")]),
+                added_hunk(10, &["first"]),
+                added_hunk(60, &["second shifted"]),
             ],
             100,
         );
@@ -7464,17 +6485,10 @@ mod tests {
         // Expected: cursor continues to point at the same hunk identity
         // AND the viewport top shifts so the cursor lands at the same
         // screen row as before the recompute.
-        let mut body_lines = Vec::new();
-        for i in 0..30 {
-            body_lines.push(diff_line(LineKind::Context, &format!("ctx {i}")));
-        }
+        let mut body_lines = prefixed_diff_lines(LineKind::Context, "ctx ", 30);
         body_lines.push(diff_line(LineKind::Added, "y"));
         let mut app = fake_app(vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
+            single_added_file("a.rs", "x", 200),
             make_file("b.rs", vec![hunk(42, body_lines.clone())], 100),
         ]);
 
@@ -7506,11 +6520,7 @@ mod tests {
         // and its mtime bumped past a.rs's, so its position in the
         // layout moves from first to last.
         let fresh = vec![
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-                200,
-            ),
+            single_added_file("a.rs", "x", 200),
             make_file("b.rs", vec![hunk(42, body_lines.clone())], 400),
         ];
         app.apply_computed_files(fresh);
@@ -7553,7 +6563,7 @@ mod tests {
             diff_line(LineKind::Added, "scar target"),
             diff_line(LineKind::Added, "line three"),
         ];
-        let mut app = fake_app(vec![make_file("b.rs", vec![hunk(1, pre_edit_body)], 100)]);
+        let mut app = fake_app(vec![single_hunk_file("b.rs", pre_edit_body, 100)]);
 
         // Park cursor on the "scar target" DiffLine (hunk_idx=0,
         // line_idx=1) and pretend a scar was just inserted there —
@@ -7591,7 +6601,7 @@ mod tests {
         // "line gone" branch we cut the hunk down to one line so
         // new-line 2 is past the end.
         let edited_body = vec![diff_line(LineKind::Added, "line one")];
-        let fresh = vec![make_file("b.rs", vec![hunk(1, edited_body)], 100)];
+        let fresh = vec![single_hunk_file("b.rs", edited_body, 100)];
         app.view_mode = ViewMode::Stream;
         app.apply_computed_files(fresh);
 
@@ -7667,20 +6677,11 @@ mod tests {
 
     #[test]
     fn scroll_to_starts_animation_when_row_changes() {
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(
-                    10,
-                    vec![
-                        diff_line(LineKind::Added, "y1"),
-                        diff_line(LineKind::Added, "y2"),
-                    ],
-                ),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(10, &["y1", "y2"])],
             100,
-        )]);
+        );
         app.anim = None;
         app.scroll = 0;
         app.scroll_to(3);
@@ -7689,11 +6690,7 @@ mod tests {
 
     #[test]
     fn scroll_to_does_not_start_animation_on_noop() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.anim = None;
         let current = app.scroll;
         app.scroll_to(current);
@@ -7702,20 +6699,11 @@ mod tests {
 
     #[test]
     fn scroll_to_carries_current_visual_into_animation_from() {
-        let mut app = fake_app(vec![make_file(
+        let mut app = app_with_hunks(
             "a.rs",
-            vec![
-                hunk(1, vec![diff_line(LineKind::Added, "x")]),
-                hunk(
-                    20,
-                    vec![
-                        diff_line(LineKind::Added, "y1"),
-                        diff_line(LineKind::Added, "y2"),
-                    ],
-                ),
-            ],
+            vec![added_hunk(1, &["x"]), added_hunk(20, &["y1", "y2"])],
             100,
-        )]);
+        );
         app.scroll = 0;
         app.anim = None;
         app.visual_top.set(7.25);
@@ -7726,11 +6714,7 @@ mod tests {
 
     #[test]
     fn tick_anim_clears_anim_once_duration_elapsed() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         let start = Instant::now() - Duration::from_millis(500);
         app.anim = Some(ScrollAnim {
             from: 0.0,
@@ -7744,11 +6728,7 @@ mod tests {
 
     #[test]
     fn tick_anim_keeps_anim_while_still_running() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         let start = Instant::now();
         app.anim = Some(ScrollAnim {
             from: 0.0,
@@ -7764,24 +6744,14 @@ mod tests {
     fn visual_viewport_top_matches_target_when_idle() {
         // Build a multi-file layout so the viewport has something to center.
         let app = fake_app(vec![
-            make_file(
+            file_with_hunk(
                 "a.rs",
-                vec![hunk(
-                    1,
-                    (0..8)
-                        .map(|i| diff_line(LineKind::Added, &format!("a{i}")))
-                        .collect(),
-                )],
+                hunk(1, prefixed_diff_lines(LineKind::Added, "a", 8)),
                 100,
             ),
-            make_file(
+            file_with_hunk(
                 "b.rs",
-                vec![hunk(
-                    1,
-                    (0..8)
-                        .map(|i| diff_line(LineKind::Added, &format!("b{i}")))
-                        .collect(),
-                )],
+                hunk(1, prefixed_diff_lines(LineKind::Added, "b", 8)),
                 200,
             ),
         ]);
@@ -7794,24 +6764,14 @@ mod tests {
     #[test]
     fn visual_viewport_top_tweens_between_from_and_target() {
         let mut app = fake_app(vec![
-            make_file(
+            file_with_hunk(
                 "a.rs",
-                vec![hunk(
-                    1,
-                    (0..8)
-                        .map(|i| diff_line(LineKind::Added, &format!("a{i}")))
-                        .collect(),
-                )],
+                hunk(1, prefixed_diff_lines(LineKind::Added, "a", 8)),
                 100,
             ),
-            make_file(
+            file_with_hunk(
                 "b.rs",
-                vec![hunk(
-                    1,
-                    (0..8)
-                        .map(|i| diff_line(LineKind::Added, &format!("b{i}")))
-                        .collect(),
-                )],
+                hunk(1, prefixed_diff_lines(LineKind::Added, "b", 8)),
                 200,
             ),
         ]);
@@ -7840,11 +6800,7 @@ mod tests {
     /// visual rows. Used by the wrap regression tests below.
     fn wrap_regression_app(wrap_factor: usize, width: usize) -> App {
         let content: String = std::iter::repeat_n('x', width * wrap_factor).collect();
-        fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, &content)])],
-            100,
-        )])
+        single_added_app("a.rs", &content)
     }
 
     #[test]
@@ -7871,12 +6827,7 @@ mod tests {
         let vi = VisualIndex::build(&app.layout, &app.files, Some(10));
 
         // Find the one DiffLine row in the layout.
-        let diff_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::DiffLine { .. }))
-            .expect("layout must contain a DiffLine");
+        let diff_row = diff_line_row(&app, 0);
         assert_eq!(
             vi.visual_height(diff_row),
             4,
@@ -7906,17 +6857,12 @@ mod tests {
         // then a short one the cursor sits on.
         let long_content: String = std::iter::repeat_n('x', 80).collect();
         let short_content = "short".to_string();
-        let mut app = fake_app(vec![make_file(
+        let mut app = added_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, &long_content),
-                    diff_line(LineKind::Added, &short_content),
-                ],
-            )],
+            1,
+            &[long_content.as_str(), short_content.as_str()],
             100,
-        )]);
+        );
         // Park the cursor on the second (short) diff row.
         let short_row = app
             .layout
@@ -8008,12 +6954,7 @@ mod tests {
         app.follow_mode = false;
 
         // Find the diff row and park on its first visual line.
-        let diff_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::DiffLine { .. }))
-            .expect("layout has a DiffLine");
+        let diff_row = diff_line_row(&app, 0);
         app.scroll = diff_row;
         app.cursor_sub_row = 0;
 
@@ -8108,11 +7049,7 @@ mod tests {
         // successful payload. The pre-rework bug cleared
         // watcher_health via the same code path that clears
         // last_error.
-        app.apply_computed_files(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        app.apply_computed_files(vec![single_added_file("a.rs", "x", 100)]);
 
         assert!(
             app.watcher_health
@@ -8126,11 +7063,7 @@ mod tests {
         let mut app = fake_app(vec![]);
         app.input_health = Some("input: stream hiccup".into());
 
-        app.apply_computed_files(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        app.apply_computed_files(vec![single_added_file("a.rs", "x", 100)]);
 
         assert_eq!(
             app.input_health.as_deref(),
@@ -8258,6 +7191,50 @@ mod tests {
         app
     }
 
+    fn scar_app_with_line(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        kind: LineKind,
+        line: &str,
+    ) -> App {
+        scar_app_with_real_fs(
+            tmp,
+            rel_path,
+            source,
+            hunk_new_start,
+            vec![diff_line(kind, line)],
+        )
+    }
+
+    fn scar_app_with_added_line(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        line: &str,
+    ) -> App {
+        scar_app_with_line(tmp, rel_path, source, hunk_new_start, LineKind::Added, line)
+    }
+
+    fn scar_app_with_context_line(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        line: &str,
+    ) -> App {
+        scar_app_with_line(
+            tmp,
+            rel_path,
+            source,
+            hunk_new_start,
+            LineKind::Context,
+            line,
+        )
+    }
+
     /// Park the cursor on the Nth DiffLine row in the layout (0-indexed
     /// across the whole scroll, not per file). Panics if there aren't
     /// enough DiffLine rows — the tests control the layout exactly so
@@ -8276,24 +7253,41 @@ mod tests {
         panic!("layout has fewer than {} DiffLine rows", n + 1);
     }
 
+    fn read_temp_file(tmp: &tempfile::TempDir, rel_path: &str) -> String {
+        std::fs::read_to_string(tmp.path().join(rel_path)).expect("read")
+    }
+
+    fn open_scar_comment_app(
+        tmp: &tempfile::TempDir,
+        rel_path: &str,
+        source: &str,
+        hunk_new_start: usize,
+        line: &str,
+    ) -> App {
+        let mut app = scar_app_with_added_line(tmp, rel_path, source, hunk_new_start, line);
+        cursor_on_nth_diff_line(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('c')));
+        app
+    }
+
     #[test]
     fn handle_key_a_inserts_ask_scar_above_cursor_line() {
         let tmp = tempfile::tempdir().expect("tmp");
         // Simulate a diff where line 2 of main.rs was newly added. The
         // cursor lands on that added row, and pressing `a` should insert
         // the canned "ask" scar directly above it.
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_added_line(
             &tmp,
             "src/main.rs",
             "fn one() {}\nfn two() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn two() {}")],
+            "fn two() {}",
         );
         cursor_on_nth_diff_line(&mut app, 0);
 
         app.handle_key(key(KeyCode::Char('a')));
 
-        let after = std::fs::read_to_string(tmp.path().join("src/main.rs")).expect("read back");
+        let after = read_temp_file(&tmp, "src/main.rs");
         assert_eq!(
             after, "fn one() {}\n// @kizu[ask]: explain this change\nfn two() {}\n",
             "`a` key must insert the canned ask scar above the cursor row",
@@ -8307,18 +7301,18 @@ mod tests {
     #[test]
     fn handle_key_r_inserts_reject_scar_above_cursor_line() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_added_line(
             &tmp,
             "auth.py",
             "def main():\n    return 1\n",
             2,
-            vec![diff_line(LineKind::Added, "    return 1")],
+            "    return 1",
         );
         cursor_on_nth_diff_line(&mut app, 0);
 
         app.handle_key(key(KeyCode::Char('r')));
 
-        let after = std::fs::read_to_string(tmp.path().join("auth.py")).expect("read back");
+        let after = read_temp_file(&tmp, "auth.py");
         assert_eq!(
             after, "def main():\n    # @kizu[reject]: revert this change\n    return 1\n",
             "`r` key must insert the canned reject scar using python # syntax",
@@ -8332,25 +7326,14 @@ mod tests {
         // disk stays untouched and no error is recorded.
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\n";
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "lib.rs",
-            original,
-            1,
-            vec![diff_line(LineKind::Added, "fn one() {}")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "lib.rs", original, 1, "fn one() {}");
         // Park the cursor on the FileHeader row explicitly.
-        let file_header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("file header exists");
+        let file_header_row = file_header_row(&app);
         app.scroll_to(file_header_row);
 
         app.handle_key(key(KeyCode::Char('a')));
 
-        let after = std::fs::read_to_string(tmp.path().join("lib.rs")).expect("read back");
+        let after = read_temp_file(&tmp, "lib.rs");
         assert_eq!(after, original, "header-row `a` must not touch the file");
         assert!(app.last_error.is_none(), "header-row `a` is a clean no-op");
     }
@@ -8362,11 +7345,7 @@ mod tests {
         // dispatch must surface that through `last_error` without
         // panicking.
         let tmp = tempfile::tempdir().expect("tmp");
-        let file = make_file(
-            "ghost.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "fn missing()")])],
-            100,
-        );
+        let file = single_added_file("ghost.rs", "fn missing()", 100);
         let mut app = fake_app(vec![file]);
         app.root = tmp.path().to_path_buf();
         cursor_on_nth_diff_line(&mut app, 0);
@@ -8386,23 +7365,8 @@ mod tests {
     fn scar_target_line_maps_hunk_header_to_first_changed_line_no_context() {
         // Hunk starts immediately with Added lines (no leading context).
         // The first changed line IS new_start, so the result equals new_start.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                42,
-                vec![
-                    diff_line(LineKind::Added, "first"),
-                    diff_line(LineKind::Added, "second"),
-                ],
-            )],
-            100,
-        )]);
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
-            .expect("hunk header row exists");
+        let mut app = added_hunk_app("a.rs", 42, &["first", "second"], 100);
+        let header_row = hunk_header_row(&app, 0);
         app.scroll_to(header_row);
         let (_, line) = app.scar_target_line().expect("target");
         assert_eq!(
@@ -8416,25 +7380,18 @@ mod tests {
         // Hunk has 2 leading Context lines before the first Added line.
         // The scar should land above the Added line, not above the context.
         // new_start=10, context, context, added → target = 10 + 2 = 12.
-        let mut app = fake_app(vec![make_file(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Context, "ctx1"),
-                    diff_line(LineKind::Context, "ctx2"),
-                    diff_line(LineKind::Added, "new_stuff"),
-                    diff_line(LineKind::Context, "ctx3"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Context, "ctx1"),
+                diff_line(LineKind::Context, "ctx2"),
+                diff_line(LineKind::Added, "new_stuff"),
+                diff_line(LineKind::Context, "ctx3"),
+            ],
             100,
-        )]);
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
-            .expect("hunk header row exists");
+        );
+        let header_row = hunk_header_row(&app, 0);
         app.scroll_to(header_row);
         let (_, line) = app.scar_target_line().expect("target");
         assert_eq!(
@@ -8449,24 +7406,13 @@ mod tests {
         // press `a`, and the source file should now carry the
         // canned ask scar directly above the first body line.
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/lib.rs",
-            "line_a\nline_b\n",
-            2,
-            vec![diff_line(LineKind::Added, "line_b")],
-        );
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::HunkHeader { .. }))
-            .expect("hunk header row exists");
+        let mut app = scar_app_with_added_line(&tmp, "src/lib.rs", "line_a\nline_b\n", 2, "line_b");
+        let header_row = hunk_header_row(&app, 0);
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Char('a')));
 
-        let after = std::fs::read_to_string(tmp.path().join("src/lib.rs")).expect("read back");
+        let after = read_temp_file(&tmp, "src/lib.rs");
         assert_eq!(
             after, "line_a\n// @kizu[ask]: explain this change\nline_b\n",
             "`a` on a hunk header must drop the scar above hunk.new_start",
@@ -8478,16 +7424,13 @@ mod tests {
     #[test]
     fn handle_key_c_opens_scar_comment_overlay_with_captured_target() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let app = open_scar_comment_app(
             &tmp,
             "src/foo.rs",
             "fn alpha() {}\nfn beta() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn beta() {}")],
+            "fn beta() {}",
         );
-        cursor_on_nth_diff_line(&mut app, 0);
-
-        app.handle_key(key(KeyCode::Char('c')));
 
         let state = app
             .scar_comment
@@ -8500,7 +7443,7 @@ mod tests {
             tmp.path().join("src/foo.rs"),
             "captures absolute target path"
         );
-        let after = std::fs::read_to_string(tmp.path().join("src/foo.rs")).expect("read");
+        let after = read_temp_file(&tmp, "src/foo.rs");
         assert_eq!(
             after, "fn alpha() {}\nfn beta() {}\n",
             "`c` must not touch the file until `Enter` commits"
@@ -8511,19 +7454,8 @@ mod tests {
     fn handle_key_c_is_noop_on_file_header_row() {
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\n";
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "lib.rs",
-            original,
-            1,
-            vec![diff_line(LineKind::Added, "fn one() {}")],
-        );
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("file header exists");
+        let mut app = scar_app_with_added_line(&tmp, "lib.rs", original, 1, "fn one() {}");
+        let header_row = file_header_row(&app);
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Char('c')));
@@ -8537,15 +7469,7 @@ mod tests {
     #[test]
     fn scar_comment_typing_appends_characters_to_body() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "a.rs",
-            "x\ny\n",
-            2,
-            vec![diff_line(LineKind::Added, "y")],
-        );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
+        let mut app = open_scar_comment_app(&tmp, "a.rs", "x\ny\n", 2, "y");
 
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
@@ -8558,18 +7482,8 @@ mod tests {
     #[test]
     fn scar_comment_backspace_deletes_last_character() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "a.rs",
-            "x\ny\n",
-            2,
-            vec![diff_line(LineKind::Added, "y")],
-        );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
-        for ch in "ab".chars() {
-            app.handle_key(key(KeyCode::Char(ch)));
-        }
+        let mut app = open_scar_comment_app(&tmp, "a.rs", "x\ny\n", 2, "y");
+        type_chars(&mut app, "ab");
 
         app.handle_key(key(KeyCode::Backspace));
         let state = app.scar_comment.as_ref().expect("still open");
@@ -8580,23 +7494,13 @@ mod tests {
     fn scar_comment_esc_cancels_without_writing_to_file() {
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\nfn two() {}\n";
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "cancel.rs",
-            original,
-            2,
-            vec![diff_line(LineKind::Added, "fn two() {}")],
-        );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
-        for ch in "dont".chars() {
-            app.handle_key(key(KeyCode::Char(ch)));
-        }
+        let mut app = open_scar_comment_app(&tmp, "cancel.rs", original, 2, "fn two() {}");
+        type_chars(&mut app, "dont");
 
         app.handle_key(key(KeyCode::Esc));
 
         assert!(app.scar_comment.is_none(), "Esc closes the overlay");
-        let after = std::fs::read_to_string(tmp.path().join("cancel.rs")).expect("read");
+        let after = read_temp_file(&tmp, "cancel.rs");
         assert_eq!(after, original, "cancel must not touch the file");
         assert!(app.last_error.is_none(), "cancel is not an error");
     }
@@ -8604,23 +7508,19 @@ mod tests {
     #[test]
     fn scar_comment_enter_commits_free_scar_above_target_line() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = open_scar_comment_app(
             &tmp,
             "commit.rs",
             "fn one() {}\nfn two() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn two() {}")],
+            "fn two() {}",
         );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
-        for ch in "why two?".chars() {
-            app.handle_key(key(KeyCode::Char(ch)));
-        }
+        type_chars(&mut app, "why two?");
 
         app.handle_key(key(KeyCode::Enter));
 
         assert!(app.scar_comment.is_none(), "commit closes the overlay");
-        let after = std::fs::read_to_string(tmp.path().join("commit.rs")).expect("read");
+        let after = read_temp_file(&tmp, "commit.rs");
         assert_eq!(
             after, "fn one() {}\n// @kizu[free]: why two?\nfn two() {}\n",
             "Enter must write a free-scar above the captured target line"
@@ -8631,22 +7531,14 @@ mod tests {
     fn scar_comment_enter_on_empty_body_is_cancel() {
         let tmp = tempfile::tempdir().expect("tmp");
         let original = "fn one() {}\nfn two() {}\n";
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "empty.rs",
-            original,
-            2,
-            vec![diff_line(LineKind::Added, "fn two() {}")],
-        );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
+        let mut app = open_scar_comment_app(&tmp, "empty.rs", original, 2, "fn two() {}");
         app.handle_key(key(KeyCode::Enter));
 
         assert!(
             app.scar_comment.is_none(),
             "empty commit closes the overlay"
         );
-        let after = std::fs::read_to_string(tmp.path().join("empty.rs")).expect("read");
+        let after = read_temp_file(&tmp, "empty.rs");
         assert_eq!(after, original, "empty body must not write a blank scar");
     }
 
@@ -8656,15 +7548,7 @@ mod tests {
         // the body instead of quitting the app. Proves the router
         // correctly parks normal-mode dispatch behind the overlay.
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "quit.rs",
-            "x\ny\n",
-            2,
-            vec![diff_line(LineKind::Added, "y")],
-        );
-        cursor_on_nth_diff_line(&mut app, 0);
-        app.handle_key(key(KeyCode::Char('c')));
+        let mut app = open_scar_comment_app(&tmp, "quit.rs", "x\ny\n", 2, "y");
 
         app.handle_key(key(KeyCode::Char('q')));
 
@@ -8845,12 +7729,7 @@ mod tests {
             "fn one() {}\n",
             "fn one() {}\nfn two() {}\n",
         );
-        let header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("header");
+        let header_row = file_header_row(&app);
         app.scroll_to(header_row);
 
         app.handle_key(key(KeyCode::Enter));
@@ -8863,31 +7742,78 @@ mod tests {
         app.layout.rows.iter().position(f).expect("row exists")
     }
 
+    fn file_header_row(app: &App) -> usize {
+        find_first_row_matching(app, |r| matches!(r, RowKind::FileHeader { .. }))
+    }
+
+    fn diff_line_row(app: &App, line_idx: usize) -> usize {
+        find_first_row_matching(
+            app,
+            |r| matches!(r, RowKind::DiffLine { line_idx: idx, .. } if *idx == line_idx),
+        )
+    }
+
+    fn first_diff_row_with_kind(app: &App, kind: LineKind) -> usize {
+        find_first_row_matching(app, |r| {
+            if let RowKind::DiffLine {
+                file_idx,
+                hunk_idx,
+                line_idx,
+            } = r
+            {
+                app.files
+                    .get(*file_idx)
+                    .and_then(|f| match &f.content {
+                        DiffContent::Text(hunks) => hunks
+                            .get(*hunk_idx)
+                            .and_then(|h| h.lines.get(*line_idx))
+                            .map(|l| l.kind == kind),
+                        _ => None,
+                    })
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        })
+    }
+
+    fn hunk_header_row(app: &App, hunk_idx: usize) -> usize {
+        find_first_row_matching(
+            app,
+            |r| matches!(r, RowKind::HunkHeader { file_idx: 0, hunk_idx: idx } if *idx == hunk_idx),
+        )
+    }
+
+    fn assert_cursor_on_hunk_header(app: &App, hunk_idx: usize, context: &str) {
+        assert!(
+            matches!(
+                app.layout.rows.get(app.scroll),
+                Some(RowKind::HunkHeader { file_idx: 0, hunk_idx: idx }) if *idx == hunk_idx
+            ),
+            "{context}, got {:?}",
+            app.layout.rows.get(app.scroll)
+        );
+    }
+
     #[test]
     fn find_matches_returns_empty_for_empty_query() {
-        let app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "hello world")])],
-            100,
-        )]);
+        let app = single_added_app("a.rs", "hello world");
         let m = find_matches(&app.layout, &app.files, "");
         assert!(m.is_empty());
     }
 
     #[test]
     fn find_matches_finds_substring_case_insensitive_when_query_is_lowercase() {
-        let app = fake_app(vec![make_file(
+        let app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "Hello WORLD"),
-                    diff_line(LineKind::Context, "no match here"),
-                    diff_line(LineKind::Added, "World wide"),
-                ],
-            )],
+            1,
+            vec![
+                diff_line(LineKind::Added, "Hello WORLD"),
+                diff_line(LineKind::Context, "no match here"),
+                diff_line(LineKind::Added, "World wide"),
+            ],
             100,
-        )]);
+        );
         let m = find_matches(&app.layout, &app.files, "world");
         assert_eq!(m.len(), 2, "smart-case lowercase query matches both rows");
         assert!(m.iter().all(|loc| loc.byte_start < loc.byte_end));
@@ -8895,28 +7821,14 @@ mod tests {
 
     #[test]
     fn find_matches_is_case_sensitive_when_query_has_uppercase() {
-        let app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "hello World"),
-                    diff_line(LineKind::Added, "hello world"),
-                ],
-            )],
-            100,
-        )]);
+        let app = added_hunk_app("a.rs", 1, &["hello World", "hello world"], 100);
         let m = find_matches(&app.layout, &app.files, "World");
         assert_eq!(m.len(), 1, "uppercase query is case-sensitive");
     }
 
     #[test]
     fn find_matches_captures_multiple_hits_on_one_row() {
-        let app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo foo foo")])],
-            100,
-        )]);
+        let app = single_added_app("a.rs", "foo foo foo");
         let m = find_matches(&app.layout, &app.files, "foo");
         assert_eq!(m.len(), 3);
         assert_eq!(m[0].byte_start, 0);
@@ -8926,11 +7838,7 @@ mod tests {
 
     #[test]
     fn slash_opens_search_input_composer() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
 
         app.handle_key(key(KeyCode::Char('/')));
 
@@ -8940,15 +7848,9 @@ mod tests {
 
     #[test]
     fn search_input_typing_appends_to_query_and_backspace_deletes() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "x")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "x");
         app.handle_key(key(KeyCode::Char('/')));
-        for c in "foo".chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
+        type_chars(&mut app, "foo");
         assert_eq!(app.search_input.as_ref().unwrap().query, "foo");
         app.handle_key(key(KeyCode::Backspace));
         assert_eq!(app.search_input.as_ref().unwrap().query, "fo");
@@ -8956,11 +7858,7 @@ mod tests {
 
     #[test]
     fn search_input_esc_cancels_without_installing_search_state() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "foo");
         app.handle_key(key(KeyCode::Char('/')));
         app.handle_key(key(KeyCode::Char('f')));
         app.handle_key(key(KeyCode::Esc));
@@ -8970,25 +7868,12 @@ mod tests {
 
     #[test]
     fn search_input_enter_commits_and_jumps_cursor_to_first_match() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "alpha"),
-                    diff_line(LineKind::Added, "beta"),
-                    diff_line(LineKind::Added, "gamma"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["alpha", "beta", "gamma"], 100);
         // Park the cursor on the first diff row (alpha).
         cursor_on_nth_diff_line(&mut app, 0);
 
         app.handle_key(key(KeyCode::Char('/')));
-        for c in "beta".chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
+        type_chars(&mut app, "beta");
         app.handle_key(key(KeyCode::Enter));
 
         assert!(app.search_input.is_none(), "composer closed on commit");
@@ -8996,29 +7881,16 @@ mod tests {
         assert_eq!(state.matches.len(), 1);
         assert_eq!(state.current, 0);
         // Cursor landed on the "beta" row — not the first diff row.
-        let beta_row =
-            find_first_row_matching(&app, |r| matches!(r, RowKind::DiffLine { line_idx: 1, .. }));
+        let beta_row = diff_line_row(&app, 1);
         assert_eq!(app.scroll, beta_row);
         assert!(!app.follow_mode, "manual jump drops follow mode");
     }
 
     #[test]
     fn search_input_enter_with_empty_query_does_not_wipe_existing_search() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "alpha")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "alpha");
         // Pre-install a fake confirmed search state.
-        app.search = Some(SearchState {
-            query: "alpha".into(),
-            matches: vec![MatchLocation {
-                row: 0,
-                byte_start: 0,
-                byte_end: 5,
-            }],
-            current: 0,
-        });
+        install_search(&mut app, "alpha", 0);
 
         app.handle_key(key(KeyCode::Char('/')));
         app.handle_key(key(KeyCode::Enter)); // empty body
@@ -9033,27 +7905,13 @@ mod tests {
 
     fn commit_search(app: &mut App, query: &str) {
         app.handle_key(key(KeyCode::Char('/')));
-        for c in query.chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
+        type_chars(app, query);
         app.handle_key(key(KeyCode::Enter));
     }
 
     #[test]
     fn search_jump_next_walks_matches_in_order() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "bar"),
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "foo"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["foo", "bar", "foo", "foo"], 100);
         // Park the cursor on the file header (row 0) so commit picks
         // match 0 (the first match after the cursor in layout order).
         app.scroll = 0;
@@ -9070,17 +7928,7 @@ mod tests {
 
     #[test]
     fn search_jump_next_wraps_around_at_end() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "foo"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["foo", "foo"], 100);
         app.scroll = 0;
         commit_search(&mut app, "foo");
 
@@ -9092,18 +7940,7 @@ mod tests {
 
     #[test]
     fn search_jump_prev_wraps_around_at_start() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "foo"),
-                    diff_line(LineKind::Added, "foo"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["foo", "foo", "foo"], 100);
         app.scroll = 0;
         commit_search(&mut app, "foo");
 
@@ -9114,11 +7951,7 @@ mod tests {
 
     #[test]
     fn search_jump_next_is_noop_when_no_search_state() {
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo")])],
-            100,
-        )]);
+        let mut app = single_added_app("a.rs", "foo");
         cursor_on_nth_diff_line(&mut app, 0);
         let before = app.scroll;
 
@@ -9135,32 +7968,15 @@ mod tests {
         // the wrong content. After `apply_computed_files`, the search
         // must re-run `find_matches` against the fresh layout, and the
         // confirmed query must survive so `n`/`N` still work.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
-            100,
-        )]);
-        let matches = find_matches(&app.layout, &app.files, "foo");
-        app.search = Some(SearchState {
-            query: "foo".to_string(),
-            matches,
-            current: 0,
-        });
+        let mut app = single_added_app("a.rs", "foo bar");
+        install_search(&mut app, "foo", 0);
         let pre_row = app.search.as_ref().unwrap().matches[0].row;
 
         // Simulate a watcher-driven recompute that prepends a new file
         // so every layout row index downstream of it shifts.
         app.apply_computed_files(vec![
-            make_file(
-                "b.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Context, "ctx")])],
-                50,
-            ),
-            make_file(
-                "a.rs",
-                vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
-                100,
-            ),
+            context_hunk_file("b.rs", 1, &["ctx"], 50),
+            single_added_file("a.rs", "foo bar", 100),
         ]);
 
         let state = app.search.as_ref().expect("search survives recompute");
@@ -9188,19 +8004,7 @@ mod tests {
     fn search_commit_starts_from_first_match_after_cursor() {
         // vim-style `/`: commit jumps to the first match strictly
         // after the cursor position, not the global first match.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo one"),
-                    diff_line(LineKind::Added, "mid"),
-                    diff_line(LineKind::Added, "foo two"),
-                    diff_line(LineKind::Added, "foo three"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["foo one", "mid", "foo two", "foo three"], 100);
         // Cursor on the middle diff line (between first and third foo).
         cursor_on_nth_diff_line(&mut app, 1);
         let cursor_row = app.scroll;
@@ -9227,18 +8031,7 @@ mod tests {
         // When no match lives after the cursor, wrap around to the
         // global first match so `/foo<Enter>` always lands on SOMETHING
         // (never a no-op with matches.len() > 0).
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(
-                1,
-                vec![
-                    diff_line(LineKind::Added, "foo a"),
-                    diff_line(LineKind::Added, "foo b"),
-                    diff_line(LineKind::Added, "trailing"),
-                ],
-            )],
-            100,
-        )]);
+        let mut app = added_hunk_app("a.rs", 1, &["foo a", "foo b", "trailing"], 100);
         // Cursor sits AFTER both matches.
         cursor_on_nth_diff_line(&mut app, 2);
 
@@ -9254,25 +8047,12 @@ mod tests {
         // Before recompute: 2 matches, current=1. After recompute the
         // underlying file drops one match. `current` must clamp into
         // range so `n`/`N` never panic.
-        let mut app = fake_app(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo foo")])],
-            100,
-        )]);
-        let matches = find_matches(&app.layout, &app.files, "foo");
-        assert_eq!(matches.len(), 2);
-        app.search = Some(SearchState {
-            query: "foo".to_string(),
-            matches,
-            current: 1,
-        });
+        let mut app = single_added_app("a.rs", "foo foo");
+        let match_count = install_search(&mut app, "foo", 1);
+        assert_eq!(match_count, 2);
 
         // Recompute with only one `foo` remaining.
-        app.apply_computed_files(vec![make_file(
-            "a.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "foo bar")])],
-            100,
-        )]);
+        app.apply_computed_files(vec![single_added_file("a.rs", "foo bar", 100)]);
 
         let state = app.search.as_ref().unwrap();
         assert_eq!(state.matches.len(), 1);
@@ -9344,13 +8124,7 @@ mod tests {
     #[test]
     fn open_in_editor_pairs_cursor_target_line_with_env_program() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/bar.rs",
-            "a\nb\n",
-            2,
-            vec![diff_line(LineKind::Added, "b")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "src/bar.rs", "a\nb\n", 2, "b");
         cursor_on_nth_diff_line(&mut app, 0);
 
         let inv = app.open_in_editor(Some("vim")).expect("invocation");
@@ -9366,19 +8140,8 @@ mod tests {
     #[test]
     fn open_in_editor_returns_none_when_cursor_is_on_file_header() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "lib.rs",
-            "x\n",
-            1,
-            vec![diff_line(LineKind::Added, "x")],
-        );
-        let header = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("header");
+        let mut app = scar_app_with_added_line(&tmp, "lib.rs", "x\n", 1, "x");
+        let header = file_header_row(&app);
         app.scroll_to(header);
 
         assert!(app.open_in_editor(Some("vim")).is_none());
@@ -9387,13 +8150,7 @@ mod tests {
     #[test]
     fn open_in_editor_returns_none_when_env_is_empty() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "a.rs",
-            "x\n",
-            1,
-            vec![diff_line(LineKind::Added, "x")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "a.rs", "x\n", 1, "x");
         cursor_on_nth_diff_line(&mut app, 0);
         assert!(app.open_in_editor(None).is_none());
     }
@@ -9565,12 +8322,7 @@ mod tests {
             "fn one() {}\n",
             "fn one() {}\nfn two() {}\n",
         );
-        let file_header_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| matches!(r, RowKind::FileHeader { .. }))
-            .expect("file header exists");
+        let file_header_row = file_header_row(&app);
         app.scroll_to(file_header_row);
 
         app.handle_key(key(KeyCode::Char('x')));
@@ -9608,18 +8360,16 @@ mod tests {
         // hunk: Added "x" (new file line 10), Deleted "y" (no new pos),
         //       Added "z" (new file line 11). Cursor on the Deleted
         //       row should resolve to line 11 — the replacement.
-        let mut app = fake_app(vec![make_file(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                10,
-                vec![
-                    diff_line(LineKind::Added, "x"),
-                    diff_line(LineKind::Deleted, "y"),
-                    diff_line(LineKind::Added, "z"),
-                ],
-            )],
+            10,
+            vec![
+                diff_line(LineKind::Added, "x"),
+                diff_line(LineKind::Deleted, "y"),
+                diff_line(LineKind::Added, "z"),
+            ],
             100,
-        )]);
+        );
         // Cursor on the Deleted row (2nd diff line in the hunk = nth=1).
         cursor_on_nth_diff_line(&mut app, 1);
         let (_, line) = app.scar_target_line().expect("target");
@@ -9637,18 +8387,16 @@ mod tests {
         // file where the deletion gap sits. The scar will land
         // above that line (which may be a surviving neighbour or
         // the end of the file).
-        let mut app = fake_app(vec![make_file(
+        let mut app = single_hunk_app(
             "a.rs",
-            vec![hunk(
-                5,
-                vec![
-                    diff_line(LineKind::Deleted, "gone_a"),
-                    diff_line(LineKind::Deleted, "gone_b"),
-                    diff_line(LineKind::Deleted, "gone_c"),
-                ],
-            )],
+            5,
+            vec![
+                diff_line(LineKind::Deleted, "gone_a"),
+                diff_line(LineKind::Deleted, "gone_b"),
+                diff_line(LineKind::Deleted, "gone_c"),
+            ],
             100,
-        )]);
+        );
         // Cursor on the first deleted row.
         cursor_on_nth_diff_line(&mut app, 0);
         let (_, line) = app.scar_target_line().expect("target");
@@ -9677,32 +8425,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let (mut app, abs) = revert_app_with_real_repo(&tmp, "del.rs", "a\nb\nc\n", "a\nc\n");
         // Find the deleted row (LineKind::Deleted for "b").
-        let del_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                if let RowKind::DiffLine {
-                    file_idx,
-                    hunk_idx,
-                    line_idx,
-                } = r
-                {
-                    app.files
-                        .get(*file_idx)
-                        .and_then(|f| match &f.content {
-                            DiffContent::Text(hunks) => hunks
-                                .get(*hunk_idx)
-                                .and_then(|h| h.lines.get(*line_idx))
-                                .map(|l| l.kind == LineKind::Deleted),
-                            _ => None,
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            })
-            .expect("a deleted row exists");
+        let del_row = first_diff_row_with_kind(&app, LineKind::Deleted);
         app.scroll_to(del_row);
 
         app.handle_key(key(KeyCode::Char('a')));
@@ -9723,32 +8446,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let (mut app, abs) = revert_app_with_real_repo(&tmp, "gap.rs", "a\nb\nc\nd\n", "a\nd\n");
         // Park on the first deleted row.
-        let del_row = app
-            .layout
-            .rows
-            .iter()
-            .position(|r| {
-                if let RowKind::DiffLine {
-                    file_idx,
-                    hunk_idx,
-                    line_idx,
-                } = r
-                {
-                    app.files
-                        .get(*file_idx)
-                        .and_then(|f| match &f.content {
-                            DiffContent::Text(hunks) => hunks
-                                .get(*hunk_idx)
-                                .and_then(|h| h.lines.get(*line_idx))
-                                .map(|l| l.kind == LineKind::Deleted),
-                            _ => None,
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            })
-            .expect("deleted row");
+        let del_row = first_diff_row_with_kind(&app, LineKind::Deleted);
         app.scroll_to(del_row);
 
         app.handle_key(key(KeyCode::Char('a')));
@@ -9765,12 +8463,12 @@ mod tests {
     #[test]
     fn insert_canned_scar_pushes_entry_to_undo_stack() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_added_line(
             &tmp,
             "src/main.rs",
             "fn a() {}\nfn b() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn b() {}")],
+            "fn b() {}",
         );
         cursor_on_nth_diff_line(&mut app, 0);
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
@@ -9790,32 +8488,25 @@ mod tests {
         // phantom entry that would otherwise cause `u` to "undo" a
         // write that never happened).
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_context_line(
             &tmp,
             "src/main.rs",
             "fn a() {}\n// @kizu[ask]: explain this change\nfn b() {}\n",
             1,
-            vec![diff_line(LineKind::Context, "fn a() {}")],
+            "fn a() {}",
         );
         // Use file-view mode to target line 3 (where `fn b` lives)
         // deterministically — the line above is the pre-existing scar.
-        app.file_view = Some(FileViewState {
-            path: PathBuf::from("src/main.rs"),
-            return_scroll: 0,
-            lines: vec![
+        app.file_view = Some(file_view_state(
+            "src/main.rs",
+            vec![
                 "fn a() {}".into(),
                 "// @kizu[ask]: explain this change".into(),
                 "fn b() {}".into(),
             ],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 2, // 0-indexed → 1-indexed line 3
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: Cell::new(1),
-            last_line_has_trailing_newline: true,
-        });
+            2,
+            true,
+        ));
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
         assert!(
             app.scar_undo_stack.is_empty(),
@@ -9826,13 +8517,8 @@ mod tests {
     #[test]
     fn undo_scar_on_empty_stack_is_noop() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            "fn a() {}\n",
-            1,
-            vec![diff_line(LineKind::Context, "fn a() {}")],
-        );
+        let mut app =
+            scar_app_with_context_line(&tmp, "src/main.rs", "fn a() {}\n", 1, "fn a() {}");
         app.undo_scar();
         assert!(app.last_error.is_none(), "empty undo must not error");
     }
@@ -9842,13 +8528,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let abs = tmp.path().join("src/main.rs");
         let before = "fn a() {}\nfn b() {}\n".to_string();
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            &before,
-            2,
-            vec![diff_line(LineKind::Added, "fn b() {}")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "src/main.rs", &before, 2, "fn b() {}");
         cursor_on_nth_diff_line(&mut app, 0);
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
         let inserted = std::fs::read_to_string(&abs).expect("read after insert");
@@ -9865,12 +8545,12 @@ mod tests {
     fn undo_scar_mismatch_surfaces_on_last_error_and_pops_stack() {
         let tmp = tempfile::tempdir().expect("tmp");
         let abs = tmp.path().join("src/main.rs");
-        let mut app = scar_app_with_real_fs(
+        let mut app = scar_app_with_added_line(
             &tmp,
             "src/main.rs",
             "fn a() {}\nfn b() {}\n",
             2,
-            vec![diff_line(LineKind::Added, "fn b() {}")],
+            "fn b() {}",
         );
         cursor_on_nth_diff_line(&mut app, 0);
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
@@ -9895,13 +8575,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let abs = tmp.path().join("src/main.rs");
         let before = "fn a() {}\nfn b() {}\nfn c() {}\n".to_string();
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            &before,
-            2,
-            vec![diff_line(LineKind::Added, "fn b() {}")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "src/main.rs", &before, 2, "fn b() {}");
         cursor_on_nth_diff_line(&mut app, 0);
         // First insertion above line 2.
         app.insert_canned_scar(ScarKind::Ask, SCAR_TEXT_ASK);
@@ -9923,29 +8597,17 @@ mod tests {
     #[test]
     fn file_view_scar_target_line_is_cursor_plus_one() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            "line1\nline2\nline3\n",
-            1,
-            vec![diff_line(LineKind::Added, "line1")],
-        );
+        let mut app =
+            scar_app_with_added_line(&tmp, "src/main.rs", "line1\nline2\nline3\n", 1, "line1");
         // Fake a file-view state directly (bypassing open_file_view's
         // hunk-centering logic). `cursor: 1` is 0-indexed → scar
         // targets 1-indexed line 2.
-        app.file_view = Some(FileViewState {
-            path: PathBuf::from("src/main.rs"),
-            return_scroll: 0,
-            lines: vec!["line1".into(), "line2".into(), "line3".into()],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 1,
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: Cell::new(1),
-            last_line_has_trailing_newline: true,
-        });
+        app.file_view = Some(file_view_state(
+            "src/main.rs",
+            vec!["line1".into(), "line2".into(), "line3".into()],
+            1,
+            true,
+        ));
         let (path, line) = app.scar_target_line().expect("target");
         assert_eq!(line, 2);
         assert_eq!(path, tmp.path().join("src/main.rs"));
@@ -9956,29 +8618,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let abs = tmp.path().join("src/main.rs");
         let before = "line1\nline2\nline3\n".to_string();
-        let mut app = scar_app_with_real_fs(
-            &tmp,
-            "src/main.rs",
-            &before,
-            1,
-            vec![diff_line(LineKind::Added, "line1")],
-        );
+        let mut app = scar_app_with_added_line(&tmp, "src/main.rs", &before, 1, "line1");
         // Enter file view programmatically (don't rely on the Enter
         // key, which requires the diff layout to have a hunk under
         // the cursor).
-        app.file_view = Some(FileViewState {
-            path: PathBuf::from("src/main.rs"),
-            return_scroll: 0,
-            lines: vec!["line1".into(), "line2".into(), "line3".into()],
-            line_bg: std::collections::HashMap::new(),
-            cursor: 1,
-            cursor_sub_row: 0,
-            scroll_top: 0,
-            anim: None,
-            visual_top: 0.0,
-            last_body_width: Cell::new(1),
-            last_line_has_trailing_newline: true,
-        });
+        app.file_view = Some(file_view_state(
+            "src/main.rs",
+            vec!["line1".into(), "line2".into(), "line3".into()],
+            1,
+            true,
+        ));
 
         // `a` in file view must route to insert_canned_scar via
         // handle_file_view_key.
@@ -10004,17 +8653,12 @@ mod tests {
         // the hunk header via `refresh_anchor`. A sticky `scar_focus`
         // pin should survive both that second recompute and any further
         // ones until the user explicitly navigates.
-        let mut app = fake_app(vec![make_file(
+        let mut app = added_hunk_app(
             "src/main.rs",
-            vec![hunk(
-                2,
-                vec![
-                    diff_line(LineKind::Added, "// @kizu[ask]: explain this change"),
-                    diff_line(LineKind::Added, "fn two() {}"),
-                ],
-            )],
+            2,
+            &["// @kizu[ask]: explain this change", "fn two() {}"],
             100,
-        )]);
+        );
         app.scar_focus = Some((PathBuf::from("/tmp/fake/src/main.rs"), 2));
         // Directly drive `apply_computed_files` with the same file
         // set — simulates a watcher tick that re-delivers the diff.
@@ -10044,11 +8688,7 @@ mod tests {
         // After any user navigation in normal mode, the sticky focus
         // pin is released so subsequent recomputes follow normal
         // anchoring rules (the user has explicitly moved elsewhere).
-        let mut app = fake_app(vec![make_file(
-            "src/main.rs",
-            vec![hunk(1, vec![diff_line(LineKind::Added, "a")])],
-            100,
-        )]);
+        let mut app = single_added_app("src/main.rs", "a");
         app.scar_focus = Some((PathBuf::from("/tmp/fake/src/main.rs"), 1));
         app.handle_key(key(KeyCode::Char('j')));
         assert!(
