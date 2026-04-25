@@ -9,9 +9,18 @@ use ratatui::{
 };
 
 mod footer;
+mod geometry;
+mod line_numbers;
 mod overlays;
 
 pub(crate) use footer::format_local_time;
+#[cfg(test)]
+use geometry::line_number_digits;
+use geometry::{LineNumberGutter, RenderGeometry};
+use line_numbers::{
+    add_line_number_gutters, diff_ln_span, file_ln_span, insert_blank_gutter,
+    insert_blank_gutter_at,
+};
 
 use crate::app::{App, RowKind};
 use crate::git::{DiffContent, FileDiff, FileStatus, Hunk, LineKind};
@@ -205,14 +214,13 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // every downstream consumer — `VisualIndex`, `wrap_at_chars`, the
     // numbered renderers — receives the exact same width this block
     // computes.
-    let aw = area.width as usize;
-    // Single-column gutter for both diff and file view (2026-04-21
-    // feedback: two columns read as "duplicated"). `resolve_ln_gutter`
-    // also applies the extreme-narrow fallback so the body never
-    // collapses below 4 cells.
-    let wants_ln = app.show_line_numbers && app.view_mode != crate::app::ViewMode::Stream;
-    let (effective_show_ln, ln_gutter_width, ln_gutter) =
-        resolve_ln_gutter(wants_ln, app.layout.max_line_number, aw);
+    let geometry = RenderGeometry::for_diff(
+        area.width as usize,
+        app.show_line_numbers,
+        app.view_mode == crate::app::ViewMode::Stream,
+        app.wrap_lines,
+        app.layout.max_line_number,
+    );
 
     // v0.5 M2: wrap mode reserves 5 cells for the left bar only. The
     // legacy `¶` marker column took another cell on every row, but
@@ -223,15 +231,11 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // the trailing pad — if the chunk fills the full body width the
     // last glyph is overwritten by the marker, which is acceptable
     // for the `\ No newline at end of file` edge case.
-    let wrap_body_width: Option<usize> = if app.wrap_lines {
-        Some(aw.saturating_sub(5 + ln_gutter_width).max(1))
-    } else {
-        None
-    };
+    let wrap_body_width = geometry.wrap_body_width;
     // Nowrap mode still needs a body width so the diff row
     // background color can extend to the viewport edge. 5 cells for
     // the left bar, the rest is body.
-    let nowrap_body_width: usize = aw.saturating_sub(5 + ln_gutter_width).max(1);
+    let nowrap_body_width = geometry.nowrap_body_width;
 
     // Sticky header decision (ADR-0009 fix):
     //
@@ -356,10 +360,10 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             bg_added: app.config.colors.bg_added_color(),
             bg_deleted: app.config.colors.bg_deleted_color(),
             search: app.search.as_ref(),
-            effective_show_ln,
+            effective_show_ln: geometry.effective_show_ln,
             diff_line_numbers: &app.layout.diff_line_numbers,
             hunk_fingerprints: &app.layout.hunk_fingerprints,
-            ln_gutter,
+            ln_gutter: geometry.ln_gutter,
         };
         let row_lines = render_row(row_idx, &app.layout.rows[row_idx], &ctx);
         let mut take = row_lines.into_iter();
@@ -423,8 +427,8 @@ fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // v0.5: sticky header also needs the blank gutter so its body
         // lines up with the scrolling DiffLine bodies underneath
         // (Codex 3rd-round Important-1).
-        let line = if effective_show_ln {
-            insert_blank_gutter(line, &ln_gutter)
+        let line = if geometry.effective_show_ln {
+            insert_blank_gutter(line, &geometry.ln_gutter)
         } else {
             line
         };
@@ -713,62 +717,6 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
         }
         RowKind::Spacer => vec![Line::raw("")],
     }
-}
-
-/// Splice `gutter_span` directly after the first span of `line`
-/// (which is the bar — 5-cell for DiffLine / HunkHeader rows,
-/// 2-cell for FileHeader rows). Used to keep non-DiffLine row bodies
-/// horizontally aligned with DiffLine bodies when the gutter is on.
-/// `bar_fallback` is the span to emit when the line has no spans at
-/// all; callers pass a matching-width blank bar so downstream
-/// measurements stay consistent.
-fn insert_gutter_span(
-    line: Line<'static>,
-    gutter_span: Span<'static>,
-    bar_fallback: Span<'static>,
-) -> Line<'static> {
-    let mut spans = line.spans;
-    let bar = if spans.is_empty() {
-        bar_fallback
-    } else {
-        spans.remove(0)
-    };
-    let mut new_spans = Vec::with_capacity(spans.len() + 2);
-    new_spans.push(bar);
-    new_spans.push(gutter_span);
-    new_spans.extend(spans);
-    Line::from(new_spans)
-}
-
-/// Shorthand for splicing a blank gutter after the head span of a
-/// line that already has its own bar (or no bar at all, for Spacer).
-fn insert_blank_gutter(line: Line<'static>, gutter: &LineNumberGutter) -> Line<'static> {
-    insert_gutter_span(line, gutter.blank_span(), Span::raw(""))
-}
-
-/// Splice a blank gutter span after the first `split_at` cells of
-/// `line`'s single-span content. Used for BinaryNotice which packs
-/// its bar + pad + body into one `Span` literal.
-fn insert_blank_gutter_at(
-    line: Line<'static>,
-    gutter: &LineNumberGutter,
-    split_at: usize,
-) -> Line<'static> {
-    let mut spans = line.spans;
-    if spans.is_empty() {
-        return Line::from(vec![gutter.blank_span()]);
-    }
-    let first = spans.remove(0);
-    let text = first.content.as_ref();
-    let (head, tail) = text.split_at(split_at.min(text.len()));
-    let head_span = Span::styled(head.to_string(), first.style);
-    let tail_span = Span::styled(tail.to_string(), first.style);
-    let mut new_spans = Vec::with_capacity(spans.len() + 3);
-    new_spans.push(head_span);
-    new_spans.push(gutter.blank_span());
-    new_spans.push(tail_span);
-    new_spans.extend(spans);
-    Line::from(new_spans)
 }
 
 /// Project the global `SearchState.matches` onto a single layout row.
@@ -1060,142 +1008,6 @@ fn render_file_header(file: &FileDiff, is_cursor: bool) -> Line<'static> {
 
 // ---- v0.5 line-number gutter ----------------------------------------
 
-/// Width configuration for the line-number gutter (v0.5).
-///
-/// Single-column format for both diff view and file view: `" N "` —
-/// 1-cell leading pad, right-aligned number column, 1-cell trailing
-/// pad. Earlier revisions used a two-column `OLD|NEW` layout, but
-/// user feedback (2026-04-21) was that the doubled numbers on every
-/// Context row ("13 13", "14 14", …) looked like a bug ("二重表示").
-/// The single column shows only the worktree (new) line number
-/// (Context/Added), and Deleted rows get a blank gutter because the
-/// line no longer exists in the worktree — mixing `old` baseline
-/// numbers in the same column broke monotonicity when earlier hunks
-/// shifted subsequent hunks by N lines.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct LineNumberGutter {
-    pub total_width: usize,
-    pub col_width: usize,
-}
-
-impl LineNumberGutter {
-    /// Single-column gutter with the given column width.
-    pub fn single(col_width: usize) -> Self {
-        Self {
-            total_width: 1 + col_width + 1,
-            col_width,
-        }
-    }
-
-    /// Return a blank span of the full gutter width. Used for wrap
-    /// continuation rows and for non-DiffLine rows (HunkHeader,
-    /// BinaryNotice, Spacer) that still need the gutter column
-    /// reserved so downstream body rendering lines up.
-    fn blank_span(&self) -> Span<'static> {
-        Span::raw(" ".repeat(self.total_width))
-    }
-}
-
-/// Diff-view line-number gutter span. Shows the worktree (new-side)
-/// line number only:
-///
-/// - Context → new (the line exists in the current worktree)
-/// - Added   → new (same)
-/// - Deleted → blank (the line no longer exists in the worktree, so
-///   there is no "current" line number to show)
-///
-/// Earlier revisions mixed `old` and `new` values in the same column
-/// so Deleted rows would still render a number. User feedback
-/// (2026-04-21) pointed out that when *earlier* hunks in the same
-/// file shift N lines, the old-side baseline number on a Deleted row
-/// and the new-side worktree number on an adjacent Added row diverge
-/// by N, breaking the intuition that "the gutter tracks the file I'm
-/// looking at". Showing only the worktree side keeps the column
-/// monotonic.
-fn diff_ln_span(pair: (Option<usize>, Option<usize>), gutter: &LineNumberGutter) -> Span<'static> {
-    let w = gutter.col_width;
-    let content = match pair.1 {
-        Some(v) => format!(" {v:>w$} "),
-        None => " ".repeat(gutter.total_width),
-    };
-    Span::styled(
-        content,
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    )
-}
-
-/// File-view single-column line-number gutter span.
-fn file_ln_span(line_number: usize, gutter: &LineNumberGutter) -> Span<'static> {
-    Span::styled(
-        format!(" {line_number:>w$} ", w = gutter.col_width),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    )
-}
-
-/// Insert a line-number gutter after the 5-cell cursor bar on every
-/// rendered visual line. The first visual row gets the supplied
-/// number span; wrap continuation rows get blanks so the number is
-/// not repeated down the screen.
-fn add_line_number_gutters(
-    lines: Vec<Line<'static>>,
-    first_gutter: Span<'static>,
-    gutter: &LineNumberGutter,
-) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let ln = if i == 0 {
-                first_gutter.clone()
-            } else {
-                gutter.blank_span()
-            };
-            insert_gutter_span(line, ln, Span::raw("     "))
-        })
-        .collect()
-}
-
-/// Compute the line-number gutter width for a given max line number.
-/// 10 is the lower bound so tiny files stay at a stable 2 digits.
-pub(crate) fn line_number_digits(max: usize) -> usize {
-    let mut n = max.max(10);
-    let mut digits = 0;
-    while n > 0 {
-        n /= 10;
-        digits += 1;
-    }
-    digits
-}
-
-/// Resolve the effective line-number gutter: apply the
-/// extreme-narrow fallback so the caller doesn't have to. Returns
-/// `(effective_show_ln, ln_gutter_width, ln_gutter)` where
-/// `ln_gutter` uses a zero col-width when the gutter is suppressed
-/// so blank-slot helpers keep working without separate nil handling.
-fn resolve_ln_gutter(
-    show_ln: bool,
-    max_line_number: usize,
-    viewport_width: usize,
-) -> (bool, usize, LineNumberGutter) {
-    let digits = line_number_digits(max_line_number);
-    let raw_width = if show_ln {
-        LineNumberGutter::single(digits).total_width
-    } else {
-        0
-    };
-    // Fallback: if the gutter would leave < 4 cells of body width,
-    // drop it entirely so the user still gets diff content.
-    if show_ln && viewport_width >= 5 + raw_width + 4 {
-        (true, raw_width, LineNumberGutter::single(digits))
-    } else {
-        (false, 0, LineNumberGutter::single(0))
-    }
-}
-
 fn render_hunk_header(
     hunk: &Hunk,
     is_selected: bool,
@@ -1471,13 +1283,12 @@ fn render_file_view(
     effective_top: usize,
 ) {
     let height = area.height as usize;
-    let width = area.width as usize;
     // v0.5: mirror render_scroll's single-source body_width calc so
     // VisualIndex::build_lines and the numbered renderer see the same value
     // (Codex review §Critical-1).
-    let (effective_show_ln, ln_gutter_width, ln_gutter) =
-        resolve_ln_gutter(show_line_numbers, fv.lines.len(), width);
-    let body_width = width.saturating_sub(5 + ln_gutter_width).max(1);
+    let geometry =
+        RenderGeometry::for_file_view(area.width as usize, show_line_numbers, fv.lines.len());
+    let body_width = geometry.body_width;
     fv.last_body_width.set(body_width);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
 
@@ -1505,11 +1316,11 @@ fn render_file_view(
                 &fv.path,
                 show_eof_marker,
             );
-            let rendered = if effective_show_ln {
+            let rendered = if geometry.effective_show_ln {
                 add_line_number_gutters(
                     rendered,
-                    file_ln_span(line_idx + 1, &ln_gutter),
-                    &ln_gutter,
+                    file_ln_span(line_idx + 1, &geometry.ln_gutter),
+                    &geometry.ln_gutter,
                 )
             } else {
                 rendered
@@ -1550,11 +1361,11 @@ fn render_file_view(
                 &fv.path,
                 show_eof_marker,
             );
-            let rendered = if effective_show_ln {
+            let rendered = if geometry.effective_show_ln {
                 let mut lines = add_line_number_gutters(
                     vec![rendered],
-                    file_ln_span(line_idx + 1, &ln_gutter),
-                    &ln_gutter,
+                    file_ln_span(line_idx + 1, &geometry.ln_gutter),
+                    &geometry.ln_gutter,
                 );
                 lines.remove(0)
             } else {
