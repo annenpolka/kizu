@@ -2,10 +2,8 @@ use anyhow::Result;
 use std::path::Path;
 
 use super::pre_commit::remove_git_pre_commit_hook;
-use super::settings_json::remove_kizu_hooks_from_json;
-use super::{
-    AgentKind, c_bold, c_dim, c_green, c_magenta, contains_kizu_hook_command, detect_agents,
-};
+use super::settings_json::{contains_kizu_hook_command, remove_kizu_hooks_from_json};
+use super::{AgentKind, c_bold, c_dim, c_green, c_magenta, detect_agents};
 
 // ── M8: teardown ────────────────────────────────────────────────
 

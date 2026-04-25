@@ -1,7 +1,8 @@
 use anyhow::Result;
 use std::path::Path;
 
-use super::{Scope, kizu_bin_for_scope};
+use super::Scope;
+use super::install::kizu_bin_for_scope;
 
 /// Kizu-managed shim marker embedded in generated pre-commit hooks.
 const KIZU_SHIM_MARKER: &str = "# kizu-managed-shim";

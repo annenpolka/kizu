@@ -20,10 +20,10 @@ use std::path::Path;
 /// }
 /// ```
 /// A single hook command entry within a matcher group.
-pub(super) struct HookCmd<'a> {
-    pub(super) command: &'a str,
-    pub(super) timeout: Option<u32>,
-    pub(super) is_async: bool,
+pub(in crate::init) struct HookCmd<'a> {
+    pub(in crate::init) command: &'a str,
+    pub(in crate::init) timeout: Option<u32>,
+    pub(in crate::init) is_async: bool,
 }
 
 /// Each event holds an array of **matcher groups**, each with a
@@ -84,7 +84,7 @@ fn split_mixed_kizu_groups(arr: &mut Vec<serde_json::Value>) {
 /// can reconcile by subcommand instead of by full command string.
 /// Returns `None` when the command does not look like a kizu hook
 /// (e.g. a user's linter), so non-kizu entries are never matched.
-pub(super) fn kizu_command_token(command: &str) -> Option<String> {
+pub(in crate::init) fn kizu_command_token(command: &str) -> Option<String> {
     for token in command.split_whitespace() {
         if let Some(rest) = token.strip_prefix("hook-") {
             if rest.is_empty() {
@@ -96,14 +96,14 @@ pub(super) fn kizu_command_token(command: &str) -> Option<String> {
     None
 }
 
-pub(super) fn contains_kizu_hook_command(text: &str) -> bool {
+pub(in crate::init) fn contains_kizu_hook_command(text: &str) -> bool {
     text.contains("kizu hook-")
         || text
             .split_whitespace()
             .any(|token| matches!(token, "hook-post-tool" | "hook-stop" | "hook-log-event"))
 }
 
-pub(super) fn merge_hooks_into_settings(
+pub(in crate::init) fn merge_hooks_into_settings(
     path: &Path,
     hooks: &[(&str, &str, &[HookCmd<'_>])], // (event_name, matcher, commands)
 ) -> Result<(usize, usize)> {
