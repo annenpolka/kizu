@@ -2,10 +2,15 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 mod detect;
+mod pre_commit;
 mod settings_json;
 mod types;
 
 pub use detect::detect_agents;
+#[cfg(test)]
+use pre_commit::pre_commit_shim_body;
+pub(crate) use pre_commit::shell_single_quote;
+use pre_commit::{install_git_pre_commit_hook, remove_git_pre_commit_hook};
 use settings_json::{
     HookCmd, contains_kizu_hook_command, kizu_command_token, merge_hooks_into_settings,
     remove_kizu_hooks_from_json,
@@ -323,104 +328,6 @@ fn print_report(report: &InstallReport) {
 }
 
 // ── Installer dispatch ──────────────────────────────────────────
-
-/// Kizu-managed shim marker embedded in generated pre-commit hooks.
-const KIZU_SHIM_MARKER: &str = "# kizu-managed-shim";
-
-/// Wrap `s` in POSIX single quotes, escaping any interior single
-/// quotes with the standard `'\''` sequence. Produces a token that
-/// `sh` always parses as exactly one literal argument, regardless of
-/// spaces, `$`, `"`, `\`, `*`, etc. Kizu binaries installed under
-/// paths like `/Users/John Doe/.cargo/bin/kizu` would otherwise
-/// wordsplit in the generated pre-commit shim.
-///
-/// Shared with [`crate::attach`] so the Ghostty `osascript` builder
-/// reuses the same quoting contract.
-pub(crate) fn shell_single_quote(s: &str) -> String {
-    let escaped = s.replace('\'', r"'\''");
-    format!("'{escaped}'")
-}
-
-/// Render the `/bin/sh` shim body that `.git/hooks/pre-commit`
-/// writes. Extracted from `install_git_pre_commit_hook` so the
-/// quoting contract can be unit-tested without touching the
-/// filesystem.
-fn pre_commit_shim_body(bin: &str, has_user_hook: bool) -> String {
-    let bin_q = shell_single_quote(bin);
-    if has_user_hook {
-        format!(
-            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
-             # Run the original user hook first.\n\
-             \"$(dirname \"$0\")/pre-commit.user\" \"$@\"\n\
-             # Then run kizu scar guard.\n\
-             {bin_q} hook-pre-commit\n"
-        )
-    } else {
-        format!(
-            "#!/bin/sh\n{KIZU_SHIM_MARKER}\nset -e\n\
-             # kizu scar guard\n\
-             {bin_q} hook-pre-commit\n"
-        )
-    }
-}
-
-/// Install a kizu-managed pre-commit shim that guarantees
-/// `kizu hook-pre-commit` always runs, even when the repo has a
-/// pre-existing hook script that may contain `exit`/`exec`.
-///
-/// Strategy:
-/// - **No existing hook**: write a simple shim.
-/// - **Existing hook is already kizu-managed**: no-op.
-/// - **Existing non-kizu hook**: rename it to `pre-commit.user`,
-///   then write a shim that calls the original *and* kizu. Both
-///   must succeed (fail-fast with `set -e`).
-fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
-    let git_dir = crate::git::git_dir(project_root)?;
-    let hooks_dir = git_dir.join("hooks");
-    std::fs::create_dir_all(&hooks_dir)?;
-    let hook_path = hooks_dir.join("pre-commit");
-
-    if hook_path.exists() {
-        let content = std::fs::read_to_string(&hook_path)?;
-        if content.contains(KIZU_SHIM_MARKER) {
-            println!("  git pre-commit hook: already installed");
-            return Ok(());
-        }
-        // Existing non-kizu hook → rename and wrap.
-        let user_hook = hooks_dir.join("pre-commit.user");
-        if user_hook.exists() {
-            anyhow::bail!(
-                "cannot install pre-commit shim: backup path already exists at {}\n\
-                 Remove or rename it manually, then re-run `kizu init`.",
-                user_hook.display()
-            );
-        }
-        std::fs::rename(&hook_path, &user_hook)?;
-        let bin = kizu_bin_for_scope(Scope::ProjectLocal);
-        let shim = pre_commit_shim_body(&bin, true);
-        std::fs::write(&hook_path, shim)?;
-        println!(
-            "  git pre-commit hook: wrapped existing hook → {}",
-            user_hook.display()
-        );
-    } else {
-        let bin = kizu_bin_for_scope(Scope::ProjectLocal);
-        let shim = pre_commit_shim_body(&bin, false);
-        std::fs::write(&hook_path, shim)?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    println!(
-        "  git pre-commit hook: installed at {}",
-        hook_path.display()
-    );
-    Ok(())
-}
 
 /// Returns `true` when the requested scope is not natively supported
 /// by this agent and a fallback choice is needed.
@@ -886,38 +793,6 @@ fn remove_json_hooks_with_report(agent_label: &str, path: &Path) -> Result<bool>
 
 /// Remove kizu's pre-commit hook and restore the user's original if
 /// it was wrapped by the shim installer.
-fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
-    let git_dir = match crate::git::git_dir(project_root) {
-        Ok(d) => d,
-        Err(_) => return Ok(false),
-    };
-    let hooks_dir = git_dir.join("hooks");
-    let hook_path = hooks_dir.join("pre-commit");
-    if !hook_path.exists() {
-        return Ok(false);
-    }
-    let content = std::fs::read_to_string(&hook_path)?;
-    if !content.contains("kizu hook-pre-commit") && !content.contains(KIZU_SHIM_MARKER) {
-        return Ok(false);
-    }
-
-    // Remove the kizu shim.
-    std::fs::remove_file(&hook_path)?;
-
-    // Restore the original user hook if it was renamed by install.
-    let user_hook = hooks_dir.join("pre-commit.user");
-    if user_hook.exists() {
-        std::fs::rename(&user_hook, &hook_path)?;
-    }
-
-    Ok(true)
-}
-
-/// Scrub kizu hook entries from `<home>/.cursor/hooks.json`,
-/// covering the user-scope install path that `install_cursor` uses
-/// when `Scope::User`. Split out of `run_teardown` so tests can
-/// inject a fake home directory without monkey-patching
-/// `dirs::home_dir()`. Returns `true` if anything was removed.
 #[cfg(test)]
 fn teardown_cursor_user_hooks(home: &Path) -> Result<bool> {
     let path = home.join(".cursor").join("hooks.json");
