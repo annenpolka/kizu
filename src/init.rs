@@ -15,6 +15,7 @@ use install::{install_cursor, kizu_hook_command_with_bin};
 use pre_commit::install_git_pre_commit_hook;
 #[cfg(test)]
 use pre_commit::pre_commit_shim_body;
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) use pre_commit::shell_single_quote;
 #[cfg(test)]
 use settings_json::{HookCmd, merge_hooks_into_settings, remove_kizu_hooks_from_json};
