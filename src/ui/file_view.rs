@@ -7,10 +7,10 @@ use ratatui::{
 };
 
 use super::{
-    cursor_bar, eof_no_newline_span,
+    cursor_bar,
     geometry::RenderGeometry,
     line_numbers::{add_line_number_gutters, file_ln_span},
-    take_cells, wrap_at_chars,
+    text_cells::{eof_no_newline_span, take_cells, wrap_at_chars},
 };
 
 pub(super) fn render_file_view(

@@ -8,12 +8,15 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+mod diff_line;
 mod file_view;
 mod footer;
 mod geometry;
 mod line_numbers;
 mod overlays;
+mod text_cells;
 
+use diff_line::{render_diff_line, render_diff_line_wrapped};
 use file_view::render_file_view;
 #[cfg(test)]
 use file_view::{render_file_view_line, render_file_view_line_wrapped};
@@ -26,6 +29,8 @@ use line_numbers::file_ln_span;
 use line_numbers::{
     add_line_number_gutters, diff_ln_span, insert_blank_gutter, insert_blank_gutter_at,
 };
+#[cfg(test)]
+use text_cells::wrap_at_chars;
 
 use crate::app::{App, RowKind};
 use crate::git::{DiffContent, FileDiff, FileStatus, Hunk, LineKind};
@@ -549,15 +554,6 @@ struct RowRenderCtx<'a> {
     ln_gutter: LineNumberGutter,
 }
 
-/// Classification of a single character position against the active
-/// search matches. Drives the style overlay inside the renderer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SearchHl {
-    None,
-    Other,
-    Current,
-}
-
 pub(super) fn cursor_bar(is_cursor: bool, is_selected: bool) -> Span<'static> {
     if is_cursor {
         Span::styled(
@@ -746,221 +742,6 @@ fn row_search_matches(
         .collect()
 }
 
-/// Classify every char in `content` against the match ranges. `matches`
-/// are `(byte_start, byte_end, is_current)` in source order; byte
-/// offsets are guaranteed to be UTF-8 char boundaries by `find_matches`.
-///
-/// Invariant: output length equals `content.chars().count()`. Chars
-/// whose byte position sits inside a match range get `Current` or
-/// `Other`; everything else stays `None`. A single char that straddles
-/// the current-match range and an overlapping other-match (can only
-/// happen if matches overlap, which `find_matches` doesn't produce
-/// because it advances `start` past each hit) would bias to Current —
-/// but the guard is defensive, not load-bearing.
-fn classify_chars_by_match(content: &str, matches: &[(usize, usize, bool)]) -> Vec<SearchHl> {
-    let n = content.chars().count();
-    let mut out = vec![SearchHl::None; n];
-    if matches.is_empty() {
-        return out;
-    }
-    for (char_idx, (byte_pos, _)) in content.char_indices().enumerate() {
-        for &(bs, be, is_current) in matches {
-            if byte_pos >= bs && byte_pos < be {
-                let new_kind = if is_current {
-                    SearchHl::Current
-                } else {
-                    SearchHl::Other
-                };
-                // Current wins over Other on overlap (defensive).
-                if out[char_idx] != SearchHl::Current || is_current {
-                    out[char_idx] = new_kind;
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Compose a base diff-line style with the search-highlight overlay
-/// for one char. `Current` fully overrides the base with the
-/// yellow-reversal look; `Other` keeps the base bg/fg but adds a
-/// bold underline so the word stands out without swallowing the
-/// add/delete signal. `Other` explicitly strips `DIM` because matches
-/// that land in an unfocused hunk still need to pop — otherwise the
-/// whole point of a search highlight is lost on everything but the
-/// currently selected hunk.
-fn apply_search_overlay(base: Style, fg: Color, hl: SearchHl) -> Style {
-    match hl {
-        SearchHl::None => base.fg(fg),
-        SearchHl::Other => base
-            .fg(fg)
-            .remove_modifier(Modifier::DIM)
-            .add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
-        SearchHl::Current => Style::default()
-            .bg(Color::Yellow)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD),
-    }
-}
-
-/// Split `content` into chunks whose **display width** is at most
-/// `width` cells. Always returns at least one chunk; an empty input
-/// produces `[""]`. CJK / emoji / other wide characters consume 2
-/// cells apiece, so a body width of 40 cells holds roughly 20 kanji —
-/// feeding char counts straight into ratatui overflowed the viewport
-/// and broke the wrap marker on CJK-heavy diffs.
-///
-/// Zero-width combining marks (`char.width()` returns `Some(0)`) and
-/// control chars (`None`) are folded into the current chunk without
-/// advancing the cell counter so they stick with their preceding
-/// base glyph instead of getting orphaned onto a new visual row.
-pub(super) fn wrap_at_chars(content: &str, width: usize) -> Vec<&str> {
-    use unicode_width::UnicodeWidthChar;
-    if content.is_empty() || width == 0 {
-        return vec![content];
-    }
-    let mut chunks = Vec::new();
-    let mut chunk_start = 0usize;
-    let mut chunk_cells = 0usize;
-    for (idx, ch) in content.char_indices() {
-        let ch_cells = ch.width().unwrap_or(0);
-        // Flush the current chunk before placing a char that would
-        // overshoot the cell budget. Requires `chunk_cells > 0` so
-        // that a single char wider than the whole width still lands
-        // in one chunk rather than looping forever on an empty one.
-        if chunk_cells > 0 && chunk_cells + ch_cells > width {
-            chunks.push(&content[chunk_start..idx]);
-            chunk_start = idx;
-            chunk_cells = 0;
-        }
-        chunk_cells += ch_cells;
-    }
-    if chunk_start < content.len() {
-        chunks.push(&content[chunk_start..]);
-    }
-    if chunks.is_empty() {
-        chunks.push(content);
-    }
-    chunks
-}
-
-/// v0.5 M2: EOF-no-newline marker (`∅`) span. Drawn at the end of
-/// the *last* visual row of a DiffLine whose `has_trailing_newline`
-/// is false — the git `\ No newline at end of file` case. Yellow +
-/// Bold so the rare event is visually loud; legacy `¶` on every
-/// normal row was too chatty.
-pub(super) fn eof_no_newline_span(bg: Option<Color>) -> Span<'static> {
-    let mut style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    if let Some(b) = bg {
-        style = style.bg(b);
-    }
-    Span::styled("∅", style)
-}
-
-/// Wrap-mode variant of [`render_diff_line`]. Splits `line.content`
-/// at `body_width` chars and paints every visual row with the delta-style
-/// background color (ADR-0014). Only the last visual row of a DiffLine
-/// whose `has_trailing_newline = false` gets the `∅` EOF-no-newline
-/// marker (v0.5 M2, was previously `¶` on every newline-terminated row).
-///
-/// Each visual row is padded out to `body_width` with trailing spaces
-/// so the background color extends uniformly to the right margin
-/// instead of stopping at the last content character.
-#[allow(clippy::too_many_arguments)]
-fn render_diff_line_wrapped(
-    line: &crate::git::DiffLine,
-    is_selected: bool,
-    cursor_sub: Option<usize>,
-    body_width: usize,
-    hl: Option<&crate::highlight::Highlighter>,
-    file_path: Option<&std::path::Path>,
-    bg_added: Color,
-    bg_deleted: Color,
-    search_matches: &[(usize, usize, bool)],
-) -> Vec<Line<'static>> {
-    use unicode_width::UnicodeWidthStr;
-    // ADR-0014: background-color diff rendering. Focused hunks keep
-    // full brightness; unfocused hunks wear `Modifier::DIM` so the
-    // eye still flows to the cursor band. Context rows use the
-    // terminal default inside the focus and dark-gray + DIM outside.
-    let bg = match line.kind {
-        LineKind::Added => Some(bg_added),
-        LineKind::Deleted => Some(bg_deleted),
-        LineKind::Context => None,
-    };
-    let base_style = match (bg, is_selected) {
-        (Some(b), true) => Style::default().bg(b),
-        (Some(b), false) => Style::default().bg(b).add_modifier(Modifier::DIM),
-        (None, true) => Style::default(),
-        (None, false) => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    };
-    // Per-char fg + search highlight kind, built once for the whole
-    // line. Distributed across wrapped chunks below so a match that
-    // spans a wrap boundary still paints cleanly on both sides.
-    let char_fgs = per_char_fg(&line.content, hl, file_path);
-    let char_hls = classify_chars_by_match(&line.content, search_matches);
-
-    let chunks = wrap_at_chars(&line.content, body_width.max(1));
-    let last_idx = chunks.len().saturating_sub(1);
-    let mut char_offset = 0usize;
-    let cursor_line = cursor_sub.map(|s| s.min(last_idx));
-
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let is_last = i == last_idx;
-            let bar = cursor_bar(cursor_line == Some(i), is_selected);
-            // v0.5 M2: reserve 1 cell only when this is the last
-            // visual row AND the DiffLine is EOF-no-newline (the `∅`
-            // marker case). Normal newline-terminated rows get no
-            // marker and no reservation.
-            let marker_reserve = if is_last && !line.has_trailing_newline {
-                1
-            } else {
-                0
-            };
-            let chunk_char_count = chunk.chars().count();
-            // Display width drives the trailing-space pad that extends
-            // the delta-style background to the viewport edge. Using
-            // char count would leave CJK rows short by one cell per
-            // wide char and the bg color would end mid-line.
-            let chunk_cell_count = UnicodeWidthStr::width(chunk);
-            let pad = body_width.saturating_sub(chunk_cell_count + marker_reserve);
-
-            let mut spans = vec![bar];
-
-            let chunk_fgs = &char_fgs[char_offset..char_offset + chunk_char_count];
-            let chunk_hls = &char_hls[char_offset..char_offset + chunk_char_count];
-            let chunk_chars: Vec<char> = chunk.chars().collect();
-            let mut run_start = 0usize;
-            while run_start < chunk_chars.len() {
-                let run_attr = (chunk_fgs[run_start], chunk_hls[run_start]);
-                let run_end = (run_start + 1..chunk_chars.len())
-                    .find(|&j| (chunk_fgs[j], chunk_hls[j]) != run_attr)
-                    .unwrap_or(chunk_chars.len());
-                let text: String = chunk_chars[run_start..run_end].iter().collect();
-                let style = apply_search_overlay(base_style, run_attr.0, run_attr.1);
-                spans.push(Span::styled(text, style));
-                run_start = run_end;
-            }
-            if pad > 0 {
-                spans.push(Span::styled(" ".repeat(pad), base_style));
-            }
-
-            if is_last && !line.has_trailing_newline {
-                spans.push(eof_no_newline_span(bg));
-            }
-            char_offset += chunk_char_count;
-            Line::from(spans)
-        })
-        .collect()
-}
-
 /// Bottom-up file header: `  path                                14:03   +12 -3`.
 /// Path color encodes the status (cyan / green / red / yellow), no `M`/`A`/`D`
 /// label needed.
@@ -1085,155 +866,6 @@ fn render_hunk_header(
     let gutter = cursor_bar(is_cursor, is_selected);
 
     Line::from(vec![gutter, Span::styled(label, label_style)])
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_diff_line(
-    line: &crate::git::DiffLine,
-    is_selected: bool,
-    is_cursor: bool,
-    body_width: usize,
-    hl: Option<&crate::highlight::Highlighter>,
-    file_path: Option<&std::path::Path>,
-    bg_added: Color,
-    bg_deleted: Color,
-    search_matches: &[(usize, usize, bool)],
-) -> Line<'static> {
-    let bg = match line.kind {
-        LineKind::Added => Some(bg_added),
-        LineKind::Deleted => Some(bg_deleted),
-        LineKind::Context => None,
-    };
-    let bar = cursor_bar(is_cursor, is_selected);
-    let base_style = match (bg, is_selected) {
-        (Some(b), true) => Style::default().bg(b),
-        (Some(b), false) => Style::default().bg(b).add_modifier(Modifier::DIM),
-        (None, true) => Style::default(),
-        (None, false) => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    };
-
-    // Derive a per-char foreground color from syntax tokens when
-    // available. Fallback: `Color::Reset` so non-highlighted content
-    // inherits the terminal default fg (same look as before the
-    // search-overlay refactor). Length matches `content.chars().count()`.
-    let char_fgs = per_char_fg(&line.content, hl, file_path);
-    let char_hls = classify_chars_by_match(&line.content, search_matches);
-
-    // Walk chars, respect `body_width` in display cells, and group
-    // consecutive chars with the same `(fg, hl)` into one span so
-    // ratatui doesn't pay span overhead per char.
-    //
-    // v0.5 M2: reserve the last cell for the EOF-no-newline marker
-    // (`∅`) when the DiffLine lacks a trailing newline. The cell is
-    // only reserved in the EOF case so normal rows still have the
-    // full body width for content + pad.
-    let eof_marker = !line.has_trailing_newline;
-    let body_budget = if eof_marker {
-        body_width.saturating_sub(1)
-    } else {
-        body_width
-    };
-    use unicode_width::UnicodeWidthChar;
-    let mut spans = vec![bar];
-    let mut cells_emitted = 0usize;
-    let chars: Vec<char> = line.content.chars().collect();
-
-    let mut run_start = 0usize;
-    while run_start < chars.len() {
-        let run_attr = (char_fgs[run_start], char_hls[run_start]);
-        let mut run_end = run_start + 1;
-        let mut run_cells = chars[run_start].width().unwrap_or(0);
-        // Short-circuit: don't bother extending the run past the
-        // body budget (body_width minus the EOF marker reserve).
-        if cells_emitted + run_cells > body_budget {
-            break;
-        }
-        while run_end < chars.len() {
-            let candidate_attr = (char_fgs[run_end], char_hls[run_end]);
-            if candidate_attr != run_attr {
-                break;
-            }
-            let w = chars[run_end].width().unwrap_or(0);
-            if cells_emitted + run_cells + w > body_budget {
-                break;
-            }
-            run_cells += w;
-            run_end += 1;
-        }
-        let text: String = chars[run_start..run_end].iter().collect();
-        let style = apply_search_overlay(base_style, run_attr.0, run_attr.1);
-        spans.push(Span::styled(text, style));
-        cells_emitted += run_cells;
-        run_start = run_end;
-        if cells_emitted >= body_budget {
-            break;
-        }
-    }
-
-    // Pad to body_budget so the delta-style background extends to the
-    // viewport edge (ADR-0014). The padding keeps the base diff bg
-    // (no search overlay) so the gutter and trailing cells don't get
-    // falsely underlined.
-    if cells_emitted < body_budget {
-        spans.push(Span::styled(
-            " ".repeat(body_budget - cells_emitted),
-            base_style,
-        ));
-    }
-    if eof_marker {
-        spans.push(eof_no_newline_span(bg));
-    }
-    Line::from(spans)
-}
-
-/// Build a per-char foreground color vector for `content`. Falls back
-/// to `Color::Reset` for every char when no highlighter is available
-/// or the file extension is unknown — which preserves the pre-overlay
-/// terminal-default appearance for plain-text diffs.
-fn per_char_fg(
-    content: &str,
-    hl: Option<&crate::highlight::Highlighter>,
-    file_path: Option<&std::path::Path>,
-) -> Vec<Color> {
-    let n = content.chars().count();
-    if let (Some(hl), Some(path)) = (hl, file_path) {
-        let tokens = hl.highlight_line(content, path);
-        if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
-            let mut out = Vec::with_capacity(n);
-            for tok in &tokens {
-                for _ in tok.text.chars() {
-                    out.push(tok.fg);
-                }
-            }
-            if out.len() == n {
-                return out;
-            }
-            // Token char count drift (shouldn't happen with syntect)
-            // — fall through to the flat-color fallback rather than
-            // panicking in the renderer.
-        }
-    }
-    vec![Color::Reset; n]
-}
-
-/// Take as many leading chars from `s` as fit into `max_cells` display
-/// cells, without splitting a wide char. Returns the prefix and the
-/// number of cells actually consumed.
-pub(super) fn take_cells(s: &str, max_cells: usize) -> (String, usize) {
-    use unicode_width::UnicodeWidthChar;
-    let mut out = String::new();
-    let mut cells = 0usize;
-    for ch in s.chars() {
-        let w = ch.width().unwrap_or(0);
-        if cells + w > max_cells {
-            break;
-        }
-        out.push(ch);
-        cells += w;
-    }
-    (out, cells)
 }
 
 /// `HH:MM` formatted **local** time. Returns `--:--` when the metadata
