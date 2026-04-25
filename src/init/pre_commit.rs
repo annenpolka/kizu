@@ -101,7 +101,7 @@ pub(super) fn install_git_pre_commit_hook(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
+pub(in crate::init) fn remove_git_pre_commit_hook(project_root: &Path) -> Result<bool> {
     let git_dir = match crate::git::git_dir(project_root) {
         Ok(d) => d,
         Err(_) => return Ok(false),

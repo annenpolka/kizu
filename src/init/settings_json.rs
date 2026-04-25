@@ -265,7 +265,7 @@ pub(super) fn merge_hooks_into_settings(
     Ok((added, skipped))
 }
 
-pub(super) fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
+pub(in crate::init) fn remove_kizu_hooks_from_json(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
