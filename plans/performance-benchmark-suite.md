@@ -20,6 +20,7 @@ kizu は AI エージェントの横で常時動く TUI なので、重い repo 
 - [x] (2026-05-01 05:54:31Z) Improvement 2: search の ASCII lowercase smart-case path から per-line `to_ascii_lowercase()` allocation を削除し、`ascii_case_insensitive_find_reports_original_byte_offsets` を Red/Green で通した。
 - [x] (2026-05-01 06:06:22Z) Validation: current tree で `cargo bench --bench operations`、`just rust`、`cargo fmt --all -- --check`、`git diff --check`、ExecPlan validator が成功した。
 - [x] (2026-05-01 06:15:10Z) Full gate: `just ci` が成功した。unit tests 471 件、release build、tuistory e2e 35 件が成功した。
+- [x] (2026-05-01 07:06:26Z) Follow-up Improvement: 残っていた `stream/build_stream_files_200_events` を改善した。`StreamPrefixCache` で秒単位の時刻文字列を再利用し、出力 `Vec` の事前確保と `file_paths` の余分な `Vec` clone 削減を入れた。
 
 ## Surprises & Discoveries
 
@@ -44,6 +45,9 @@ kizu は AI エージェントの横で常時動く TUI なので、重い repo 
 - Observation: `paths` と `hook` の env-var tests は module-local mutex では直列化できていなかった。
   Evidence: `just ci` 初回で `paths::tests::events_dir_is_per_project` が `path_b.starts_with("/tmp/kizu-test-state/events/")` に失敗した。`KIZU_STATE_DIR` を hook tests が別 mutex で触っていたため、`src/test_support.rs` の crate-wide `ENV_LOCK` に統合した。
 
+- Observation: `build_stream_files` の残りの重さは diff 行の変換よりも event ごとの時刻 prefix 生成が支配的だった。
+  Evidence: Follow-up 前の `stream/build_stream_files_200_events` は `7.2316 ms 7.2896 ms 7.3545 ms`、秒単位の `StreamPrefixCache` 導入後は `123.37 µs 124.04 µs 124.81 µs` になった。
+
 ## Decision Log
 
 - Decision: 一時 probe ではなく Criterion の `benches/operations.rs` を追加する。
@@ -66,13 +70,19 @@ kizu は AI エージェントの横で常時動く TUI なので、重い repo 
   Rationale: `find_matches` の byte offsets は renderer の search highlight にそのまま使うため、haystack を lowercase した別 String 上で探すより、元 content の byte slice を case-insensitive 比較する方が速くて offset 変換も不要である。
   Date/Author: 2026-05-01 05:54:31Z / Codex
 
+- Decision: Stream view の header prefix は `build_stream_files` 呼び出し内で epoch second ごとに時刻文字列をキャッシュする。
+  Rationale: 表示精度は `HH:MM:SS` なので同一秒内の timestamp は同じ時刻文字列になる。`StreamEvent` や `FileDiff` のデータモデルを広げずに、イベント再構築の hot path から `localtime_r` の繰り返しを外せる。
+  Date/Author: 2026-05-01 07:06:26Z / Codex
+
 ## Outcomes & Retrospective
 
 Criterion benchmark suite を `benches/operations.rs` として追加し、`cargo bench --bench operations` で主要操作を継続計測できるようにした。binary-only だった crate は `src/lib.rs` を持つ構成に変え、`src/main.rs` は CLI dispatch の thin binary になった。
 
 性能改善は二つ入った。`src/highlight.rs` は `Highlighter` に path+line content cache を持たせ、同じ visible line を再描画するたびに syntect を走らせない。`src/app/search.rs` は lowercase ASCII smart-case 検索で per-line lowercase String を作らず、元 content の byte offset を直接探す。
 
-初回 baseline から final current tree への主要値は、`highlight_300_rust_lines` が約 `5.89ms` から `52.4µs`、`render/full_frame_nowrap` が約 `960µs` から `264.8µs`、`render/full_frame_wrap` が約 `749µs` から `272.4µs`、`search/find_matches_many_rows` が約 `1.77ms` から `1.10ms` になった。`stream/build_stream_files_200_events` は約 `7.0ms` のまま残っており、次の大きな改善候補である。
+初回 baseline から final current tree への主要値は、`highlight_300_rust_lines` が約 `5.89ms` から `52.4µs`、`render/full_frame_nowrap` が約 `960µs` から `264.8µs`、`render/full_frame_wrap` が約 `749µs` から `272.4µs`、`search/find_matches_many_rows` が約 `1.77ms` から `1.10ms` になった。
+
+Follow-up で残っていた `stream/build_stream_files_200_events` も改善した。`build_stream_files` は秒単位の時刻 prefix cache、出力 `Vec` の事前確保、`file_paths` の余分な `Vec` clone 削減により、約 `7.29ms` から約 `124µs` になった。
 
 ## Context and Orientation
 
@@ -244,6 +254,11 @@ current tree final benchmark:
     scar/insert_and_remove_scar_200_line_file: 214.39 µs
     stream/compute_operation_diff: 55.351 µs
     stream/build_stream_files_200_events: 7.0432 ms
+
+Follow-up benchmark:
+
+    stream/compute_operation_diff: 53.990 µs
+    stream/build_stream_files_200_events: 124.04 µs, change -98.307%
 
 Validation:
 
