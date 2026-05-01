@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 /// Supported AI coding agent kinds. Determines how stdin JSON is
 /// parsed and how stdout feedback is formatted.
@@ -12,15 +13,17 @@ pub enum AgentKind {
     Cline,
 }
 
-impl AgentKind {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for AgentKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "claude-code" | "claude" => Some(Self::ClaudeCode),
-            "cursor" => Some(Self::Cursor),
-            "codex" => Some(Self::Codex),
-            "qwen" | "qwen-code" => Some(Self::QwenCode),
-            "cline" => Some(Self::Cline),
-            _ => None,
+            "claude-code" | "claude" => Ok(Self::ClaudeCode),
+            "cursor" => Ok(Self::Cursor),
+            "codex" => Ok(Self::Codex),
+            "qwen" | "qwen-code" => Ok(Self::QwenCode),
+            "cline" => Ok(Self::Cline),
+            _ => Err(()),
         }
     }
 }

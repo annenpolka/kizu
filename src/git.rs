@@ -7,8 +7,7 @@ mod types;
 mod untracked;
 
 pub use diff::{compute_diff, compute_diff_with_snapshots, diff_single_file};
-#[cfg(test)]
-use parse::parse_unified_diff;
+pub(crate) use parse::parse_unified_diff;
 #[cfg(test)]
 use parse::split_logical_lines;
 pub use repo::{current_branch_ref, find_root, git_common_dir, git_dir, head_sha};

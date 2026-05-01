@@ -28,7 +28,12 @@ unicode-width = "0.2"
 which = "8"
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3"
+
+[[bench]]
+name = "operations"
+harness = false
 
 [profile.release]
 lto = "thin"

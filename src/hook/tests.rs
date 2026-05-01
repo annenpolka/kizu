@@ -1,12 +1,8 @@
 use super::*;
+use crate::test_support::ENV_LOCK;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// Serializes tests that mutate `KIZU_STATE_DIR` so cargo's
-/// parallel test runner does not interleave env-var writes.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn parse_hook_input_extracts_claude_code_post_tool_use() {
@@ -312,15 +308,15 @@ fn format_stop_stderr_lists_all_hits() {
 #[test]
 fn agent_kind_from_str_matches_common_names() {
     assert_eq!(
-        AgentKind::from_str("claude-code"),
-        Some(AgentKind::ClaudeCode)
+        "claude-code".parse::<AgentKind>(),
+        Ok(AgentKind::ClaudeCode)
     );
-    assert_eq!(AgentKind::from_str("claude"), Some(AgentKind::ClaudeCode));
-    assert_eq!(AgentKind::from_str("cursor"), Some(AgentKind::Cursor));
-    assert_eq!(AgentKind::from_str("codex"), Some(AgentKind::Codex));
-    assert_eq!(AgentKind::from_str("qwen"), Some(AgentKind::QwenCode));
-    assert_eq!(AgentKind::from_str("cline"), Some(AgentKind::Cline));
-    assert_eq!(AgentKind::from_str("unknown"), None);
+    assert_eq!("claude".parse::<AgentKind>(), Ok(AgentKind::ClaudeCode));
+    assert_eq!("cursor".parse::<AgentKind>(), Ok(AgentKind::Cursor));
+    assert_eq!("codex".parse::<AgentKind>(), Ok(AgentKind::Codex));
+    assert_eq!("qwen".parse::<AgentKind>(), Ok(AgentKind::QwenCode));
+    assert_eq!("cline".parse::<AgentKind>(), Ok(AgentKind::Cline));
+    assert_eq!("unknown".parse::<AgentKind>(), Err(()));
 }
 
 #[test]

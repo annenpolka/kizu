@@ -9,6 +9,12 @@ use crate::app::{
 };
 use crate::git::{DiffContent, DiffLine, FileDiff, FileStatus, Hunk, LineKind};
 
+/// Serializes tests that mutate process-wide environment variables.
+/// Cargo runs unit tests from different modules in the same process,
+/// so module-local locks are not enough when paths and hook tests both
+/// touch `KIZU_STATE_DIR`.
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn diff_line(kind: LineKind, content: &str) -> DiffLine {
     DiffLine {
         kind,

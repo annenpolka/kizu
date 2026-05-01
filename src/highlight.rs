@@ -5,10 +5,16 @@
 //! in [`App`] and shared by both the diff view and file view renderers.
 
 use ratatui::style::Color;
-use std::path::Path;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
+
+const HIGHLIGHT_CACHE_CAP: usize = 8_192;
 
 /// Cached syntax highlighting state. Created once per App lifetime
 /// via [`Highlighter::new`], then reused across frames.
@@ -16,12 +22,52 @@ pub struct Highlighter {
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     theme_name: String,
+    cache: RefCell<HighlightCache>,
 }
 
 /// One highlighted token: a span of text with a foreground color.
+#[derive(Clone)]
 pub struct HlToken {
     pub text: String,
     pub fg: Color,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HighlightCacheKey {
+    path: PathBuf,
+    line: String,
+}
+
+#[derive(Default)]
+struct HighlightCache {
+    map: HashMap<HighlightCacheKey, Vec<HlToken>>,
+    order: VecDeque<HighlightCacheKey>,
+}
+
+impl HighlightCache {
+    fn get(&self, key: &HighlightCacheKey) -> Option<Vec<HlToken>> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: HighlightCacheKey, tokens: Vec<HlToken>) {
+        if let Some(slot) = self.map.get_mut(&key) {
+            *slot = tokens;
+            return;
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, tokens);
+        while self.map.len() > HIGHLIGHT_CACHE_CAP {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 impl Highlighter {
@@ -30,6 +76,7 @@ impl Highlighter {
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
             theme_name: "base16-eighties.dark".to_string(),
+            cache: RefCell::new(HighlightCache::default()),
         }
     }
 
@@ -37,6 +84,19 @@ impl Highlighter {
     /// tokens. Falls back to a single unstyled token if the file
     /// extension is unknown or highlighting fails.
     pub fn highlight_line(&self, line: &str, path: &Path) -> Vec<HlToken> {
+        let cache_key = HighlightCacheKey {
+            path: path.to_path_buf(),
+            line: line.to_string(),
+        };
+        if let Some(tokens) = self.cache.borrow().get(&cache_key) {
+            return tokens;
+        }
+        let tokens = self.highlight_line_uncached(line, path);
+        self.cache.borrow_mut().insert(cache_key, tokens.clone());
+        tokens
+    }
+
+    fn highlight_line_uncached(&self, line: &str, path: &Path) -> Vec<HlToken> {
         let ext = path.extension().and_then(|e| e.to_str());
         let syntax = ext
             .and_then(|e| self.syntax_set.find_syntax_by_extension(e))
@@ -85,6 +145,17 @@ impl Highlighter {
                 fg: Color::Reset,
             }],
         }
+    }
+
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
+        self.cache.borrow().len()
+    }
+}
+
+impl Default for Highlighter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -142,5 +213,25 @@ mod tests {
         let tokens = hl.highlight_line("", Path::new("a.rs"));
         // Empty line may produce 0 or 1 tokens, just verify no panic.
         let _ = tokens;
+    }
+
+    #[test]
+    fn highlight_line_reuses_cached_tokens_for_same_path_and_content() {
+        let hl = Highlighter::new();
+        let path = Path::new("test.rs");
+
+        let first = hl.highlight_line("fn main() {}", path);
+        assert_eq!(hl.cache_len(), 1);
+        let second = hl.highlight_line("fn main() {}", path);
+
+        assert_eq!(hl.cache_len(), 1, "same line should hit cache");
+        assert_eq!(first.len(), second.len());
+        assert!(
+            first
+                .iter()
+                .zip(second.iter())
+                .all(|(a, b)| a.text == b.text && a.fg == b.fg),
+            "cached tokens must preserve text and colors"
+        );
     }
 }
