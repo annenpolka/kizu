@@ -94,17 +94,8 @@ use anyhow::Context;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    /// Cargo runs tests in parallel within a single process, and
-    /// `std::env::set_var` mutates global process state. The tests below
-    /// that toggle `KIZU_STATE_DIR` / `KIZU_CONFIG` would otherwise race
-    /// each other (one test's `remove_var` clears another's `set_var`
-    /// before the second assertion runs). Serialising them through a
-    /// shared mutex is cheaper than switching the whole module to
-    /// `--test-threads=1`.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn project_hash_is_deterministic() {

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::path::Path;
 use std::process::Command;
+use std::str::FromStr;
 
 /// Supported terminal multiplexers / emulators for `--attach`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,15 +12,16 @@ pub enum TerminalKind {
     Ghostty,
 }
 
-impl TerminalKind {
-    /// Try to parse a terminal name string into a [`TerminalKind`].
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for TerminalKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "tmux" => Some(Self::Tmux),
-            "zellij" => Some(Self::Zellij),
-            "kitty" => Some(Self::Kitty),
-            "ghostty" => Some(Self::Ghostty),
-            _ => None,
+            "tmux" => Ok(Self::Tmux),
+            "zellij" => Ok(Self::Zellij),
+            "kitty" => Ok(Self::Kitty),
+            "ghostty" => Ok(Self::Ghostty),
+            _ => Err(()),
         }
     }
 }
@@ -159,7 +161,7 @@ fn escape_applescript_string(s: &str) -> String {
 /// Returns an error if no terminal can be determined.
 pub fn resolve_terminal(config_terminal: &str) -> Result<TerminalKind> {
     if !config_terminal.is_empty() {
-        return TerminalKind::from_str(config_terminal).ok_or_else(|| {
+        return config_terminal.parse::<TerminalKind>().map_err(|_| {
             anyhow!(
                 "unknown terminal '{}' in config; expected: tmux, zellij, kitty, ghostty",
                 config_terminal
@@ -181,15 +183,12 @@ mod tests {
 
     #[test]
     fn terminal_kind_from_str_matches_known_names() {
-        assert_eq!(TerminalKind::from_str("tmux"), Some(TerminalKind::Tmux));
-        assert_eq!(TerminalKind::from_str("TMUX"), Some(TerminalKind::Tmux));
-        assert_eq!(TerminalKind::from_str("zellij"), Some(TerminalKind::Zellij));
-        assert_eq!(TerminalKind::from_str("kitty"), Some(TerminalKind::Kitty));
-        assert_eq!(
-            TerminalKind::from_str("ghostty"),
-            Some(TerminalKind::Ghostty)
-        );
-        assert_eq!(TerminalKind::from_str("unknown"), None);
+        assert_eq!("tmux".parse::<TerminalKind>(), Ok(TerminalKind::Tmux));
+        assert_eq!("TMUX".parse::<TerminalKind>(), Ok(TerminalKind::Tmux));
+        assert_eq!("zellij".parse::<TerminalKind>(), Ok(TerminalKind::Zellij));
+        assert_eq!("kitty".parse::<TerminalKind>(), Ok(TerminalKind::Kitty));
+        assert_eq!("ghostty".parse::<TerminalKind>(), Ok(TerminalKind::Ghostty));
+        assert_eq!("unknown".parse::<TerminalKind>(), Err(()));
     }
 
     #[test]

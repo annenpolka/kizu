@@ -1,22 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-
-mod app;
-mod attach;
-mod config;
-mod git;
-mod highlight;
-mod hook;
-mod init;
-mod paths;
-mod prompt;
-mod scar;
-mod session;
-mod stream;
-#[cfg(test)]
-mod test_support;
-mod ui;
-mod watcher;
+use kizu::{app, attach, config, git, hook, init};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -100,8 +84,9 @@ async fn main() -> Result<()> {
 }
 
 fn run_hook_post_tool(agent_str: &str) -> Result<()> {
-    let agent = hook::AgentKind::from_str(agent_str)
-        .ok_or_else(|| anyhow::anyhow!("unknown agent: {agent_str}"))?;
+    let agent = agent_str
+        .parse::<hook::AgentKind>()
+        .map_err(|_| anyhow::anyhow!("unknown agent: {agent_str}"))?;
     let input = hook::parse_hook_input(agent, std::io::stdin().lock())?;
 
     if input.file_paths.is_empty() {
@@ -116,8 +101,9 @@ fn run_hook_post_tool(agent_str: &str) -> Result<()> {
 }
 
 fn run_hook_stop(agent_str: &str) -> Result<()> {
-    let agent = hook::AgentKind::from_str(agent_str)
-        .ok_or_else(|| anyhow::anyhow!("unknown agent: {agent_str}"))?;
+    let agent = agent_str
+        .parse::<hook::AgentKind>()
+        .map_err(|_| anyhow::anyhow!("unknown agent: {agent_str}"))?;
     let input = hook::parse_hook_input(agent, std::io::stdin().lock())?;
 
     if input.stop_hook_active {

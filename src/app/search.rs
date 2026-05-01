@@ -40,6 +40,16 @@ pub struct SearchInputState {
     pub cursor_pos: usize,
 }
 
+fn find_ascii_case_insensitive(haystack: &str, needle: &str, start: usize) -> Option<usize> {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || start > haystack.len() || needle.len() > haystack.len() - start {
+        return None;
+    }
+    let last_start = haystack.len() - needle.len();
+    (start..=last_start).find(|&idx| haystack[idx..idx + needle.len()].eq_ignore_ascii_case(needle))
+}
+
 /// Find every occurrence of `query` across the **DiffLine** rows of
 /// `layout`, in row order. Empty queries return an empty vector so
 /// callers can treat "no matches" and "no query" identically.
@@ -90,15 +100,28 @@ pub fn find_matches(layout: &ScrollLayout, files: &[FileDiff], query: &str) -> V
         // byte offsets meaningful. Non-ASCII lowercase queries
         // degrade to case-sensitive matching, which is a clean
         // failure mode.
-        let ascii_only = needle.is_ascii() && line.content.is_ascii();
-        let (haystack, search_needle): (String, String) = if case_sensitive || !ascii_only {
-            (line.content.clone(), needle.clone())
-        } else {
-            (line.content.to_ascii_lowercase(), needle.clone())
-        };
-
         let mut start = 0;
-        while let Some(idx) = haystack[start..].find(&search_needle) {
+        if !case_sensitive && needle.is_ascii() && line.content.is_ascii() {
+            while let Some(byte_start) = find_ascii_case_insensitive(&line.content, &needle, start)
+            {
+                let byte_end = byte_start + needle.len();
+                out.push(MatchLocation {
+                    row: row_idx,
+                    byte_start,
+                    byte_end,
+                });
+                start = byte_end;
+            }
+            continue;
+        }
+
+        let haystack = line.content.as_str();
+        let search_needle = if case_sensitive {
+            query
+        } else {
+            needle.as_str()
+        };
+        while let Some(idx) = haystack[start..].find(search_needle) {
             let byte_start = start + idx;
             let byte_end = byte_start + search_needle.len();
             out.push(MatchLocation {
@@ -193,5 +216,18 @@ impl App {
         let row = state.matches[state.current].row;
         self.follow_mode = false;
         self.scroll_to(row);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_case_insensitive_find_reports_original_byte_offsets() {
+        let haystack = "Hello WORLD world";
+        assert_eq!(find_ascii_case_insensitive(haystack, "world", 0), Some(6));
+        assert_eq!(find_ascii_case_insensitive(haystack, "world", 7), Some(12));
+        assert_eq!(find_ascii_case_insensitive(haystack, "world", 13), None);
     }
 }
