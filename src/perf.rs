@@ -137,6 +137,23 @@ pub fn write_scar_target(dir: &Path, lines: usize) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub fn write_tsx_scar_target(dir: &Path, components: usize) -> Result<(PathBuf, usize)> {
+    let path = dir.join("scar_target.tsx");
+    let mut content = String::new();
+    let target_component = components / 2;
+    let mut target_line = 1usize;
+    for idx in 0..components {
+        if idx == target_component {
+            target_line = content.lines().count() + 4;
+        }
+        content.push_str(&format!(
+            "export function Component{idx}({{ count }}: {{ count: number }}) {{\n  return (\n    <section>\n      <p>Count: {{count}}</p>\n    </section>\n  );\n}}\n"
+        ));
+    }
+    std::fs::write(&path, content)?;
+    Ok((path, target_line))
+}
+
 pub fn scan_scar_files_for_bench(paths: &[PathBuf]) -> Vec<crate::hook::ScarHit> {
     crate::hook::scan_scars(paths)
 }
@@ -156,6 +173,16 @@ pub fn synthetic_source_lines(lines: usize, line_width: usize) -> Vec<String> {
     (0..lines)
         .map(|idx| bench_line(idx, idx, line_width))
         .collect()
+}
+
+pub fn synthetic_tsx_document(components: usize) -> String {
+    let mut source = String::new();
+    for idx in 0..components {
+        source.push_str(&format!(
+            "type Props{idx} = {{ count: number; label: string }};\nexport function Component{idx}({{ count, label }}: Props{idx}) {{\n  return (\n    <section className=\"counter\" data-index=\"{idx}\">\n      <h2>{{label}}</h2>\n      <p>Count: {{count}}</p>\n    </section>\n  );\n}}\n"
+        ));
+    }
+    source
 }
 
 pub fn stream_events(

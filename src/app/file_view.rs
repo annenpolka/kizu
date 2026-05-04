@@ -27,6 +27,7 @@ use super::{
 pub struct FileViewState {
     pub path: PathBuf,
     pub return_scroll: usize,
+    pub content: String,
     pub lines: Vec<String>,
     pub line_bg: HashMap<usize, Color>,
     pub cursor: usize,
@@ -170,6 +171,7 @@ impl App {
         self.file_view = Some(FileViewState {
             path: file.path.clone(),
             return_scroll: self.scroll,
+            content,
             lines,
             line_bg,
             cursor: initial_cursor,

@@ -31,6 +31,7 @@ pub(super) fn render_file_view(
     let body_width = geometry.body_width;
     fv.last_body_width.set(body_width);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+    let highlighted_document = hl.map(|hl| hl.highlight_document(&fv.content, &fv.path));
 
     // v0.5 M2: draw `∅` on the last line only when the on-disk file
     // is missing a trailing newline. Mid-file rows never get the marker.
@@ -47,7 +48,7 @@ pub(super) fn render_file_view(
             };
             let cursor_sub = (line_idx == fv.cursor).then_some(fv.cursor_sub_row);
             let show_eof_marker = mark_last_no_newline && line_idx == last_line_idx;
-            let rendered = render_file_view_line_wrapped(
+            let rendered = render_file_view_line_wrapped_with_tokens(
                 &fv.lines[line_idx],
                 cursor_sub,
                 body_width,
@@ -55,6 +56,10 @@ pub(super) fn render_file_view(
                 hl,
                 &fv.path,
                 show_eof_marker,
+                highlighted_document
+                    .as_ref()
+                    .and_then(|doc| doc.lines.get(line_idx))
+                    .map(Vec::as_slice),
             );
             let rendered = if geometry.effective_show_ln {
                 add_line_number_gutters(
@@ -92,7 +97,7 @@ pub(super) fn render_file_view(
                 Style::default()
             };
             let show_eof_marker = mark_last_no_newline && line_idx == last_line_idx;
-            let rendered = render_file_view_line(
+            let rendered = render_file_view_line_with_tokens(
                 &fv.lines[line_idx],
                 line_idx == fv.cursor,
                 body_width,
@@ -100,6 +105,10 @@ pub(super) fn render_file_view(
                 hl,
                 &fv.path,
                 show_eof_marker,
+                highlighted_document
+                    .as_ref()
+                    .and_then(|doc| doc.lines.get(line_idx))
+                    .map(Vec::as_slice),
             );
             let rendered = if geometry.effective_show_ln {
                 let mut lines = add_line_number_gutters(
@@ -125,6 +134,7 @@ pub(super) fn render_file_view(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+#[cfg(test)]
 pub(super) fn render_file_view_line(
     content: &str,
     is_cursor: bool,
@@ -133,6 +143,29 @@ pub(super) fn render_file_view_line(
     hl: Option<&crate::highlight::Highlighter>,
     file_path: &std::path::Path,
     show_eof_marker: bool,
+) -> Line<'static> {
+    render_file_view_line_with_tokens(
+        content,
+        is_cursor,
+        body_width,
+        base_style,
+        hl,
+        file_path,
+        show_eof_marker,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_file_view_line_with_tokens(
+    content: &str,
+    is_cursor: bool,
+    body_width: usize,
+    base_style: Style,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: &std::path::Path,
+    show_eof_marker: bool,
+    document_tokens: Option<&[crate::highlight::HlToken]>,
 ) -> Line<'static> {
     let bar = cursor_bar(is_cursor, false);
     // v0.5 M2: reserve 1 cell at the end when we need to paint the
@@ -144,34 +177,35 @@ pub(super) fn render_file_view_line(
         body_width
     };
 
-    if let Some(hl) = hl {
-        let tokens = hl.highlight_line(content, file_path);
-        if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
-            let mut spans = vec![bar];
-            let mut cells_emitted = 0usize;
-            for token in &tokens {
-                let remaining = body_budget.saturating_sub(cells_emitted);
-                if remaining == 0 {
-                    break;
-                }
-                let (text, token_cells) = take_cells(&token.text, remaining);
-                if text.is_empty() {
-                    break;
-                }
-                spans.push(Span::styled(text, base_style.fg(token.fg)));
-                cells_emitted += token_cells;
+    if let Some(tokens) = document_tokens
+        .map(|tokens| tokens.to_vec())
+        .or_else(|| hl.map(|hl| hl.highlight_line(content, file_path)))
+        .filter(|tokens| tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset))
+    {
+        let mut spans = vec![bar];
+        let mut cells_emitted = 0usize;
+        for token in &tokens {
+            let remaining = body_budget.saturating_sub(cells_emitted);
+            if remaining == 0 {
+                break;
             }
-            if cells_emitted < body_budget {
-                spans.push(Span::styled(
-                    " ".repeat(body_budget - cells_emitted),
-                    base_style,
-                ));
+            let (text, token_cells) = take_cells(&token.text, remaining);
+            if text.is_empty() {
+                break;
             }
-            if show_eof_marker {
-                spans.push(eof_no_newline_span(base_style.bg));
-            }
-            return Line::from(spans);
+            spans.push(Span::styled(text, base_style.fg(token.fg)));
+            cells_emitted += token_cells;
         }
+        if cells_emitted < body_budget {
+            spans.push(Span::styled(
+                " ".repeat(body_budget - cells_emitted),
+                base_style,
+            ));
+        }
+        if show_eof_marker {
+            spans.push(eof_no_newline_span(base_style.bg));
+        }
+        return Line::from(spans);
     }
 
     use unicode_width::UnicodeWidthStr;
@@ -194,6 +228,7 @@ pub(super) fn render_file_view_line(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn render_file_view_line_wrapped(
     content: &str,
     cursor_sub: Option<usize>,
@@ -203,12 +238,37 @@ pub(super) fn render_file_view_line_wrapped(
     file_path: &std::path::Path,
     show_eof_marker: bool,
 ) -> Vec<Line<'static>> {
+    render_file_view_line_wrapped_with_tokens(
+        content,
+        cursor_sub,
+        body_width,
+        base_style,
+        hl,
+        file_path,
+        show_eof_marker,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_file_view_line_wrapped_with_tokens(
+    content: &str,
+    cursor_sub: Option<usize>,
+    body_width: usize,
+    base_style: Style,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: &std::path::Path,
+    show_eof_marker: bool,
+    document_tokens: Option<&[crate::highlight::HlToken]>,
+) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthStr;
 
-    let tokens: Option<Vec<crate::highlight::HlToken>> = hl.and_then(|hl| {
-        let toks = hl.highlight_line(content, file_path);
-        (toks.len() > 1 || toks.first().is_some_and(|t| t.fg != Color::Reset)).then_some(toks)
-    });
+    let tokens: Option<Vec<crate::highlight::HlToken>> = document_tokens
+        .map(|tokens| tokens.to_vec())
+        .or_else(|| hl.map(|hl| hl.highlight_line(content, file_path)))
+        .and_then(|toks| {
+            (toks.len() > 1 || toks.first().is_some_and(|t| t.fg != Color::Reset)).then_some(toks)
+        });
 
     let char_colors: Vec<Color> = if let Some(ref toks) = tokens {
         let mut colors = Vec::with_capacity(content.len());

@@ -481,6 +481,143 @@ fn render_scroll_lines_use_background_color_for_added_and_deleted() {
 }
 
 #[test]
+fn diff_view_uses_document_highlight_for_tsx() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let rel = "src/Button.tsx";
+    let abs = tmp.path().join(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).expect("mkdir");
+    let content = "export const button = (\n  <Button\n    kind=\"primary\"\n    onClick={() => save()}\n  />\n);\n";
+    std::fs::write(&abs, content).expect("write tsx");
+
+    let mut app = app_with_file(make_file(
+        rel,
+        vec![added_hunk(
+            1,
+            &[
+                "export const button = (",
+                "  <Button",
+                "    kind=\"primary\"",
+                "    onClick={() => save()}",
+                "  />",
+                ");",
+            ],
+        )],
+        100,
+    ));
+    app.root = tmp.path().to_path_buf();
+    app.scroll_to(0);
+
+    let buffer = render_buffer(&app, 100, 14);
+    let (x, y, _) = first_text_run(&buffer, "kind");
+
+    assert_eq!(
+        buffer[(x, y)].style().fg,
+        Some(Color::Cyan),
+        "tsx attribute in diff view should use tree-sitter document highlight"
+    );
+}
+
+#[test]
+fn diff_view_uses_baseline_document_highlight_for_deleted_tsx() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let root = tmp.path();
+    std::process::Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .current_dir(root)
+        .status()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(root)
+        .status()
+        .expect("git config email");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "kizu test"])
+        .current_dir(root)
+        .status()
+        .expect("git config name");
+
+    let rel = "src/Button.tsx";
+    let abs = root.join(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).expect("mkdir");
+    let before = "export const button = (\n  <Button\n    kind=\"primary\"\n    onClick={() => save()}\n  />\n);\n";
+    let after = "export const button = (\n  <Button\n    onClick={() => save()}\n  />\n);\n";
+    std::fs::write(&abs, before).expect("write before");
+    std::process::Command::new("git")
+        .args(["add", rel])
+        .current_dir(root)
+        .status()
+        .expect("git add");
+    std::process::Command::new("git")
+        .args(["commit", "--quiet", "-m", "seed"])
+        .current_dir(root)
+        .status()
+        .expect("git commit");
+    let baseline = crate::git::head_sha(root).expect("head");
+    std::fs::write(&abs, after).expect("write after");
+    let files = crate::git::compute_diff(root, &baseline).expect("diff");
+    let mut app = app_with_files(files);
+    app.root = root.to_path_buf();
+    app.baseline_sha = baseline;
+    app.scroll_to(0);
+
+    let buffer = render_buffer(&app, 100, 14);
+    let (x, y, _) = first_text_run(&buffer, "kind");
+
+    assert_eq!(
+        buffer[(x, y)].style().fg,
+        Some(Color::Cyan),
+        "deleted tsx attribute should use baseline document highlight"
+    );
+}
+
+#[test]
+fn diff_view_does_not_document_highlight_non_js_files() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let rel = "src/foo.rs";
+    let abs = tmp.path().join(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).expect("mkdir");
+    std::fs::write(&abs, "pub fn answer() -> i32 { 42 }\n").expect("write rust");
+
+    let mut app = app_with_file(make_file(
+        rel,
+        vec![added_hunk(1, &["pub fn answer() -> i32 { 42 }"])],
+        100,
+    ));
+    app.root = tmp.path().to_path_buf();
+
+    let _buffer = render_buffer(&app, 100, 10);
+    let highlighter = app.highlighter.get().expect("highlighter initialized");
+
+    assert_eq!(
+        highlighter.document_cache_len(),
+        0,
+        "diff view should not build whole-document highlights for non-JS/TS files"
+    );
+}
+
+#[test]
+fn file_view_uses_document_highlight_for_tsx() {
+    let content = "export const button = (\n  <Button\n    kind=\"primary\"\n    onClick={() => save()}\n  />\n);\n";
+    let mut app = app_with_files(Vec::new());
+    app.file_view = Some(file_view_state(
+        "src/Button.tsx",
+        content.lines().map(String::from).collect(),
+        2,
+        true,
+    ));
+
+    let buffer = render_buffer(&app, 100, 10);
+    let (x, y, _) = first_text_run(&buffer, "kind");
+
+    assert_eq!(
+        buffer[(x, y)].style().fg,
+        Some(Color::Cyan),
+        "tsx attribute in file view should use tree-sitter document highlight"
+    );
+}
+
+#[test]
 fn nowrap_added_row_background_extends_to_viewport_edge() {
     // ADR-0014: the delta-style coloured band must run from the
     // first body cell to the last cell of the viewport, even

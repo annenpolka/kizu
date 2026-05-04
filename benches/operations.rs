@@ -151,6 +151,15 @@ fn bench_highlight(c: &mut Criterion) {
             ));
         });
     });
+    let tsx = perf::synthetic_tsx_document(80);
+    let tsx_path = Path::new("bench.tsx");
+    group.throughput(Throughput::Elements(80));
+    group.bench_function("highlight_80_tsx_components_document", |b| {
+        b.iter(|| {
+            let doc = highlighter.highlight_document(black_box(&tsx), black_box(tsx_path));
+            black_box(doc.lines.len());
+        });
+    });
     group.finish();
 }
 
@@ -182,6 +191,15 @@ fn bench_hook(c: &mut Criterion) {
             black_box(hits.len());
         });
     });
+    let tsx_dir = tempdir().expect("temp tsx scar scan dir");
+    let tsx_paths = write_tsx_scan_fixture(tsx_dir.path(), 80, 120);
+    group.throughput(Throughput::Elements(tsx_paths.len() as u64));
+    group.bench_function("scan_jsx_block_scars_80_files", |b| {
+        b.iter(|| {
+            let hits = perf::scan_scar_files_for_bench(black_box(&tsx_paths));
+            black_box(hits.len());
+        });
+    });
     group.finish();
 }
 
@@ -205,6 +223,30 @@ fn bench_scar(c: &mut Criterion) {
                 .expect("scar inserted");
                 let removed = remove_scar(&path, receipt.line_1indexed, &receipt.rendered)
                     .expect("remove scar");
+                black_box(removed);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("insert_and_remove_scar_30_component_tsx_file", |b| {
+        b.iter_batched(
+            || {
+                let dir = tempdir().expect("temp tsx scar dir");
+                let (path, target_line) =
+                    perf::write_tsx_scar_target(dir.path(), 30).expect("tsx scar target");
+                (dir, path, target_line)
+            },
+            |(_dir, path, target_line)| {
+                let receipt = insert_scar(
+                    black_box(&path),
+                    black_box(target_line),
+                    ScarKind::Ask,
+                    "explain this change",
+                )
+                .expect("insert tsx scar")
+                .expect("scar inserted");
+                let removed = remove_scar(&path, receipt.line_1indexed, &receipt.rendered)
+                    .expect("remove tsx scar");
                 black_box(removed);
             },
             BatchSize::SmallInput,
@@ -248,6 +290,26 @@ fn write_scan_fixture(dir: &Path, files: usize, lines: usize) -> Vec<PathBuf> {
                 }
             }
             std::fs::write(&path, content).expect("write scar scan fixture");
+            path
+        })
+        .collect()
+}
+
+fn write_tsx_scan_fixture(dir: &Path, files: usize, lines: usize) -> Vec<PathBuf> {
+    (0..files)
+        .map(|file_idx| {
+            let path = dir.join(format!("component_{file_idx}.tsx"));
+            let mut content = String::new();
+            content.push_str("export function Component() {\n  return (\n    <section>\n");
+            for line_idx in 0..lines {
+                if line_idx == lines / 2 && file_idx % 8 == 0 {
+                    content.push_str("      {/* @kizu[ask]: explain this change */}\n");
+                } else {
+                    content.push_str(&format!("      <p>Item {file_idx}-{line_idx}</p>\n"));
+                }
+            }
+            content.push_str("    </section>\n  );\n}\n");
+            std::fs::write(&path, content).expect("write tsx scar scan fixture");
             path
         })
         .collect()

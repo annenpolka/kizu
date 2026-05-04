@@ -8,7 +8,7 @@ use ratatui::{
 
 use super::{
     cursor_bar,
-    diff_line::{render_diff_line, render_diff_line_wrapped},
+    diff_line::{render_diff_line_with_tokens, render_diff_line_wrapped_with_tokens},
     format_mtime,
     geometry::{LineNumberGutter, RenderGeometry},
     line_numbers::{
@@ -89,6 +89,10 @@ pub(super) fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let viewport_height = body_height;
     app.last_body_height.set(viewport_height);
     app.last_body_width.set(wrap_body_width);
+    let hl = app
+        .highlighter
+        .get_or_init(crate::highlight::Highlighter::new);
+    let doc_highlights = build_diff_document_highlights(app, hl);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport_height);
     let mut row_idx = viewport_top;
@@ -100,9 +104,6 @@ pub(super) fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             None
         };
-        let hl = app
-            .highlighter
-            .get_or_init(crate::highlight::Highlighter::new);
         let ctx = RowRenderCtx {
             files: &app.files,
             selected_hunk: selected,
@@ -111,6 +112,7 @@ pub(super) fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
             nowrap_body_width,
             seen_hunks: &app.seen_hunks,
             hl: Some(hl),
+            doc_highlights: &doc_highlights,
             bg_added: app.config.colors.bg_added_color(),
             bg_deleted: app.config.colors.bg_deleted_color(),
             search: app.search.as_ref(),
@@ -176,6 +178,43 @@ pub(super) fn render_scroll(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
+struct DiffFileDocumentHighlights {
+    worktree: Option<crate::highlight::HighlightedDocument>,
+    baseline: Option<crate::highlight::HighlightedDocument>,
+}
+
+fn build_diff_document_highlights(
+    app: &App,
+    hl: &crate::highlight::Highlighter,
+) -> Vec<DiffFileDocumentHighlights> {
+    app.files
+        .iter()
+        .map(|file| {
+            if !matches!(file.content, DiffContent::Text(_)) {
+                return DiffFileDocumentHighlights {
+                    worktree: None,
+                    baseline: None,
+                };
+            }
+            if crate::language::js_ts::dialect_for_path(&file.path).is_none() {
+                return DiffFileDocumentHighlights {
+                    worktree: None,
+                    baseline: None,
+                };
+            }
+            let worktree = std::fs::read_to_string(app.root.join(&file.path))
+                .ok()
+                .map(|content| hl.highlight_document(&content, &file.path));
+            let baseline =
+                crate::git::read_file_at_revision(&app.root, &app.baseline_sha, &file.path)
+                    .ok()
+                    .flatten()
+                    .map(|content| hl.highlight_document(&content, &file.path));
+            DiffFileDocumentHighlights { worktree, baseline }
+        })
+        .collect()
+}
+
 fn apply_cursor_gutter_tint(
     frame: &mut Frame<'_>,
     content_area: Rect,
@@ -233,6 +272,7 @@ struct RowRenderCtx<'a> {
     nowrap_body_width: usize,
     seen_hunks: &'a std::collections::BTreeMap<(std::path::PathBuf, usize), u64>,
     hl: Option<&'a crate::highlight::Highlighter>,
+    doc_highlights: &'a [DiffFileDocumentHighlights],
     bg_added: Color,
     bg_deleted: Color,
     search: Option<&'a crate::app::SearchState>,
@@ -303,8 +343,15 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
             let line = &hunks[*hunk_idx].lines[*line_idx];
             let is_cursor = cursor_sub.is_some();
             let search_matches = row_search_matches(ctx.search, row_idx);
+            let pair = ctx
+                .diff_line_numbers
+                .get(row_idx)
+                .copied()
+                .flatten()
+                .unwrap_or((None, None));
+            let document_tokens = diff_document_tokens(ctx, *file_idx, line.kind, pair);
             let rendered = match wrap_body_width {
-                Some(width) => render_diff_line_wrapped(
+                Some(width) => render_diff_line_wrapped_with_tokens(
                     line,
                     is_selected,
                     cursor_sub,
@@ -314,8 +361,9 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
                     ctx.bg_added,
                     ctx.bg_deleted,
                     &search_matches,
+                    document_tokens,
                 ),
-                None => vec![render_diff_line(
+                None => vec![render_diff_line_with_tokens(
                     line,
                     is_selected,
                     is_cursor,
@@ -325,17 +373,12 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
                     ctx.bg_added,
                     ctx.bg_deleted,
                     &search_matches,
+                    document_tokens,
                 )],
             };
             if !ctx.effective_show_ln {
                 rendered
             } else {
-                let pair = ctx
-                    .diff_line_numbers
-                    .get(row_idx)
-                    .copied()
-                    .flatten()
-                    .unwrap_or((None, None));
                 add_line_number_gutters(
                     rendered,
                     diff_ln_span(pair, &ctx.ln_gutter),
@@ -360,6 +403,23 @@ fn render_row(row_idx: usize, row: &RowKind, ctx: &RowRenderCtx<'_>) -> Vec<Line
         }
         RowKind::Spacer => vec![Line::raw("")],
     }
+}
+
+fn diff_document_tokens<'a>(
+    ctx: &'a RowRenderCtx<'a>,
+    file_idx: usize,
+    kind: LineKind,
+    pair: (Option<usize>, Option<usize>),
+) -> Option<&'a [crate::highlight::HlToken]> {
+    let file_docs = ctx.doc_highlights.get(file_idx)?;
+    let (document, line_number) = match kind {
+        LineKind::Deleted => (file_docs.baseline.as_ref()?, pair.0?),
+        LineKind::Added | LineKind::Context => (file_docs.worktree.as_ref()?, pair.1?),
+    };
+    document
+        .lines
+        .get(line_number.saturating_sub(1))
+        .map(Vec::as_slice)
 }
 
 fn row_search_matches(

@@ -65,6 +65,7 @@ fn apply_search_overlay(base: Style, fg: Color, hl: SearchHl) -> Style {
 /// at `body_width` cells and paints every visual row with the
 /// delta-style background color.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn render_diff_line_wrapped(
     line: &crate::git::DiffLine,
     is_selected: bool,
@@ -75,6 +76,33 @@ pub(super) fn render_diff_line_wrapped(
     bg_added: Color,
     bg_deleted: Color,
     search_matches: &[(usize, usize, bool)],
+) -> Vec<Line<'static>> {
+    render_diff_line_wrapped_with_tokens(
+        line,
+        is_selected,
+        cursor_sub,
+        body_width,
+        hl,
+        file_path,
+        bg_added,
+        bg_deleted,
+        search_matches,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_diff_line_wrapped_with_tokens(
+    line: &crate::git::DiffLine,
+    is_selected: bool,
+    cursor_sub: Option<usize>,
+    body_width: usize,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: Option<&std::path::Path>,
+    bg_added: Color,
+    bg_deleted: Color,
+    search_matches: &[(usize, usize, bool)],
+    document_tokens: Option<&[crate::highlight::HlToken]>,
 ) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthStr;
     // ADR-0014: background-color diff rendering. Focused hunks keep
@@ -97,7 +125,7 @@ pub(super) fn render_diff_line_wrapped(
     // Per-char fg + search highlight kind, built once for the whole
     // line. Distributed across wrapped chunks below so a match that
     // spans a wrap boundary still paints cleanly on both sides.
-    let char_fgs = per_char_fg(&line.content, hl, file_path);
+    let char_fgs = per_char_fg(&line.content, hl, file_path, document_tokens);
     let char_hls = classify_chars_by_match(&line.content, search_matches);
 
     let chunks = wrap_at_chars(&line.content, body_width.max(1));
@@ -150,6 +178,7 @@ pub(super) fn render_diff_line_wrapped(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn render_diff_line(
     line: &crate::git::DiffLine,
     is_selected: bool,
@@ -160,6 +189,33 @@ pub(super) fn render_diff_line(
     bg_added: Color,
     bg_deleted: Color,
     search_matches: &[(usize, usize, bool)],
+) -> Line<'static> {
+    render_diff_line_with_tokens(
+        line,
+        is_selected,
+        is_cursor,
+        body_width,
+        hl,
+        file_path,
+        bg_added,
+        bg_deleted,
+        search_matches,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_diff_line_with_tokens(
+    line: &crate::git::DiffLine,
+    is_selected: bool,
+    is_cursor: bool,
+    body_width: usize,
+    hl: Option<&crate::highlight::Highlighter>,
+    file_path: Option<&std::path::Path>,
+    bg_added: Color,
+    bg_deleted: Color,
+    search_matches: &[(usize, usize, bool)],
+    document_tokens: Option<&[crate::highlight::HlToken]>,
 ) -> Line<'static> {
     let bg = match line.kind {
         LineKind::Added => Some(bg_added),
@@ -176,7 +232,7 @@ pub(super) fn render_diff_line(
             .add_modifier(Modifier::DIM),
     };
 
-    let char_fgs = per_char_fg(&line.content, hl, file_path);
+    let char_fgs = per_char_fg(&line.content, hl, file_path, document_tokens);
     let char_hls = classify_chars_by_match(&line.content, search_matches);
 
     let eof_marker = !line.has_trailing_newline;
@@ -239,24 +295,37 @@ fn per_char_fg(
     content: &str,
     hl: Option<&crate::highlight::Highlighter>,
     file_path: Option<&std::path::Path>,
+    document_tokens: Option<&[crate::highlight::HlToken]>,
 ) -> Vec<Color> {
     let n = content.chars().count();
+    if let Some(tokens) = document_tokens
+        && let Some(colors) = token_char_colors(tokens, n)
+    {
+        return colors;
+    }
     if let (Some(hl), Some(path)) = (hl, file_path) {
         let tokens = hl.highlight_line(content, path);
-        if tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset) {
-            let mut out = Vec::with_capacity(n);
-            for tok in &tokens {
-                for _ in tok.text.chars() {
-                    out.push(tok.fg);
-                }
-            }
-            if out.len() == n {
-                return out;
-            }
+        if (tokens.len() > 1 || tokens.first().is_some_and(|t| t.fg != Color::Reset))
+            && let Some(colors) = token_char_colors(&tokens, n)
+        {
+            return colors;
             // Token char count drift should not happen with syntect.
             // Fall through to the flat-color fallback instead of
             // panicking in the renderer.
         }
     }
     vec![Color::Reset; n]
+}
+
+fn token_char_colors(
+    tokens: &[crate::highlight::HlToken],
+    expected_chars: usize,
+) -> Option<Vec<Color>> {
+    let mut out = Vec::with_capacity(expected_chars);
+    for tok in tokens {
+        for _ in tok.text.chars() {
+            out.push(tok.fg);
+        }
+    }
+    (out.len() == expected_chars).then_some(out)
 }

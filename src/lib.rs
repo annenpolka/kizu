@@ -5,6 +5,7 @@ pub mod git;
 pub mod highlight;
 pub mod hook;
 pub mod init;
+pub mod language;
 pub mod paths;
 #[doc(hidden)]
 pub mod perf;

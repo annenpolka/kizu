@@ -7,7 +7,8 @@ use super::ScarHit;
 /// PostToolUse / Stop invocation, so recompiling this regex per call
 /// would bill the cost to Claude Code's tool-use latency.
 static SCAR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--)\s*@kizu\[(\w+)\]:\s*(.*)").expect("scar regex")
+    regex::Regex::new(r"^\s*(?://|#|--|/\*|<!--|\{/\*)\s*@kizu\[(\w+)\]:\s*(.*)")
+        .expect("scar regex")
 });
 
 /// Grep every file in `paths` for `@kizu[...]` scars. Returns all
@@ -70,11 +71,22 @@ fn scan_content_for_scars(
                 path: path.to_path_buf(),
                 line_number: i + 1,
                 kind: caps[1].to_string(),
-                message: caps[2].trim().to_string(),
+                message: trim_scar_message(&caps[2]),
             });
         }
     }
     hits
+}
+
+fn trim_scar_message(raw: &str) -> String {
+    let mut message = raw.trim();
+    for suffix in ["*/}", "*/", "-->"] {
+        if let Some(stripped) = message.strip_suffix(suffix) {
+            message = stripped.trim_end();
+            break;
+        }
+    }
+    message.to_string()
 }
 
 /// Grep staged (index) contents of `paths` for `@kizu[...]` scars.

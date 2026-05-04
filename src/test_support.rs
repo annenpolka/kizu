@@ -163,9 +163,14 @@ pub(crate) fn file_view_state(
     cursor: usize,
     last_line_has_trailing_newline: bool,
 ) -> FileViewState {
+    let mut content = lines.join("\n");
+    if last_line_has_trailing_newline && !content.is_empty() {
+        content.push('\n');
+    }
     FileViewState {
         path: PathBuf::from(path),
         return_scroll: 0,
+        content,
         lines,
         line_bg: HashMap::new(),
         cursor,

@@ -10,7 +10,9 @@ pub use diff::{compute_diff, compute_diff_with_snapshots, diff_single_file};
 pub(crate) use parse::parse_unified_diff;
 #[cfg(test)]
 use parse::split_logical_lines;
-pub use repo::{current_branch_ref, find_root, git_common_dir, git_dir, head_sha};
+pub use repo::{
+    current_branch_ref, find_root, git_common_dir, git_dir, head_sha, read_file_at_revision,
+};
 pub use revert::{build_hunk_patch, revert_hunk};
 #[cfg(test)]
 pub(crate) use types::line_numbers_for;

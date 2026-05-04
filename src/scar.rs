@@ -12,6 +12,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::language::js_ts::{JsTsScarStyle, dialect_for_path, scar_placement_for_line};
+
 /// The lexical shape of a single-line or block comment in the target
 /// language. `open` is the leading marker (`//`, `#`, `<!--`, …) and
 /// `close` is the trailing marker for languages that need one
@@ -108,6 +110,10 @@ const DASH_DASH: CommentSyntax = CommentSyntax {
     open: "--",
     close: None,
 };
+const JSX_BLOCK: CommentSyntax = CommentSyntax {
+    open: "{/*",
+    close: Some("*/}"),
+};
 
 /// Detect the comment syntax for a file path, using its extension.
 ///
@@ -199,10 +205,19 @@ pub fn insert_scar(
     kind: ScarKind,
     body: &str,
 ) -> Result<Option<ScarInsert>> {
-    let syntax = detect_comment_syntax(path);
-    let scar_body = syntax.render_scar(kind, body);
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("reading {} for scar insertion", path.display()))?;
+    let (syntax, line_number) = if let Some(dialect) = dialect_for_path(path) {
+        let placement = scar_placement_for_line(dialect, &original, line_number)?;
+        let syntax = match placement.style {
+            JsTsScarStyle::LineComment => SLASH_SLASH,
+            JsTsScarStyle::JsxBlockComment => JSX_BLOCK,
+        };
+        (syntax, placement.insert_before_line_1indexed)
+    } else {
+        (detect_comment_syntax(path), line_number)
+    };
+    let scar_body = syntax.render_scar(kind, body);
     let newline = if original.contains("\r\n") {
         "\r\n"
     } else {
@@ -886,6 +901,113 @@ mod tests {
             post, pre,
             "scar insert should preserve the file's modified time"
         );
+    }
+
+    mod jsx_tsx_scar_placement {
+        use super::*;
+
+        #[test]
+        fn insert_scar_uses_jsx_block_comment_for_jsx_children() {
+            let dir = TempDir::new().expect("tmp");
+            let path = write_tmp(
+                &dir,
+                "Counter.tsx",
+                "export function Counter({ count }: { count: number }) {\n  return (\n    <section>\n      <p>Count: {count}</p>\n    </section>\n  );\n}\n",
+            );
+
+            let receipt = insert_scar(&path, 4, ScarKind::Ask, "explain this change")
+                .expect("insert")
+                .expect("receipt");
+
+            let after = fs::read_to_string(&path).expect("read back");
+            assert_eq!(
+                after,
+                "export function Counter({ count }: { count: number }) {\n  return (\n    <section>\n      {/* @kizu[ask]: explain this change */}\n      <p>Count: {count}</p>\n    </section>\n  );\n}\n"
+            );
+            assert_eq!(
+                receipt.rendered,
+                "      {/* @kizu[ask]: explain this change */}"
+            );
+        }
+
+        #[test]
+        fn insert_scar_uses_slash_slash_for_ts_expression() {
+            let dir = TempDir::new().expect("tmp");
+            let path = write_tmp(
+                &dir,
+                "Counter.tsx",
+                "export function Counter({ count }: { count: number }) {\n  const label: string = String(count);\n  return <p>{label}</p>;\n}\n",
+            );
+
+            insert_scar(&path, 2, ScarKind::Ask, "explain this change")
+                .expect("insert")
+                .expect("receipt");
+
+            let after = fs::read_to_string(&path).expect("read back");
+            assert_eq!(
+                after,
+                "export function Counter({ count }: { count: number }) {\n  // @kizu[ask]: explain this change\n  const label: string = String(count);\n  return <p>{label}</p>;\n}\n"
+            );
+        }
+
+        #[test]
+        fn insert_scar_relocates_from_jsx_opening_tag_attribute() {
+            let dir = TempDir::new().expect("tmp");
+            let path = write_tmp(
+                &dir,
+                "ButtonPanel.tsx",
+                "export function Panel() {\n  return (\n    <Button\n      kind=\"primary\"\n      onClick={() => save()}\n    >\n      Save\n    </Button>\n  );\n}\n",
+            );
+
+            let receipt = insert_scar(&path, 4, ScarKind::Ask, "explain this change")
+                .expect("insert")
+                .expect("receipt");
+
+            let after = fs::read_to_string(&path).expect("read back");
+            assert_eq!(
+                after,
+                "export function Panel() {\n  return (\n    {/* @kizu[ask]: explain this change */}\n    <Button\n      kind=\"primary\"\n      onClick={() => save()}\n    >\n      Save\n    </Button>\n  );\n}\n"
+            );
+            assert_eq!(receipt.line_1indexed, 3);
+        }
+
+        #[test]
+        fn insert_scar_handles_jsx_fragment_child() {
+            let dir = TempDir::new().expect("tmp");
+            let path = write_tmp(
+                &dir,
+                "Fragment.tsx",
+                "export function Fragment() {\n  return (\n    <>\n      <span>One</span>\n    </>\n  );\n}\n",
+            );
+
+            insert_scar(&path, 4, ScarKind::Free, "why here?")
+                .expect("insert")
+                .expect("receipt");
+
+            let after = fs::read_to_string(&path).expect("read back");
+            assert_eq!(
+                after,
+                "export function Fragment() {\n  return (\n    <>\n      {/* @kizu[free]: why here? */}\n      <span>One</span>\n    </>\n  );\n}\n"
+            );
+        }
+
+        #[test]
+        fn insert_scar_returns_error_when_tsx_parse_is_unrecoverable() {
+            let dir = TempDir::new().expect("tmp");
+            let path = write_tmp(
+                &dir,
+                "Broken.tsx",
+                "export function Broken() {\n  return (\n    <section>\n      <p>Broken\n    </section>\n  );\n}\n",
+            );
+
+            let err = insert_scar(&path, 4, ScarKind::Ask, "explain this change")
+                .expect_err("broken TSX should not receive a best-effort scar");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("could not safely place JSX/TSX scar"),
+                "error should explain safe placement failure, got: {message}"
+            );
+        }
     }
 
     /// Symmetric with `insert_scar_preserves_file_mtime`: undoing a scar
