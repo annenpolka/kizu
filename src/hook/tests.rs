@@ -172,8 +172,26 @@ fn scan_scars_detects_real_scar_outside_fence_in_markdown() {
 
     let hits = scan_scars(&[file]);
     assert_eq!(hits.len(), 1, "only the scar outside the fence");
-    assert_eq!(hits[0].message, "real scar outside fence -->");
+    assert_eq!(hits[0].message, "real scar outside fence");
     assert_eq!(hits[0].line_number, 3);
+}
+
+#[test]
+fn scan_scars_finds_jsx_block_comment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("Counter.tsx");
+    fs::write(
+        &file,
+        "export function Counter() {\n  return (\n    <section>\n      {/* @kizu[ask]: explain this change */}\n      <p>Count</p>\n    </section>\n  );\n}\n",
+    )
+    .unwrap();
+
+    let hits = scan_scars(std::slice::from_ref(&file));
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].kind, "ask");
+    assert_eq!(hits[0].message, "explain this change");
+    assert_eq!(hits[0].line_number, 4);
 }
 
 #[test]
@@ -576,4 +594,46 @@ fn scan_scars_from_index_reads_staged_blob_not_worktree() {
     assert_eq!(index_hits.len(), 1);
     assert_eq!(index_hits[0].kind, "ask");
     assert_eq!(index_hits[0].message, "staged scar");
+}
+
+#[test]
+fn scan_scars_from_index_finds_jsx_block_comment() {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    Command::new("git")
+        .args(["init"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    let file = root.join("Counter.tsx");
+    fs::write(
+        &file,
+        "export function Counter() {\n  return (\n    <section>\n      {/* @kizu[ask]: staged jsx scar */}\n      <p>Count</p>\n    </section>\n  );\n}\n",
+    )
+    .unwrap();
+    Command::new("git")
+        .args(["add", "Counter.tsx"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    let index_hits = scan_scars_from_index(root, &[file]);
+
+    assert_eq!(index_hits.len(), 1);
+    assert_eq!(index_hits[0].kind, "ask");
+    assert_eq!(index_hits[0].message, "staged jsx scar");
 }

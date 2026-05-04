@@ -85,6 +85,13 @@ A _scar_ is an inline comment kizu writes directly into your source file, using 
 <!-- @kizu[free]: elaborate on the edge case here -->
 ```
 
+In JSX/TSX, kizu chooses the safe form by syntax context. TypeScript or JavaScript statements still get `//`, while JSX children and fragments get JSX block comments:
+
+```tsx
+{/* @kizu[ask]: explain this change */}
+<p>Count: {count}</p>
+```
+
 Three kinds, each bound to a single key:
 
 - **`ask`** (`a`) — a question. Inserts the canned body `explain this change`; no prompt, no typing. The agent is expected to answer inline and resume.
@@ -256,6 +263,7 @@ See [`docs/deep-research-ai-agent-hooks.md`](docs/deep-research-ai-agent-hooks.m
 - [ratatui](https://ratatui.rs/) + [crossterm](https://docs.rs/crossterm/) for the TUI
 - [notify](https://docs.rs/notify/) + [notify-debouncer-full](https://docs.rs/notify-debouncer-full/) for filesystem watching
 - `git` CLI shelled out for diff computation (`git diff --no-renames <baseline> --`) — see [ADR-0001](docs/adr/0001-git-cli-shell-out.md)
+- syntect for general syntax highlighting; tree-sitter document highlighting for JS/TS/JSX/TSX — see [ADR-0020](docs/adr/0020-tree-sitter-for-jsx-tsx.md)
 
 ## Development
 

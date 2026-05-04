@@ -85,6 +85,13 @@ kizu は 1 つの TUI に 3 つのモードを持ちます。`Tab` でメイン 
 <!-- @kizu[free]: elaborate on the edge case here -->
 ```
 
+JSX/TSX では、kizu が構文上安全な形を文脈で選びます。TypeScript / JavaScript の statement では従来通り `//`、JSX children や fragment では JSX block comment を使います:
+
+```tsx
+{/* @kizu[ask]: explain this change */}
+<p>Count: {count}</p>
+```
+
 3 種類、それぞれがキー 1 打:
 
 - **`ask`**（`a`）— 質問。定型文 `explain this change` を挿入。プロンプトも入力もなし。エージェントはインラインで答えてから作業を続けます。
@@ -256,6 +263,7 @@ kizu init --agent claude-code --scope project-local --non-interactive
 - TUI は [ratatui](https://ratatui.rs/) + [crossterm](https://docs.rs/crossterm/)
 - ファイル監視は [notify](https://docs.rs/notify/) + [notify-debouncer-full](https://docs.rs/notify-debouncer-full/)
 - diff 計算は `git` CLI の shell out（`git diff --no-renames <baseline> --`）— [ADR-0001](docs/adr/0001-git-cli-shell-out.md) 参照
+- シンタックスハイライトは一般言語を syntect、JS/TS/JSX/TSX を tree-sitter の文書単位 highlight で処理 — [ADR-0020](docs/adr/0020-tree-sitter-for-jsx-tsx.md) 参照
 
 ## 開発
 

@@ -134,3 +134,27 @@ pub fn find_root(start: &Path) -> Result<PathBuf> {
         .context("`git rev-parse --show-toplevel` produced non-UTF8 output")?;
     Ok(PathBuf::from(raw.trim()))
 }
+
+/// Read a UTF-8 file blob at `revision:path`.
+///
+/// Missing paths, binary/non-UTF-8 blobs, and git failures that mean the
+/// revision does not contain the file return `Ok(None)` so renderers can
+/// fall back to line-local highlighting.
+pub fn read_file_at_revision(root: &Path, revision: &str, path: &Path) -> Result<Option<String>> {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let spec = format!("{revision}:{}", rel.display());
+    let output = Command::new("git")
+        .args(["show", &spec])
+        .current_dir(root)
+        .output()
+        .context("failed to spawn `git show <revision>:<path>`")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    match String::from_utf8(output.stdout) {
+        Ok(content) => Ok(Some(content)),
+        Err(_) => Ok(None),
+    }
+}
